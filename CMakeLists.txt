@@ -18,6 +18,16 @@ enable_testing()
 find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
 
+# Find ZooKeeper
+find_package(ZooKeeper REQUIRED)
+if(NOT TARGET zookeeper_mt)
+    message(FATAL_ERROR "ZooKeeper C client library not found. Please install libzookeeper-mt-dev or similar package.")
+endif()
+
+# Add ZooKeeper include directories
+include_directories(${ZOOKEEPER_INCLUDE_DIRS})
+message(STATUS "Found ZooKeeper: ${ZOOKEEPER_VERSION}")
+
 # Find Protobuf
 find_package(Protobuf REQUIRED CONFIG)
 if(NOT Protobuf_FOUND)
@@ -193,6 +203,11 @@ target_include_directories(zk_head_server_monitor PRIVATE
 
 target_link_libraries(zk_head_server_monitor PRIVATE
     ${CMAKE_THREAD_LIBS_INIT}
+    zookeeper_mt
+)
+
+target_include_directories(zk_head_server_monitor PRIVATE
+    ${ZOOKEEPER_INCLUDE_DIRS}
 )
 
 # Include directories for protobuf

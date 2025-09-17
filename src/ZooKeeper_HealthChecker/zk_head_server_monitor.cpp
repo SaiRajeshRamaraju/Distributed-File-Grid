@@ -1,4 +1,5 @@
 #include "../include/version.h"
+#include "../include/zookeeper_client.hpp"
 #include <iostream>
 #include <string>
 #include <thread>
@@ -7,6 +8,7 @@
 #include <atomic>
 #include <vector>
 #include <map>
+#include <unordered_map>
 #include <signal.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -16,126 +18,158 @@
 #include <cstring>
 #include <sstream>
 #include <fstream>
+#include <memory>
+#include <functional>
 
-// ZooKeeper simulation (in production, use libzookeeper)
-namespace zk_sim {
-    struct ZNode {
-        std::string data;
-        std::chrono::steady_clock::time_point last_update;
-        bool ephemeral = false;
-    };
+// Real ZooKeeper client wrapper
+class ZooKeeperClientWrapper {
+private:
+    std::unique_ptr<ZooKeeperClient> zk_client_;
+    std::string connection_string_;
+    std::string session_id_;
+    std::atomic<bool> connected_{false};
+    std::mutex mutex_;
     
-    class ZooKeeperClient {
-    private:
-        std::map<std::string, ZNode> nodes;
-        std::mutex nodes_mutex;
-        std::string session_id;
+public:
+    ZooKeeperClientWrapper(const std::string& connection_string) 
+        : connection_string_(connection_string) {
+        zk_client_ = std::make_unique<ZooKeeperClient>(connection_string, 10000);
+        connect();
+    }
+    
+    bool connect() {
+        if (connected_) return true;
         
-    public:
-        ZooKeeperClient(const std::string& connection_string) {
-            session_id = "session_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
-            std::cout << "ZooKeeper client connected to: " << connection_string << std::endl;
-            std::cout << "Session ID: " << session_id << std::endl;
-        }
+        zk_client_->set_watch_callback([this](int type, int state, const char* path) {
+            handle_watch_event(type, state, path);
+        });
         
-        bool create_node(const std::string& path, const std::string& data, bool ephemeral = false) {
-            std::lock_guard<std::mutex> lock(nodes_mutex);
-            if (nodes.find(path) != nodes.end()) {
-                return false; // Node already exists
-            }
-            
-            ZNode node;
-            node.data = data;
-            node.last_update = std::chrono::steady_clock::now();
-            node.ephemeral = ephemeral;
-            nodes[path] = node;
-            
-            std::cout << "Created ZNode: " << path << " (ephemeral: " << ephemeral << ")" << std::endl;
+        if (zk_client_->connect()) {
+            connected_ = true;
+            std::cout << "Connected to ZooKeeper at: " << connection_string_ << std::endl;
             return true;
         }
         
-        bool update_node(const std::string& path, const std::string& data) {
-            std::lock_guard<std::mutex> lock(nodes_mutex);
-            auto it = nodes.find(path);
-            if (it == nodes.end()) {
-                return false;
+        std::cerr << "Failed to connect to ZooKeeper at: " << connection_string_ << std::endl;
+        return false;
+    }
+    
+    bool create_node(const std::string& path, const std::string& data, bool ephemeral = false) {
+        if (!connected_ && !connect()) return false;
+        
+        // Create parent nodes if they don't exist
+        size_t pos = path.find_last_of('/');
+        if (pos != std::string::npos && pos != 0) {
+            std::string parent = path.substr(0, pos);
+            if (!node_exists(parent)) {
+                create_node(parent, "", false);
             }
-            
-            it->second.data = data;
-            it->second.last_update = std::chrono::steady_clock::now();
+        }
+        
+        int rc = zk_client_->create_node(path, data, ephemeral, false);
+        if (rc == ZOK || rc == ZNODEEXISTS) {
             return true;
         }
         
-        std::string get_node_data(const std::string& path) {
-            std::lock_guard<std::mutex> lock(nodes_mutex);
-            auto it = nodes.find(path);
-            if (it == nodes.end()) {
-                return "";
-            }
-            return it->second.data;
-        }
+        std::cerr << "Failed to create node " << path << ": " << zerror(rc) << std::endl;
+        return false;
+    }
+    
+    bool update_node(const std::string& path, const std::string& data) {
+        if (!connected_ && !connect()) return false;
         
-        bool node_exists(const std::string& path) {
-            std::lock_guard<std::mutex> lock(nodes_mutex);
-            return nodes.find(path) != nodes.end();
-        }
-        
-        bool delete_node(const std::string& path) {
-            std::lock_guard<std::mutex> lock(nodes_mutex);
-            auto it = nodes.find(path);
-            if (it == nodes.end()) {
-                return false;
-            }
-            nodes.erase(it);
-            std::cout << "Deleted ZNode: " << path << std::endl;
+        int rc = zk_client_->set_node_data(path, data);
+        if (rc == ZOK) {
             return true;
         }
         
-        std::vector<std::string> list_children(const std::string& parent_path) {
-            std::lock_guard<std::mutex> lock(nodes_mutex);
-            std::vector<std::string> children;
-            
-            for (const auto& [path, node] : nodes) {
-                if (path.find(parent_path + "/") == 0 && 
-                    path.substr(parent_path.length() + 1).find('/') == std::string::npos) {
-                    children.push_back(path.substr(parent_path.length() + 1));
-                }
-            }
-            return children;
+        std::cerr << "Failed to update node " << path << ": " << zerror(rc) << std::endl;
+        return false;
+    }
+    
+    std::string get_node_data(const std::string& path) {
+        if (!connected_ && !connect()) return "";
+        
+        return zk_client_->get_node_data(path, true);
+    }
+    
+    bool node_exists(const std::string& path) {
+        if (!connected_ && !connect()) return false;
+        
+        return zk_client_->node_exists(path);
+    }
+    
+    bool delete_node(const std::string& path) {
+        if (!connected_ && !connect()) return false;
+        
+        int rc = zk_client_->delete_node(path);
+        if (rc == ZOK) {
+            return true;
         }
         
-        void cleanup_ephemeral_nodes() {
-            std::lock_guard<std::mutex> lock(nodes_mutex);
-            auto now = std::chrono::steady_clock::now();
-            
-            for (auto it = nodes.begin(); it != nodes.end();) {
-                if (it->second.ephemeral && 
-                    std::chrono::duration_cast<std::chrono::seconds>(now - it->second.last_update).count() > 60) {
-                    std::cout << "Cleaning up stale ephemeral node: " << it->first << std::endl;
-                    it = nodes.erase(it);
-                } else {
-                    ++it;
-                }
-            }
+        std::cerr << "Failed to delete node " << path << ": " << zerror(rc) << std::endl;
+        return false;
+    }
+    
+    std::vector<std::string> list_children(const std::string& parent_path) {
+        if (!connected_ && !connect()) return {};
+        
+        return zk_client_->get_children(parent_path, true);
+    }
+    
+    void cleanup_ephemeral_nodes() {
+        // In a real implementation, ephemeral nodes are automatically removed by ZooKeeper
+        // when the session ends, so we don't need to do anything here.
+    }
+    
+private:
+    void handle_watch_event(int type, int state, const char* path) {
+        if (state == ZOO_CONNECTED_STATE) {
+            connected_ = true;
+            std::cout << "ZooKeeper connection state: CONNECTED" << std::endl;
+        } else if (state == ZOO_EXPIRED_SESSION_STATE) {
+            connected_ = false;
+            std::cerr << "ZooKeeper session expired. Attempting to reconnect..." << std::endl;
+            // Try to reconnect
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            connect();
+        } else if (state == ZOO_AUTH_FAILED_STATE) {
+            std::cerr << "ZooKeeper authentication failed" << std::endl;
+            connected_ = false;
+        } else if (state == ZOO_CONNECTING_STATE) {
+            std::cout << "ZooKeeper connection state: CONNECTING" << std::endl;
+        } else if (state == ZOO_ASSOCIATING_STATE) {
+            std::cout << "ZooKeeper connection state: ASSOCIATING" << std::endl;
         }
-    };
-}
+        
+        // Handle node events
+        if (path) {
+            std::cout << "ZooKeeper watch event: type=" << type 
+                     << ", state=" << state 
+                     << ", path=" << path << std::endl;
+        }
+    }
+};
 
 struct HeadServerInfo {
     std::string server_id;
     std::string ip_address;
     int port;
     std::chrono::steady_clock::time_point last_heartbeat;
+    std::chrono::steady_clock::time_point last_health_check;
     bool is_leader = false;
     std::string status = "unknown";
     double cpu_usage = 0.0;
     double memory_usage = 0.0;
     int active_connections = 0;
+    int consecutive_failures = 0;
+    
+    HeadServerInfo() : last_health_check(std::chrono::steady_clock::now()) {}
 };
 
 class ZooKeeperHeadServerMonitor {
 private:
-    std::unique_ptr<zk_sim::ZooKeeperClient> zk_client;
+    std::unique_ptr<ZooKeeperClientWrapper> zk_client;
     std::map<std::string, HeadServerInfo> head_servers;
     std::mutex servers_mutex;
     std::atomic<bool> running{false};
@@ -148,40 +182,126 @@ private:
     const std::chrono::seconds HEARTBEAT_TIMEOUT{30};
     const std::chrono::seconds MONITOR_INTERVAL{10};
     
-    bool check_head_server_health(const HeadServerInfo& server) {
-        // Simple TCP connection test
-        int sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock < 0) {
-            return false;
+    bool check_head_server_health(HeadServerInfo& server) {
+        const int MAX_RETRIES = 3;
+        const std::chrono::seconds CONNECTION_TIMEOUT{5};
+        
+        // If we have a recent successful check, consider it healthy
+        auto now = std::chrono::steady_clock::now();
+        auto time_since_last_check = now - server.last_health_check;
+        
+        // If we checked recently and it was healthy, return early
+        if (time_since_last_check < std::chrono::seconds(5) && server.status == "healthy") {
+            return true;
         }
         
-        // Set socket to non-blocking
-        int flags = fcntl(sock, F_GETFL, 0);
-        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+        // Track consecutive failures
+        static std::unordered_map<std::string, int> failure_counts;
+        static std::mutex failure_mutex;
         
-        struct sockaddr_in addr;
-        memset(&addr, 0, sizeof(addr));
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(server.port);
-        inet_pton(AF_INET, server.ip_address.c_str(), &addr.sin_addr);
+        std::string server_key = server.server_id + ":" + server.ip_address + ":" + std::to_string(server.port);
         
-        int result = connect(sock, (struct sockaddr*)&addr, sizeof(addr));
-        close(sock);
+        for (int attempt = 0; attempt < MAX_RETRIES; ++attempt) {
+            int sock = socket(AF_INET, SOCK_STREAM, 0);
+            if (sock < 0) {
+                std::cerr << "Failed to create socket for " << server_key << ": " << strerror(errno) << std::endl;
+                continue;
+            }
+            
+            // Set socket to non-blocking
+            int flags = fcntl(sock, F_GETFL, 0);
+            fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+            
+            struct sockaddr_in addr;
+            memset(&addr, 0, sizeof(addr));
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(server.port);
+            inet_pton(AF_INET, server.ip_address.c_str(), &addr.sin_addr);
+            
+            // Start connection
+            int result = connect(sock, (struct sockaddr*)&addr, sizeof(addr));
+            
+            if (result == 0) {
+                // Connection succeeded immediately
+                close(sock);
+                
+                // Reset failure count on success
+                {
+                    std::lock_guard<std::mutex> lock(failure_mutex);
+                    failure_counts[server_key] = 0;
+                }
+                
+                // Update last health check time
+                server.last_health_check = now;
+                return true;
+            } else if (errno == EINPROGRESS) {
+                // Connection in progress, wait for it to complete
+                fd_set write_fds;
+                FD_ZERO(&write_fds);
+                FD_SET(sock, &write_fds);
+                
+                struct timeval timeout;
+                timeout.tv_sec = CONNECTION_TIMEOUT.count();
+                timeout.tv_usec = 0;
+                
+                int select_result = select(sock + 1, nullptr, &write_fds, nullptr, &timeout);
+                
+                if (select_result > 0 && FD_ISSET(sock, &write_fds)) {
+                    // Check if connection was successful
+                    int error = 0;
+                    socklen_t len = sizeof(error);
+                    getsockopt(sock, SOL_SOCKET, SO_ERROR, &error, &len);
+                    
+                    close(sock);
+                    
+                    if (error == 0) {
+                        // Connection succeeded
+                        std::lock_guard<std::mutex> lock(failure_mutex);
+                        failure_counts[server_key] = 0;
+                        server.last_health_check = now;
+                        return true;
+                    }
+                } else {
+                    close(sock);
+                }
+            } else {
+                close(sock);
+            }
+            
+            // If we get here, the connection attempt failed
+            if (attempt < MAX_RETRIES - 1) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+        }
         
-        // For simulation, we'll consider the server healthy if it's been updated recently
-        auto now = std::chrono::steady_clock::now();
-        auto time_since_heartbeat = std::chrono::duration_cast<std::chrono::seconds>(now - server.last_heartbeat);
+        // If we get here, all retries failed
+        {
+            std::lock_guard<std::mutex> lock(failure_mutex);
+            int failures = ++failure_counts[server_key];
+            
+            // Only mark as unhealthy after multiple consecutive failures
+            if (failures >= 3) {
+                server.status = "unhealthy";
+                std::cerr << "Server " << server_key << " marked as unhealthy after " << failures << " consecutive failures" << std::endl;
+            } else {
+                std::cerr << "Temporary failure for server " << server_key << " (" << failures << " failures so far)" << std::endl;
+            }
+        }
         
-        return time_since_heartbeat < HEARTBEAT_TIMEOUT;
+        return false;
     }
     
     void register_monitor() {
         std::string monitor_path = MONITORS_PATH + "/" + monitor_id;
         std::string monitor_data = "monitor_id=" + monitor_id + ",start_time=" + 
-                                 std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+                                 std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+                                 ",host=" + get_local_ip_address();
         
-        zk_client->create_node(monitor_path, monitor_data, true); // ephemeral node
-        std::cout << "Registered monitor: " << monitor_id << std::endl;
+        if (zk_client->create_node(monitor_path, monitor_data, true)) {
+            std::cout << "Registered monitor: " << monitor_id << std::endl;
+        } else {
+            std::cerr << "Failed to register monitor: " << monitor_id << std::endl;
+        }
     }
     
     void discover_head_servers() {
@@ -247,45 +367,76 @@ private:
         
         std::string current_leader;
         HeadServerInfo* best_candidate = nullptr;
+        auto now = std::chrono::steady_clock::now();
         
         // Find current leader
         for (auto& [server_id, info] : head_servers) {
             if (info.is_leader) {
                 current_leader = server_id;
-                break;
-            }
-        }
-        
-        // Check if current leader is healthy
-        if (!current_leader.empty()) {
-            auto& leader_info = head_servers[current_leader];
-            if (check_head_server_health(leader_info)) {
-                std::cout << "Current leader " << current_leader << " is healthy" << std::endl;
-                return; // Leader is healthy, no election needed
-            } else {
-                std::cout << "Current leader " << current_leader << " is unhealthy, starting election" << std::endl;
-                leader_info.is_leader = false;
+                
+                // Check if leader is still healthy
+                if (check_head_server_health(info)) {
+                    // Leader is still healthy, no need for election
+                    std::cout << "Current leader " << current_leader << " is still healthy" << std::endl;
+                    return;
+                } else {
+                    // Leader is unhealthy, demote it
+                    std::cout << "Current leader " << current_leader << " is unhealthy, starting election" << std::endl;
+                    info.is_leader = false;
+                    info.status = "unhealthy";
+                    
+                    // Update ZK with leader status change
+                    std::string server_path = HEAD_SERVERS_PATH + "/" + info.server_id;
+                    std::string server_data = "ip=" + info.ip_address + 
+                                           ",port=" + std::to_string(info.port) +
+                                           ",status=unhealthy" +
+                                           ",last_update=" + std::to_string(now.time_since_epoch().count());
+                    
+                    if (zk_client->node_exists(server_path)) {
+                        zk_client->update_node(server_path, server_data);
+                    }
+                    break;
+                }
             }
         }
         
         // Find best candidate (lowest server_id among healthy servers)
         for (auto& [server_id, info] : head_servers) {
-            if (check_head_server_health(info)) {
-                if (!best_candidate || server_id < best_candidate->server_id) {
-                    best_candidate = &info;
-                    best_candidate->server_id = server_id;
-                }
+            // Skip servers that are not healthy
+            if (info.status != "healthy" && !check_head_server_health(info)) {
+                continue;
+            }
+            
+            // Prefer servers with lower CPU and memory usage
+            if (!best_candidate || 
+                (info.cpu_usage < best_candidate->cpu_usage && 
+                 info.memory_usage < best_candidate->memory_usage)) {
+                best_candidate = &info;
+            } else if (info.cpu_usage == best_candidate->cpu_usage && 
+                      info.memory_usage == best_candidate->memory_usage &&
+                      server_id < best_candidate->server_id) {
+                // If resource usage is equal, fall back to server_id comparison
+                best_candidate = &info;
             }
         }
         
         if (best_candidate) {
+            // Mark the old leader as not leader
+            if (!current_leader.empty() && head_servers.find(current_leader) != head_servers.end()) {
+                head_servers[current_leader].is_leader = false;
+            }
+            
+            // Promote new leader
             best_candidate->is_leader = true;
+            best_candidate->status = "healthy";
             leader_server_id = best_candidate->server_id;
             
             // Update ZooKeeper with new leader info
             std::string leader_path = ZK_ROOT_PATH + "/leader";
             std::string leader_data = "server_id=" + leader_server_id + 
-                                    ",elected_at=" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+                                    ",elected_at=" + std::to_string(now.time_since_epoch().count()) +
+                                    ",ip=" + best_candidate->ip_address +
+                                    ",port=" + std::to_string(best_candidate->port);
             
             if (zk_client->node_exists(leader_path)) {
                 zk_client->update_node(leader_path, leader_data);
@@ -293,9 +444,61 @@ private:
                 zk_client->create_node(leader_path, leader_data);
             }
             
-            std::cout << "New leader elected: " << leader_server_id << std::endl;
+            // Update the server's status in ZK
+            std::string server_path = HEAD_SERVERS_PATH + "/" + leader_server_id;
+            std::string server_data = "ip=" + best_candidate->ip_address + 
+                                   ",port=" + std::to_string(best_candidate->port) +
+                                   ",status=leader" +
+                                   ",cpu_usage=" + std::to_string(best_candidate->cpu_usage) +
+                                   ",memory_usage=" + std::to_string(best_candidate->memory_usage) +
+                                   ",active_connections=" + std::to_string(best_candidate->active_connections) +
+                                   ",last_update=" + std::to_string(now.time_since_epoch().count());
+            
+            if (zk_client->node_exists(server_path)) {
+                zk_client->update_node(server_path, server_data);
+            } else {
+                zk_client->create_node(server_path, server_data, true); // ephemeral
+            }
+            
+            std::cout << "New leader elected: " << leader_server_id 
+                     << " (CPU: " << best_candidate->cpu_usage 
+                     << "%, Memory: " << best_candidate->memory_usage << "%)" << std::endl;
         } else {
-            std::cout << "No healthy head servers found for leader election" << std::endl;
+            std::cerr << "WARNING: No healthy head servers available for leader election!" << std::endl;
+            
+            // If we have no leader and no healthy servers, try to elect the least unhealthy one
+            HeadServerInfo* least_unhealthy = nullptr;
+            for (auto& [server_id, info] : head_servers) {
+                if (!least_unhealthy || 
+                    (info.consecutive_failures < least_unhealthy->consecutive_failures)) {
+                    least_unhealthy = &info;
+                }
+            }
+            
+            if (least_unhealthy) {
+                std::cerr << "Electing least unhealthy server as leader: " 
+                         << least_unhealthy->server_id 
+                         << " (" << least_unhealthy->consecutive_failures 
+                         << " consecutive failures)" << std::endl;
+                
+                least_unhealthy->is_leader = true;
+                least_unhealthy->status = "degraded";
+                leader_server_id = least_unhealthy->server_id;
+                
+                // Update ZK with degraded leader status
+                std::string leader_path = ZK_ROOT_PATH + "/leader";
+                std::string leader_data = "server_id=" + leader_server_id + 
+                                        ",status=degraded" +
+                                        ",elected_at=" + std::to_string(now.time_since_epoch().count()) +
+                                        ",ip=" + least_unhealthy->ip_address +
+                                        ",port=" + std::to_string(least_unhealthy->port);
+                
+                if (zk_client->node_exists(leader_path)) {
+                    zk_client->update_node(leader_path, leader_data);
+                } else {
+                    zk_client->create_node(leader_path, leader_data);
+                }
+            }
         }
     }
     
@@ -376,18 +579,19 @@ private:
 
 public:
     ZooKeeperHeadServerMonitor(const std::string& zk_connection_string) {
-        monitor_id = "monitor_" + std::to_string(getpid()) + "_" + 
-                    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
-        
-        zk_client = std::make_unique<zk_sim::ZooKeeperClient>(zk_connection_string);
-        
-        // Initialize ZooKeeper structure
-        zk_client->create_node(ZK_ROOT_PATH, "Distributed File Grid Root");
-        zk_client->create_node(HEAD_SERVERS_PATH, "Head Servers Registry");
-        zk_client->create_node(MONITORS_PATH, "Monitors Registry");
-        zk_client->create_node(ZK_ROOT_PATH + "/health_reports", "Health Reports");
-    }
-    
+            monitor_id = "monitor_" + std::to_string(getpid()) + "_" + 
+                        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+            
+            zk_client = std::make_unique<ZooKeeperClientWrapper>(zk_connection_string);
+            
+            // Initialize ZooKeeper structure
+            zk_client->create_node(ZK_ROOT_PATH, "Distributed File Grid Root");
+            zk_client->create_node(HEAD_SERVERS_PATH, "Head Servers Registry");
+            zk_client->create_node(MONITORS_PATH, "Monitors Registry");
+            zk_client->create_node(ZK_ROOT_PATH + "/health_reports", "Health Reports");
+            
+            std::cout << "Initialized ZooKeeper structure at: " << zk_connection_string << std::endl;
+        }  
     void start() {
         running = true;
         std::cout << "Starting ZooKeeper Head Server Monitor..." << std::endl;
@@ -410,13 +614,22 @@ public:
                                          const std::string& ip, int port) {
         std::string server_path = HEAD_SERVERS_PATH + "/" + server_id;
         std::string server_data = "ip=" + ip + ",port=" + std::to_string(port) + 
-                                ",status=healthy,cpu_usage=25.5,memory_usage=60.2,active_connections=10" +
-                                ",last_update=" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+                                ",status=healthy,cpu_usage=" + 
+                                std::to_string(10.0 + (std::rand() % 30)) + // Random CPU usage between 10-40%
+                                ",memory_usage=" + 
+                                std::to_string(40.0 + (std::rand() % 50)) + // Random memory usage between 40-90%
+                                ",active_connections=" + 
+                                std::to_string(std::rand() % 100) + // Random connections between 0-100
+                                ",last_update=" + 
+                                std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
         
-        zk_client->create_node(server_path, server_data, true); // ephemeral
-        std::cout << "Simulated head server registration: " << server_id << std::endl;
-    }
-    
+        if (zk_client->create_node(server_path, server_data, true)) { // ephemeral
+            std::cout << "Simulated head server registration: " << server_id 
+                     << " at " << ip << ":" << port << std::endl;
+        } else {
+            std::cerr << "Failed to register head server: " << server_id << std::endl;
+        }
+    }  
     void run_interactive_mode() {
         std::cout << "\n=== ZooKeeper Head Server Monitor Interactive Mode ===" << std::endl;
         std::cout << "Commands:" << std::endl;
@@ -463,38 +676,58 @@ void signal_handler(int signal) {
     exit(0);
 }
 
-int main(int argc, char* argv[]) {
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-    
-    if (argc > 1) {
-        std::string arg = argv[1];
-        
-        if (arg == "-h" || arg == "--help") {
-            std::cout << "Usage: zk_head_server_monitor [OPTIONS]\n";
-            std::cout << "Options:\n";
-            std::cout << "  -h, --help     Show this help message and exit\n";
-            std::cout << "  -v, --version  Show program's version number and exit\n";
-            std::cout << "  -i, --interactive  Run in interactive mode\n";
-            std::cout << "  --zk-hosts HOSTS   ZooKeeper connection string (default: localhost:2181)\n";
-            return 0;
-        }
-        if (arg == "-v" || arg == "--version") {
-            std::cout << "ZooKeeper Head Server Monitor version: " << APP_VERSION << std::endl;
-            return 0;
-        }
+// Helper function to get local IP address
+std::string get_local_ip_address() {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        return "unknown";
     }
     
+    // Use Google's DNS server as a dummy address
+    struct sockaddr_in serv;
+    memset(&serv, 0, sizeof(serv));
+    serv.sin_family = AF_INET;
+    serv.sin_addr.s_addr = inet_addr("8.8.8.8");
+    serv.sin_port = htons(53);
+    
+    // Connect to the dummy address to determine the local interface
+    if (connect(sock, (const struct sockaddr*)&serv, sizeof(serv)) < 0) {
+        close(sock);
+        return "unknown";
+    }
+    
+    // Get the local address
+    struct sockaddr_in name;
+    socklen_t namelen = sizeof(name);
+    if (getsockname(sock, (struct sockaddr*)&name, &namelen) < 0) {
+        close(sock);
+        return "unknown";
+    }
+    
+    close(sock);
+    char ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &name.sin_addr, ip, sizeof(ip));
+    return std::string(ip);
+}
+
+int main(int argc, char* argv[]) {
     std::string zk_hosts = "localhost:2181";
     bool interactive = false;
     
     // Parse command line arguments
-    for (int i = 1; i < argc; i++) {
+    for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--zk-hosts" && i + 1 < argc) {
             zk_hosts = argv[++i];
         } else if (arg == "-i" || arg == "--interactive") {
             interactive = true;
+        } else if (arg == "--help") {
+            std::cout << "Usage: " << argv[0] << " [--zk-hosts HOST:PORT] [--interactive]\n"
+                      << "Options:\n"
+                      << "  --zk-hosts HOST:PORT  ZooKeeper connection string (default: localhost:2181)\n"
+                      << "  -i, --interactive     Run in interactive mode\n"
+                      << "  --help                Show this help message\n";
+            return 0;
         }
     }
     
