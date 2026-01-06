@@ -156,10 +156,18 @@ The Distributed File Grid consists of **four main components** with enterprise-g
    - `health_checker` - Traditional heartbeat-based monitoring service
    - `zk_head_server_monitor` - **NEW** ZooKeeper-based head server coordination
 
-3. **Start Services**
+3. **Start Services (separate terminals)**
    ```bash
-   ./scripts/start_services.sh
+   # Terminal 1 – metadata/head server
+   ./build/main head-server
+
+   # Terminal 2 – storage node (use unique IDs/ports per replica)
+   ./build/main cluster-server --server-id 1 --ip 127.0.0.1 --port 8080
+
+   # Terminal 3 – heartbeat-based health checker
+   ./build/main health-checker
    ```
+   Each process runs in the foreground; keep them alive while issuing upload/download commands.
 
 #### Option 2: Docker Deployment (Recommended)
 
@@ -207,23 +215,20 @@ The Distributed File Grid consists of **four main components** with enterprise-g
 
 ### File Operations
 
-The system provides a RESTful API for file operations:
+Interact with the system through the CLI entry point (`./build/main`). Every command expects the services from the Quick Start section to be running in separate terminals.
 
 ```bash
-# Upload a file
-curl -X POST http://localhost:9669/upload \
-  -F "file=@/path/to/your/file.txt"
+# Upload a local file (splits into 64 MB chunks with 3x replication metadata)
+./build/main upload /path/to/file.bin file.bin
 
-# Download a file
-curl -X GET http://localhost:9669/download/filename.txt \
-  -o downloaded_file.txt
+# Download a tracked file
+./build/main download file.bin /tmp/restored.bin
 
-# List files
-curl -X GET http://localhost:9669/files
-
-# Delete a file
-curl -X DELETE http://localhost:9669/files/filename.txt
+# List all files known to the metadata store (Redis or fallback)
+./build/main list
 ```
+
+> **Note:** The REST API referenced in earlier drafts is still under development. Use the CLI workflow above for the current release.
 
 ### Configuration
 
@@ -242,6 +247,12 @@ Key configuration options:
   "max_connections": 1000 // Maximum concurrent connections
 }
 ```
+
+### Metadata Storage Modes
+
+- **Redis-backed (recommended for production):** Configure the build with `-DWITH_REDIS=ON`. The head server automatically starts/uses a local Redis instance (or connects to the one you provide) for chunk metadata, replication coordination, and TTL support.
+- **Embedded fallback (default):** When Redis is disabled, metadata is stored in a simple on-disk database at `/tmp/dfg_metadata.db`. Override the location via the `DFG_METADATA_DB` environment variable if you want the data under version control or a persistent volume.
+- **Listing helper:** Regardless of the backend, `./build/main list` enumerates every tracked file by calling the new `list_all_files()` helper in `redis_handler.hpp`.
 
 ### Monitoring & Management
 
@@ -377,6 +388,13 @@ make -j$(nproc)
 - **Logging & Debugging**: Comprehensive logging with centralized collection
 
 **All executables compile and run successfully on Arch Linux with GCC 15.2.1**
+
+## Current Status
+
+- **CLI-first workflow**: `./build/main` drives the system via the `head-server`, `cluster-server`, `health-checker`, `upload`, `download`, and `list` commands. An HTTP API is planned but not yet implemented.
+- **Metadata backends**: Redis remains fully supported (`-DWITH_REDIS=ON`), while builds without Redis transparently fall back to an on-disk metadata store at `/tmp/dfg_metadata.db` (override with `DFG_METADATA_DB`).
+- **Embedded coordinator**: The ZooKeeper-style head monitor now ships with a built-in coordination layer, so the `zk_head_server_monitor` binary is always available without any external C dependencies.
+- **Docker scripts**: Container and orchestration assets are provided for future work but are not required for the native CLI workflow described below.
 
 ### Running Tests
 

@@ -16,17 +16,6 @@ enable_testing()
 
 # Find required packages
 find_package(Threads REQUIRED)
-find_package(PkgConfig REQUIRED)
-
-# Find ZooKeeper
-find_package(ZooKeeper REQUIRED)
-if(NOT TARGET zookeeper_mt)
-    message(FATAL_ERROR "ZooKeeper C client library not found. Please install libzookeeper-mt-dev or similar package.")
-endif()
-
-# Add ZooKeeper include directories
-include_directories(${ZOOKEEPER_INCLUDE_DIRS})
-message(STATUS "Found ZooKeeper: ${ZOOKEEPER_VERSION}")
 
 # Find Protobuf
 find_package(Protobuf REQUIRED CONFIG)
@@ -80,10 +69,21 @@ set(ABSEIL_LIBS
     absl::log
 )
 
-# Find Prometheus-CPP package
-find_package(prometheus-cpp REQUIRED)
+# Prometheus-cpp (download via FetchContent to avoid external dependency)
+FetchContent_Declare(
+    prometheus-cpp
+    GIT_REPOSITORY https://github.com/jupp0r/prometheus-cpp.git
+    GIT_TAG v1.2.4
+)
+set(_DFG_ENABLE_TESTING_BACKUP ${ENABLE_TESTING})
+set(ENABLE_TESTING OFF CACHE BOOL "Build prometheus-cpp tests" FORCE)
+FetchContent_MakeAvailable(prometheus-cpp)
+if(DEFINED _DFG_ENABLE_TESTING_BACKUP)
+    set(ENABLE_TESTING ${_DFG_ENABLE_TESTING_BACKUP} CACHE BOOL "Build tests" FORCE)
+else()
+    unset(ENABLE_TESTING CACHE)
+endif()
 
-# Set up Prometheus components
 set(PROMETHEUS_LIBS
     prometheus-cpp::core
     prometheus-cpp::pull
@@ -192,9 +192,10 @@ target_link_libraries(health_checker PRIVATE
     absl::log_internal_check_op
 )
 
-# ZooKeeper Head Server Monitor
+# ZooKeeper Head Server Monitor (now backed by the embedded coordinator)
 add_executable(zk_head_server_monitor
     src/ZooKeeper_HealthChecker/zk_head_server_monitor.cpp
+    src/ZooKeeper_HealthChecker/zookeeper_client.cpp
 )
 
 target_include_directories(zk_head_server_monitor PRIVATE
@@ -203,17 +204,13 @@ target_include_directories(zk_head_server_monitor PRIVATE
 
 target_link_libraries(zk_head_server_monitor PRIVATE
     ${CMAKE_THREAD_LIBS_INIT}
-    zookeeper_mt
-)
-
-target_include_directories(zk_head_server_monitor PRIVATE
-    ${ZOOKEEPER_INCLUDE_DIRS}
 )
 
 # Include directories for protobuf
 target_include_directories(head_server PRIVATE 
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/include
+    ${CMAKE_BINARY_DIR}/generated
     ${CMAKE_SOURCE_DIR}/src/protos/v1/generate
     ${Protobuf_INCLUDE_DIRS}
 )
@@ -221,6 +218,7 @@ target_include_directories(head_server PRIVATE
 target_include_directories(cluster_server PRIVATE 
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/include
+    ${CMAKE_BINARY_DIR}/generated
     ${CMAKE_SOURCE_DIR}/src/protos/v1/generate
     ${Protobuf_INCLUDE_DIRS}
 )
@@ -228,6 +226,7 @@ target_include_directories(cluster_server PRIVATE
 target_include_directories(health_checker PRIVATE 
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/include
+    ${CMAKE_BINARY_DIR}/generated
     ${CMAKE_SOURCE_DIR}/src/protos/v1/generate
     ${Protobuf_INCLUDE_DIRS}
 )

@@ -21,6 +21,29 @@
 #include <memory>
 #include <functional>
 
+// Minimal zerror shim to keep legacy logging intact while using the embedded client
+namespace {
+const char* zerror(int code) {
+    switch (code) {
+        case ZOK:
+            return "OK";
+        case ZNODEEXISTS:
+            return "Node already exists";
+        case ZNONODE:
+            return "Node not found";
+        case ZINVALIDSTATE:
+            return "Invalid client state";
+        default: {
+            thread_local std::string buffer;
+            buffer = "Unknown error (" + std::to_string(code) + ")";
+            return buffer.c_str();
+        }
+    }
+}
+} // namespace
+
+std::string get_local_ip_address();
+
 // Real ZooKeeper client wrapper
 class ZooKeeperClientWrapper {
 private:

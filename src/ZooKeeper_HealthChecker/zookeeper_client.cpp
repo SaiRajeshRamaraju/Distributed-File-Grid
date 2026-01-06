@@ -1,326 +1,277 @@
 #include "zookeeper_client.hpp"
-#include <cstring>
-#include <stdexcept>
+
+#include <algorithm>
+#include <iomanip>
+#include <map>
+#include <mutex>
+#include <set>
 #include <sstream>
-#include <iostream>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace {
+
+struct Node {
+	std::string data;
+	bool ephemeral = false;
+	int version = 0;
+	std::set<std::string> children;
+};
+
+std::unordered_map<std::string, Node>& store() {
+	static std::unordered_map<std::string, Node> nodes = [] {
+		std::unordered_map<std::string, Node> initial;
+		initial["/"] = Node{};
+		return initial;
+	}();
+	return nodes;
+}
+
+std::unordered_map<std::string, int>& sequence_counters() {
+	static std::unordered_map<std::string, int> counters;
+	return counters;
+}
+
+std::mutex& store_mutex() {
+	static std::mutex m;
+	return m;
+}
+
+std::string normalize_path(const std::string& raw) {
+	if (raw.empty()) {
+		return "/";
+	}
+
+	std::string path = raw;
+	if (path.front() != '/') {
+		path.insert(path.begin(), '/');
+	}
+	while (path.size() > 1 && path.back() == '/') {
+		path.pop_back();
+	}
+	return path;
+}
+
+std::string parent_path(const std::string& path) {
+	if (path == "/") {
+		return "";
+	}
+	auto pos = path.find_last_of('/');
+	if (pos == 0) {
+		return "/";
+	}
+	return path.substr(0, pos);
+}
+
+std::string child_name(const std::string& path) {
+	if (path == "/") {
+		return "/";
+	}
+	auto pos = path.find_last_of('/');
+	return path.substr(pos + 1);
+}
+
+bool ensure_parent_exists(const std::string& parent) {
+	if (parent.empty()) {
+		return true;
+	}
+	auto& nodes = store();
+	return nodes.find(parent) != nodes.end();
+}
+
+} // namespace
 
 ZooKeeperClient::ZooKeeperClient(const std::string& hosts, int recv_timeout)
-    : hosts_(hosts), recv_timeout_(recv_timeout), connected_(false), zk_handle_(nullptr) {
-}
+	: hosts_(hosts), recv_timeout_(recv_timeout), connected_(false) {}
 
-ZooKeeperClient::~ZooKeeperClient() {
-    disconnect();
-}
+ZooKeeperClient::~ZooKeeperClient() { disconnect(); }
 
 bool ZooKeeperClient::connect() {
-    std::unique_lock<std::mutex> lock(mutex_);
-    
-    if (zk_handle_) {
-        return true;
-    }
-    
-    // Initialize ZooKeeper client
-    zk_handle_ = zookeeper_init(hosts_.c_str(), 
-                               &ZooKeeperClient::watcher, 
-                               recv_timeout_, 
-                               nullptr, 
-                               this, 
-                               0);
-    
-    if (!zk_handle_) {
-        return false;
-    }
-    
-    // Wait for connection to be established
-    if (cv_.wait_for(lock, std::chrono::milliseconds(recv_timeout_), 
-                    [this] { return connected_ || !zk_handle_; })) {
-        return connected_;
-    }
-    
-    return false;
+	bool notify = false;
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (connected_) {
+			return true;
+		}
+		connected_ = true;
+		notify = true;
+	}
+	if (notify) {
+		invoke_watch(ZOO_CREATED_EVENT, ZOO_CONNECTED_STATE, hosts_);
+	}
+	return true;
 }
 
 void ZooKeeperClient::disconnect() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (zk_handle_) {
-        zookeeper_close(zk_handle_);
-        zk_handle_ = nullptr;
-        connected_ = false;
-    }
+	bool notify = false;
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (!connected_) {
+			return;
+		}
+		connected_ = false;
+		notify = true;
+	}
+	if (notify) {
+		invoke_watch(ZOO_DELETED_EVENT, ZOO_EXPIRED_SESSION_STATE, hosts_);
+	}
 }
 
 bool ZooKeeperClient::is_connected() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return connected_ && zk_handle_ && zoo_state(zk_handle_) == ZOO_CONNECTED_STATE;
+	std::lock_guard<std::mutex> lock(mutex_);
+	return connected_;
 }
 
 int ZooKeeperClient::get_state() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return zk_handle_ ? zoo_state(zk_handle_) : 0;
+	std::lock_guard<std::mutex> lock(mutex_);
+	return connected_ ? ZOO_CONNECTED_STATE : ZOO_CONNECTING_STATE;
 }
 
-std::string ZooKeeperClient::get_current_server() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!zk_handle_) return "";
-    
-    char buf[1024] = {0};
-    int len = sizeof(buf);
-    zoo_get_current_server(zk_handle_, buf, &len);
-    return std::string(buf, len);
-}
+std::string ZooKeeperClient::get_current_server() const { return hosts_; }
 
-// Synchronous operations
 int ZooKeeperClient::create_node(const std::string& path, const std::string& data, bool ephemeral, bool sequence) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!zk_handle_) return ZINVALIDSTATE;
-    
-    int flags = 0;
-    if (ephemeral) flags |= ZOO_EPHEMERAL;
-    if (sequence) flags |= ZOO_SEQUENCE;
-    
-    char path_buffer[1024];
-    int path_len = sizeof(path_buffer);
-    
-    int rc = zoo_create(zk_handle_, 
-                       path.c_str(), 
-                       data.c_str(), 
-                       data.length(),
-                       &ZOO_OPEN_ACL_UNSAFE,
-                       flags,
-                       path_buffer,
-                       path_len);
-    
-    return rc;
+	if (!is_connected()) {
+		return ZINVALIDSTATE;
+	}
+
+	std::string normalized = normalize_path(path);
+	std::string created_path;
+
+	{
+		std::lock_guard<std::mutex> lock(store_mutex());
+		auto& nodes = store();
+		std::string actual_path = normalized;
+
+		if (sequence) {
+			int seq = ++sequence_counters()[normalized];
+			std::ostringstream oss;
+			oss << normalized << '_' << std::setw(10) << std::setfill('0') << seq;
+			actual_path = oss.str();
+		}
+
+		if (nodes.find(actual_path) != nodes.end()) {
+			return ZNODEEXISTS;
+		}
+
+		std::string parent = parent_path(actual_path);
+		if (!parent.empty() && !ensure_parent_exists(parent)) {
+			return ZNONODE;
+		}
+
+		Node node;
+		node.data = data;
+		node.ephemeral = ephemeral;
+		nodes[actual_path] = std::move(node);
+
+		if (!parent.empty()) {
+			nodes[parent].children.insert(child_name(actual_path));
+		}
+
+		created_path = actual_path;
+	}
+
+	invoke_watch(ZOO_CREATED_EVENT, ZOO_CHANGED_EVENT, created_path);
+	return ZOK;
 }
 
-int ZooKeeperClient::delete_node(const std::string& path, int version) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!zk_handle_) return ZINVALIDSTATE;
-    
-    return zoo_delete(zk_handle_, path.c_str(), version);
+int ZooKeeperClient::delete_node(const std::string& path, int /*version*/) {
+	if (!is_connected()) {
+		return ZINVALIDSTATE;
+	}
+
+	std::string normalized = normalize_path(path);
+	{
+		std::lock_guard<std::mutex> lock(store_mutex());
+		auto& nodes = store();
+		auto it = nodes.find(normalized);
+		if (it == nodes.end()) {
+			return ZNONODE;
+		}
+		if (!it->second.children.empty()) {
+			return ZINVALIDSTATE;
+		}
+
+		std::string parent = parent_path(normalized);
+		if (!parent.empty()) {
+			nodes[parent].children.erase(child_name(normalized));
+		}
+
+		nodes.erase(it);
+	}
+
+	invoke_watch(ZOO_DELETED_EVENT, ZOO_CHANGED_EVENT, normalized);
+	return ZOK;
 }
 
 bool ZooKeeperClient::node_exists(const std::string& path) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!zk_handle_) return false;
-    
-    struct Stat stat;
-    return zoo_exists(zk_handle_, path.c_str(), 0, &stat) == ZOK;
+	std::string normalized = normalize_path(path);
+	std::lock_guard<std::mutex> lock(store_mutex());
+	return store().find(normalized) != store().end();
 }
 
-std::string ZooKeeperClient::get_node_data(const std::string& path, bool watch) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!zk_handle_) return "";
-    
-    char buffer[1024 * 1024]; // 1MB buffer
-    int buffer_len = sizeof(buffer);
-    struct Stat stat;
-    
-    int rc = zoo_wget(zk_handle_, 
-                     path.c_str(), 
-                     watch ? &ZooKeeperClient::watcher : nullptr,
-                     this,
-                     buffer, 
-                     &buffer_len,
-                     &stat);
-    
-    if (rc == ZOK) {
-        return std::string(buffer, buffer_len);
-    }
-    
-    return "";
+std::string ZooKeeperClient::get_node_data(const std::string& path, bool /*watch*/) {
+	std::string normalized = normalize_path(path);
+	std::lock_guard<std::mutex> lock(store_mutex());
+	auto& nodes = store();
+	auto it = nodes.find(normalized);
+	if (it == nodes.end()) {
+		return {};
+	}
+	return it->second.data;
 }
 
-int ZooKeeperClient::set_node_data(const std::string& path, const std::string& data, int version) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!zk_handle_) return ZINVALIDSTATE;
-    
-    return zoo_set(zk_handle_, path.c_str(), data.c_str(), data.length(), version);
+int ZooKeeperClient::set_node_data(const std::string& path, const std::string& data, int /*version*/) {
+	if (!is_connected()) {
+		return ZINVALIDSTATE;
+	}
+
+	std::string normalized = normalize_path(path);
+	{
+		std::lock_guard<std::mutex> lock(store_mutex());
+		auto& nodes = store();
+		auto it = nodes.find(normalized);
+		if (it == nodes.end()) {
+			return ZNONODE;
+		}
+		it->second.data = data;
+		++it->second.version;
+	}
+
+	invoke_watch(ZOO_CHANGED_EVENT, ZOO_CHANGED_EVENT, normalized);
+	return ZOK;
 }
 
-std::vector<std::string> ZooKeeperClient::get_children(const std::string& path, bool watch) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    std::vector<std::string> children;
-    
-    if (!zk_handle_) return children;
-    
-    struct String_vector strings;
-    int rc = zoo_wget_children(zk_handle_, 
-                              path.c_str(), 
-                              watch ? &ZooKeeperClient::watcher : nullptr,
-                              this,
-                              &strings);
-    
-    if (rc == ZOK) {
-        for (int i = 0; i < strings.count; ++i) {
-            children.emplace_back(strings.data[i]);
-        }
-        deallocate_String_vector(&strings);
-    }
-    
-    return children;
+std::vector<std::string> ZooKeeperClient::get_children(const std::string& path, bool /*watch*/) {
+	std::string normalized = normalize_path(path);
+	std::lock_guard<std::mutex> lock(store_mutex());
+	auto& nodes = store();
+	auto it = nodes.find(normalized);
+	if (it == nodes.end()) {
+		return {};
+	}
+
+	std::vector<std::string> children;
+	children.reserve(it->second.children.size());
+	for (const auto& child : it->second.children) {
+		children.push_back(child);
+	}
+	return children;
 }
 
-// Asynchronous operations
-void ZooKeeperClient::create_node_async(const std::string& path, 
-                                       const std::string& data, 
-                                       bool ephemeral, 
-                                       bool sequence, 
-                                       StringCallback cb) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!zk_handle_) {
-        cb(ZINVALIDSTATE, nullptr, 0);
-        return;
-    }
-    
-    int flags = 0;
-    if (ephemeral) flags |= ZOO_EPHEMERAL;
-    if (sequence) flags |= ZOO_SEQUENCE;
-    
-    auto* ctx = new StringCallback(std::move(cb));
-    
-    int rc = zoo_acreate(zk_handle_, 
-                        path.c_str(), 
-                        data.c_str(), 
-                        data.length(),
-                        &ZOO_OPEN_ACL_UNSAFE,
-                        flags,
-                        &ZooKeeperClient::string_completion,
-                        ctx);
-    
-    if (rc != ZOK) {
-        delete ctx;
-        cb(rc, nullptr, 0);
-    }
-}
-
-void ZooKeeperClient::get_children_async(const std::string& path, bool watch, StringsCallback cb) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!zk_handle_) {
-        cb(ZINVALIDSTATE, nullptr);
-        return;
-    }
-    
-    auto* ctx = new StringsCallback(std::move(cb));
-    
-    int rc = zoo_awget_children(zk_handle_,
-                               path.c_str(),
-                               watch ? &ZooKeeperClient::watcher : nullptr,
-                               this,
-                               &ZooKeeperClient::strings_completion,
-                               ctx);
-    
-    if (rc != ZOK) {
-        delete ctx;
-        cb(rc, nullptr);
-    }
-}
-
-void ZooKeeperClient::get_node_data_async(const std::string& path, bool watch, DataCallback cb) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!zk_handle_) {
-        cb(ZINVALIDSTATE, nullptr, 0, nullptr);
-        return;
-    }
-    
-    auto* ctx = new DataCallback(std::move(cb));
-    
-    int rc = zoo_awget(zk_handle_,
-                      path.c_str(),
-                      watch ? &ZooKeeperClient::watcher : nullptr,
-                      this,
-                      &ZooKeeperClient::data_completion,
-                      ctx);
-    
-    if (rc != ZOK) {
-        delete ctx;
-        cb(rc, nullptr, 0, nullptr);
-    }
-}
-
-void ZooKeeperClient::set_node_data_async(const std::string& path, 
-                                         const std::string& data, 
-                                         int version, 
-                                         StatCallback cb) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!zk_handle_) {
-        cb(ZINVALIDSTATE, nullptr);
-        return;
-    }
-    
-    auto* ctx = new StatCallback(std::move(cb));
-    
-    int rc = zoo_aset(zk_handle_,
-                     path.c_str(),
-                     data.c_str(),
-                     data.length(),
-                     version,
-                     &ZooKeeperClient::stat_completion,
-                     ctx);
-    
-    if (rc != ZOK) {
-        delete ctx;
-        cb(rc, nullptr);
-    }
-}
-
-// Watch management
 void ZooKeeperClient::set_watch_callback(WatchCallback cb) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    watch_callback_ = std::move(cb);
+	std::lock_guard<std::mutex> lock(mutex_);
+	watch_callback_ = std::move(cb);
 }
 
-// Static callbacks
-void ZooKeeperClient::watcher(zhandle_t* zh, int type, int state, const char* path, void* watcherCtx) {
-    auto* client = static_cast<ZooKeeperClient*>(watcherCtx);
-    if (!client) return;
-    
-    {
-        std::lock_guard<std::mutex> lock(client->mutex_);
-        if (state == ZOO_CONNECTED_STATE) {
-            client->connected_ = true;
-            client->cv_.notify_all();
-        } else if (state == ZOO_EXPIRED_SESSION_STATE) {
-            client->connected_ = false;
-            // Attempt to reconnect
-            client->connect();
-        }
-    }
-    
-    if (client->watch_callback_) {
-        client->watch_callback_(type, state, path);
-    }
+void ZooKeeperClient::invoke_watch(int type, int state, const std::string& path) {
+	WatchCallback cb;
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		cb = watch_callback_;
+	}
+	if (cb) {
+		cb(type, state, path.c_str());
+	}
 }
 
-void ZooKeeperClient::string_completion(int rc, const char* value, const void* data) {
-    auto* cb = const_cast<StringCallback*>(static_cast<const StringCallback*>(data));
-    if (cb) {
-        (*cb)(rc, value, value ? strlen(value) : 0);
-        delete cb;
-    }
-}
-
-void ZooKeeperClient::strings_completion(int rc, const struct String_vector* strings, const void* data) {
-    auto* cb = const_cast<StringsCallback*>(static_cast<const StringsCallback*>(data));
-    if (cb) {
-        (*cb)(rc, strings);
-        delete cb;
-    }
-}
-
-void ZooKeeperClient::stat_completion(int rc, const struct Stat* stat, const void* data) {
-    auto* cb = const_cast<StatCallback*>(static_cast<const StatCallback*>(data));
-    if (cb) {
-        (*cb)(rc, stat);
-        delete cb;
-    }
-}
-
-void ZooKeeperClient::data_completion(int rc, const char* value, int value_len, 
-                                     const struct Stat* stat, const void* data) {
-    auto* cb = const_cast<DataCallback*>(static_cast<const DataCallback*>(data));
-    if (cb) {
-        (*cb)(rc, value, value_len, stat);
-        delete cb;
-    }
-}

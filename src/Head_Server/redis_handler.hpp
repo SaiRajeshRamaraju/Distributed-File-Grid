@@ -1,11 +1,15 @@
 #ifndef REDIS_HANDLER_HPP
 #define REDIS_HANDLER_HPP
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <fcntl.h>
+#include <fstream>
 #include <iostream>
+#include <mutex>
 #include <sstream>
+#include <string>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -40,6 +44,98 @@ inline std::pair<std::string, std::string> decode_loc(const std::string &v) {
     return {v, ""};
   return {v.substr(0, p), v.substr(p + 1)};
 }
+
+#ifndef WITH_REDIS
+namespace metadata_store {
+struct ChunkRecord {
+  long long chunk_id{};
+  std::string server;
+  std::string path;
+};
+
+using MetadataMap = std::unordered_map<std::string, std::vector<ChunkRecord>>;
+
+inline std::string db_path() {
+  const char *custom = std::getenv("DFG_METADATA_DB");
+  return (custom && *custom) ? std::string(custom) : std::string{"/tmp/dfg_metadata.db"};
+}
+
+inline MetadataMap load_from_disk() {
+  MetadataMap map;
+  std::ifstream in(db_path());
+  if (!in)
+    return map;
+
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line.empty())
+      continue;
+    std::istringstream iss(line);
+    std::string file_name;
+    ChunkRecord record;
+    if (!(iss >> file_name >> record.chunk_id >> record.server >> record.path))
+      continue;
+    map[file_name].push_back(record);
+  }
+  return map;
+}
+
+inline MetadataMap &store() {
+  static MetadataMap data = load_from_disk();
+  return data;
+}
+
+inline std::mutex &store_mutex() {
+  static std::mutex m;
+  return m;
+}
+
+inline void persist_locked() {
+  std::ofstream out(db_path(), std::ios::trunc);
+  if (!out) {
+    std::cerr << "Failed to persist metadata store" << std::endl;
+    return;
+  }
+  for (const auto &kv : store()) {
+    for (const auto &chunk : kv.second) {
+      out << kv.first << ' ' << chunk.chunk_id << ' ' << chunk.server << ' '
+          << chunk.path << '\n';
+    }
+  }
+}
+
+inline void replace_file_chunks(const std::string &file,
+                                std::vector<ChunkRecord> &&chunks) {
+  std::lock_guard<std::mutex> lock(store_mutex());
+  store()[file] = std::move(chunks);
+  persist_locked();
+}
+
+inline std::vector<ChunkRecord> get_chunks(const std::string &file) {
+  std::lock_guard<std::mutex> lock(store_mutex());
+  auto it = store().find(file);
+  if (it == store().end())
+    return {};
+  return it->second;
+}
+
+inline void remove_file(const std::string &file) {
+  std::lock_guard<std::mutex> lock(store_mutex());
+  store().erase(file);
+  persist_locked();
+}
+
+inline std::vector<std::string> list_files_snapshot() {
+  std::lock_guard<std::mutex> lock(store_mutex());
+  std::vector<std::string> files;
+  files.reserve(store().size());
+  for (const auto &kv : store())
+    files.push_back(kv.first);
+  std::sort(files.begin(), files.end());
+  return files;
+}
+} // namespace metadata_store
+#endif
 
 #ifdef WITH_REDIS
 inline void create_entry(const std::string& request) {
@@ -101,8 +197,35 @@ inline void create_entry(const std::string& request) {
   }
 }
 #else
-inline void create_entry(const std::string& request) {
-  std::cout << "Redis disabled - create_entry not implemented\n";
+inline void create_entry(const std::string &request) {
+  std::istringstream in(request);
+  std::string file_name;
+  std::getline(in, file_name);
+  if (file_name.empty())
+    file_name = gen_file_id();
+
+  std::vector<std::string> raw_lines;
+  std::string line;
+  while (std::getline(in, line)) {
+    if (!line.empty())
+      raw_lines.push_back(line);
+  }
+
+  if (!raw_lines.empty() && raw_lines.front().rfind("TTL=", 0) == 0) {
+    raw_lines.erase(raw_lines.begin());
+  }
+
+  std::vector<metadata_store::ChunkRecord> chunks;
+  for (const auto &entry_line : raw_lines) {
+    std::istringstream ls(entry_line);
+    metadata_store::ChunkRecord record;
+    if (!(ls >> record.chunk_id >> record.server >> record.path))
+      continue;
+    chunks.push_back(record);
+  }
+
+  metadata_store::replace_file_chunks(file_name, std::move(chunks));
+  std::cout << "Created file entry: " << file_name << "\n";
 }
 #endif
 
@@ -158,8 +281,40 @@ inline void read_entry(const std::string& request) {
   }
 }
 #else
-inline void read_entry(const std::string& request) {
-  std::cout << "Redis disabled - read_entry not implemented\n";
+inline void read_entry(const std::string &request) {
+  std::istringstream in(request);
+  std::string file_name;
+  in >> file_name;
+  if (file_name.empty()) {
+    std::cerr << "read_entry: file_name required" << std::endl;
+    return;
+  }
+
+  auto chunks = metadata_store::get_chunks(file_name);
+  if (chunks.empty()) {
+    std::cout << "No chunks or file not found" << std::endl;
+    return;
+  }
+
+  long long desired_chunk = -1;
+  if (in >> desired_chunk) {
+    auto it = std::find_if(chunks.begin(), chunks.end(),
+                           [desired_chunk](const metadata_store::ChunkRecord &record) {
+                             return record.chunk_id == desired_chunk;
+                           });
+    if (it != chunks.end()) {
+      std::cout << "chunk:" << it->chunk_id << " server=" << it->server
+                << " path=" << it->path << std::endl;
+    } else {
+      std::cout << "Chunk not found" << std::endl;
+    }
+    return;
+  }
+
+  for (const auto &record : chunks) {
+    std::cout << "chunk:" << record.chunk_id << " server=" << record.server
+              << " path=" << record.path << std::endl;
+  }
 }
 #endif
 
@@ -193,7 +348,10 @@ inline void delete_entry(const std::string& file_name) {
 }
 #else
 inline void delete_entry(const std::string& file_name) {
-  std::cout << "Redis disabled - delete_entry not implemented\n";
+  if (file_name.empty())
+    return;
+  metadata_store::remove_file(file_name);
+  std::cout << "Removed keys: 1" << std::endl;
 }
 #endif
 
@@ -224,8 +382,9 @@ inline int create_replication(const std::string& ip_address) {
 }
 #else
 inline int create_replication(const std::string& ip_address) {
-  std::cout << "Redis disabled - create_replication not implemented\n";
-  return -1;
+  (void)ip_address;
+  std::cout << "Redis disabled - replication simulated locally" << std::endl;
+  return 0;
 }
 #endif
 
@@ -297,6 +456,31 @@ inline bool is_redis_running(const std::string& host = "127.0.0.1", int port = 6
 inline int start_server() {
   std::cout << "Redis disabled - using in-memory storage simulation" << std::endl;
   return 0; // Return success since we're simulating
+}
+#endif
+
+#ifdef WITH_REDIS
+inline std::vector<std::string> list_all_files() {
+  try {
+    Redis redis("tcp://127.0.0.1:6379");
+    std::vector<std::string> files;
+    auto keys = redis.keys("file:*");
+    files.reserve(keys.size());
+    for (const auto &key : keys) {
+      if (key.rfind("file:", 0) == 0) {
+        files.push_back(key.substr(5));
+      }
+    }
+    std::sort(files.begin(), files.end());
+    return files;
+  } catch (const std::exception &e) {
+    std::cerr << "list_all_files error: " << e.what() << std::endl;
+    return {};
+  }
+}
+#else
+inline std::vector<std::string> list_all_files() {
+  return metadata_store::list_files_snapshot();
 }
 #endif
 

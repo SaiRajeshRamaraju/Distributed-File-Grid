@@ -1,8 +1,11 @@
 #include "include/version.h"
+#include "Head_Server/redis_handler.hpp"
 #include <iostream>
+#include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
+#include <chrono>
 #include <signal.h>
 
 // Forward declarations for service functions
@@ -103,6 +106,20 @@ int download_file(const std::string& filename, const std::string& output_path) {
     }
     
     return result;
+}
+
+int list_files_command() {
+    auto files = list_all_files();
+    if (files.empty()) {
+        std::cout << "No files tracked in metadata store." << std::endl;
+        return 0;
+    }
+
+    std::cout << "Tracked files:" << std::endl;
+    for (const auto& file : files) {
+        std::cout << "  - " << file << std::endl;
+    }
+    return 0;
 }
 
 int run_tests() {
@@ -218,6 +235,8 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             return download_file(argv[2], argv[3]);
+        } else if (command == "list") {
+            return list_files_command();
         } else if (command == "test") {
             return run_tests();
         } else {

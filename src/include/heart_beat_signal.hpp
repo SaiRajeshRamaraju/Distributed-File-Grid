@@ -21,7 +21,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "../protos/v1/generate/heart_beat.pb.h"
+#include "heart_beat.pb.h"
 #include <google/protobuf/timestamp.pb.h>
 #include <google/protobuf/util/time_util.h>
 
