@@ -10,6 +10,11 @@
 #include <future>
 #include <random>
 #include <algorithm>
+#include "file_transfer.pb.h"
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 
 namespace fs = std::filesystem;
 
@@ -60,22 +65,88 @@ private:
     
     bool send_chunk_to_server(const std::string& server, int chunk_id, 
                              const std::vector<char>& chunk_data, const std::string& filename) {
-        // In a real implementation, this would send the chunk via HTTP/gRPC
-        // For now, simulate by writing to local storage
-        std::string chunk_filename = "/tmp/chunks/" + server + "_" + filename + "_chunk_" + std::to_string(chunk_id);
         
-        // Create directory if it doesn't exist
-        fs::create_directories(fs::path(chunk_filename).parent_path());
+        std::string ip = server;
+        int port = 8080;
+        size_t pos = server.find(':');
+        if (pos != std::string::npos) {
+            ip = server.substr(0, pos);
+            port = std::stoi(server.substr(pos + 1));
+        }
+        int transfer_port = port + 100;
         
-        std::ofstream file(chunk_filename, std::ios::binary);
-        if (!file) {
-            std::cerr << "Failed to create chunk file: " << chunk_filename << std::endl;
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) {
+            std::cerr << "Socket creation error" << std::endl;
+            return false;
+        }
+
+        struct sockaddr_in serv_addr;
+        serv_addr.sin_family = AF_INET;
+        serv_addr.sin_port = htons(transfer_port);
+
+        if (inet_pton(AF_INET, ip.c_str(), &serv_addr.sin_addr) <= 0) {
+            std::cerr << "Invalid address for file transfer: " << ip << std::endl;
+            close(sock);
+            return false;
+        }
+
+        if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+            std::cerr << "Connection failed to transfoer port " << ip << ":" << transfer_port << std::endl;
+            close(sock);
+            return false;
+        }
+
+        file_transfer::v1::ChunkData msg;
+        // Make chunk_id unique incorporating filename so fetching is accurate
+        std::string unique_chunk_id = filename + "_chunk_" + std::to_string(chunk_id);
+        msg.set_chunk_id(unique_chunk_id);
+        msg.set_filename(filename);
+        msg.set_data(chunk_data.data(), chunk_data.size());
+
+        std::string serialized;
+        msg.SerializeToString(&serialized);
+
+        uint32_t type = htonl(1);
+        uint32_t len = htonl(serialized.size());
+        
+        send(sock, &type, sizeof(type), 0);
+        send(sock, &len, sizeof(len), 0);
+        
+        size_t total_sent = 0;
+        while(total_sent < serialized.size()) {
+            ssize_t sent = send(sock, serialized.data() + total_sent, serialized.size() - total_sent, 0);
+            if (sent < 0) {
+               std::cerr << "Failed to send chunk data" << std::endl;
+               close(sock);
+               return false;
+            }
+            total_sent += sent;
+        }
+        
+        uint32_t resp_len_net;
+        if (recv(sock, &resp_len_net, sizeof(resp_len_net), MSG_WAITALL) != 4) {
+             std::cerr << "Failed to receive response length" << std::endl;
+             close(sock);
+             return false;
+        }
+        
+        uint32_t resp_len = ntohl(resp_len_net);
+        std::vector<char> resp_buf(resp_len);
+        
+        if (recv(sock, resp_buf.data(), resp_len, MSG_WAITALL) != resp_len) {
+            close(sock);
             return false;
         }
         
-        file.write(chunk_data.data(), chunk_data.size());
-        file.close();
-        
+        file_transfer::v1::ChunkResponse resp;
+        if (!resp.ParseFromArray(resp_buf.data(), resp_len) || !resp.success()) {
+            std::cerr << "Server rejected chunk: " << resp.error_message() << std::endl;
+            close(sock);
+            return false;
+        }
+
+        close(sock);
         std::cout << "Stored chunk " << chunk_id << " on server " << server << std::endl;
         return true;
     }

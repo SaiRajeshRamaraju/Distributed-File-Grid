@@ -1,0 +1,49 @@
+syntax = "proto3";
+package file_transfer.v1;
+
+message ChunkData {
+  string chunk_id = 1;
+  string filename = 2;
+  bytes data = 3;
+}
+
+message ChunkResponse {
+  bool success = 1;
+  string chunk_id = 2;
+  string error_message = 3;
+}
+
+message FetchChunkRequest {
+  string chunk_id = 1;
+}
+
+message FetchChunkResponse {
+  bool success = 1;
+  string chunk_id = 2;
+  bytes data = 3;
+  string error_message = 4;
+}
+
+message FetchHashRequest {
+  string chunk_id = 1;
+}
+
+message FetchHashResponse {
+  bool success = 1;
+  string chunk_id = 2;
+  string hash = 3;
+  string error_message = 4;
+  float load_score = 5;
+}
+
+message ReplicateChunkRequest {
+  string chunk_id = 1;
+  string target_server_ip = 2; // the cluster node to replicate to
+  int32 target_server_port = 3;
+  string filename = 4;
+}
+
+message ReplicateChunkResponse {
+  bool success = 1;
+  string error_message = 2;
+}

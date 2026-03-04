@@ -350,9 +350,10 @@ inline bool resolve_ipv4(const std::string &host, uint16_t port,
   return true;
 }
 
-inline task send_heartbeats(Reactor &r, int sfd, int server_id) {
+inline task send_heartbeats(Reactor &r, int sfd, int server_id, const std::string& local_ip_port) {
   heart_beat::v1::HeartBeat hb;
   hb.set_server_id(server_id);
+  hb.set_ip(local_ip_port);
   while (true) {
     *hb.mutable_timestamp() =
         google::protobuf::util::TimeUtil::GetCurrentTime();
@@ -382,14 +383,14 @@ recv_heartbeats(Reactor &r, int sfd,
   }
 }
 
-inline int send_signal(std::string server_ip, int server_id, int port = 9000) {
+inline int send_signal(std::string server_ip, int server_id, int port = 9000, std::string local_ip_port = "") {
   try {
     sockaddr_in addr{};
     if (!resolve_ipv4(server_ip, static_cast<uint16_t>(port), addr)) {
       std::cerr << "Could not resolve hostname\n";
       return 1;
     }
-    int sfd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    int sfd = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (sfd < 0) {
       std::cerr << "Socket creation failed\n";
       return 1;
@@ -402,7 +403,7 @@ inline int send_signal(std::string server_ip, int server_id, int port = 9000) {
 
     Reactor r;
     r.spawn(async_connect(r, sfd, addr));
-    r.spawn(send_heartbeats(r, sfd, server_id));
+    r.spawn(send_heartbeats(r, sfd, server_id, local_ip_port));
     r.run();
     ::close(sfd);
     return 0;

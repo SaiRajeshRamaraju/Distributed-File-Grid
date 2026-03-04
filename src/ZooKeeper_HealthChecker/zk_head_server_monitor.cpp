@@ -21,7 +21,6 @@
 #include <memory>
 #include <functional>
 
-// Minimal zerror shim to keep legacy logging intact while using the embedded client
 namespace {
 const char* zerror(int code) {
     switch (code) {
@@ -141,7 +140,7 @@ public:
     }
     
     void cleanup_ephemeral_nodes() {
-        // In a real implementation, ephemeral nodes are automatically removed by ZooKeeper
+        // WARNING: In a real implementation, ephemeral nodes are automatically removed by ZooKeeper
         // when the session ends, so we don't need to do anything here.
     }
     

@@ -18,7 +18,7 @@ enable_testing()
 find_package(Threads REQUIRED)
 
 # Find Protobuf
-find_package(Protobuf REQUIRED CONFIG)
+find_package(Protobuf CONFIG)
 if(NOT Protobuf_FOUND)
     message(STATUS "Protobuf config not found, trying to find package")
     find_package(Protobuf REQUIRED)
@@ -120,7 +120,7 @@ foreach(PROTO_FILE ${PROTO_FILES})
     add_custom_command(
         OUTPUT ${PROTO_SRC} ${PROTO_HDR}
         COMMAND ${Protobuf_PROTOC_EXECUTABLE}
-        ARGS --cpp_out=${PROTO_GEN_DIR} -I ${PROTO_PATH} ${PROTO_FILE}
+        ARGS --experimental_allow_proto3_optional --cpp_out=${PROTO_GEN_DIR} -I ${PROTO_PATH} ${PROTO_FILE}
         DEPENDS ${PROTO_FILE} protobuf::protoc
         COMMENT "Generating C++ code for ${PROTO_NAME}.proto"
         VERBATIM
@@ -189,6 +189,7 @@ target_include_directories(health_checker PRIVATE
 
 target_link_libraries(health_checker PRIVATE
     ${COMMON_LIBS}
+    ${PROMETHEUS_LIBS}
     absl::log_internal_check_op
 )
 
@@ -204,6 +205,7 @@ target_include_directories(zk_head_server_monitor PRIVATE
 
 target_link_libraries(zk_head_server_monitor PRIVATE
     ${CMAKE_THREAD_LIBS_INIT}
+    ${PROMETHEUS_LIBS}
 )
 
 # Include directories for protobuf

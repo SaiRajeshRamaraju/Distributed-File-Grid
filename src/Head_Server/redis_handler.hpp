@@ -138,9 +138,17 @@ inline std::vector<std::string> list_files_snapshot() {
 #endif
 
 #ifdef WITH_REDIS
+inline std::string get_redis_connection_string() {
+  const char* host = std::getenv("REDIS_HOST");
+  const char* port = std::getenv("REDIS_PORT");
+  std::string host_str = host ? host : "127.0.0.1";
+  std::string port_str = port ? port : "6379";
+  return "tcp://" + host_str + ":" + port_str;
+}
+
 inline void create_entry(const std::string& request) {
   try {
-    Redis redis("tcp://127.0.0.1:6379"); // primary for writes [1]
+    Redis redis(get_redis_connection_string()); // primary for writes [1]
 
     std::istringstream in(request);
     std::string file_name;
@@ -243,7 +251,7 @@ inline void read_entry(const std::string& request) {
 
     // If reading from a replica, point this connection to the replica host.
     // [20]
-    Redis redis("tcp://127.0.0.1:6379"); // [1]
+    Redis redis(get_redis_connection_string()); // [1]
 
     if (in.good()) {
       // Specific chunk
@@ -371,7 +379,7 @@ inline int create_replication(const std::string& ip_address) {
                    ? 6379
                    : std::stoi(ip_address.substr(pos + 1));
 
-    Redis redis("tcp://127.0.0.1:6379"); // local node to become a replica [1]
+    Redis redis(get_redis_connection_string()); // local node to become a replica [1]
     redis.command("REPLICAOF", host,
                   std::to_string(port)); // server-side replication [19]
     return 0;
@@ -392,6 +400,7 @@ inline int create_replication(const std::string& ip_address) {
 // Check if Redis is already running by trying to connect
 inline bool is_redis_running(const std::string& host = "127.0.0.1", int port = 6379) {
   try {
+    // Use the provided host/port for checking, not the default connection string
     Redis redis("tcp://" + host + ":" + std::to_string(port));
     redis.ping();
     return true;
@@ -462,9 +471,10 @@ inline int start_server() {
 #ifdef WITH_REDIS
 inline std::vector<std::string> list_all_files() {
   try {
-    Redis redis("tcp://127.0.0.1:6379");
+    Redis redis(get_redis_connection_string());
     std::vector<std::string> files;
-    auto keys = redis.keys("file:*");
+    std::vector<std::string> keys;
+    redis.keys("file:*", std::back_inserter(keys));
     files.reserve(keys.size());
     for (const auto &key : keys) {
       if (key.rfind("file:", 0) == 0) {

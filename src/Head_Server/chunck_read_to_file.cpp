@@ -8,6 +8,11 @@
 #include <sstream>
 #include <map>
 #include <algorithm>
+#include "file_transfer.pb.h"
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 
 namespace fs = std::filesystem;
 
@@ -78,30 +83,221 @@ private:
         return locations;
     }
     
-    std::vector<char> read_chunk_from_server(const ChunkLocation& location) {
-        std::vector<char> chunk_data;
+    file_transfer::v1::FetchHashResponse get_chunk_hash(const ChunkLocation& location, const std::string& filename) {
+        file_transfer::v1::FetchHashResponse resp;
+        resp.set_success(false);
+        std::string ip = location.server_ip;
+        int port = 8080;
+        size_t pos = ip.find(':');
+        if (pos != std::string::npos) {
+            port = std::stoi(ip.substr(pos + 1));
+            ip = ip.substr(0, pos);
+        }
+        int transfer_port = port + 100;
         
-        try {
-            std::ifstream file(location.file_path, std::ios::binary);
-            if (!file) {
-                std::cerr << "Failed to read chunk from: " << location.file_path << std::endl;
-                return chunk_data;
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) return resp;
+
+        struct sockaddr_in serv_addr;
+        serv_addr.sin_family = AF_INET;
+        serv_addr.sin_port = htons(transfer_port);
+
+        if (inet_pton(AF_INET, ip.c_str(), &serv_addr.sin_addr) <= 0) {
+            close(sock);
+            return resp;
+        }
+
+        if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+            close(sock);
+            return resp;
+        }
+
+        file_transfer::v1::FetchHashRequest req;
+        std::string unique_chunk_id = filename + "_chunk_" + std::to_string(location.chunk_id);
+        req.set_chunk_id(unique_chunk_id);
+
+        std::string serialized;
+        req.SerializeToString(&serialized);
+        uint32_t type = htonl(3);
+        uint32_t len = htonl(serialized.size());
+        
+        send(sock, &type, sizeof(type), 0);
+        send(sock, &len, sizeof(len), 0);
+        
+        size_t total_sent = 0;
+        while(total_sent < serialized.size()) {
+            ssize_t sent = send(sock, serialized.data() + total_sent, serialized.size() - total_sent, 0);
+            if (sent < 0) {
+               close(sock);
+               return resp;
             }
-            
-            // Get file size
-            file.seekg(0, std::ios::end);
-            size_t file_size = file.tellg();
-            file.seekg(0, std::ios::beg);
-            
-            chunk_data.resize(file_size);
-            file.read(chunk_data.data(), file_size);
-            file.close();
-            
-            std::cout << "Read chunk " << location.chunk_id << " (" << file_size << " bytes) from " << location.server_ip << std::endl;
-        } catch (const std::exception& e) {
-            std::cerr << "Error reading chunk: " << e.what() << std::endl;
+            total_sent += sent;
         }
         
+        uint32_t resp_len_net;
+        if (recv(sock, &resp_len_net, sizeof(resp_len_net), MSG_WAITALL) != 4) {
+             close(sock);
+             return resp;
+        }
+        
+        uint32_t resp_len = ntohl(resp_len_net);
+        std::vector<char> resp_buf(resp_len);
+        
+        if (recv(sock, resp_buf.data(), resp_len, MSG_WAITALL) != resp_len) {
+            close(sock);
+            return resp;
+        }
+        
+        resp.ParseFromArray(resp_buf.data(), resp_len);
+        close(sock);
+        return resp;
+    }
+
+    bool repair_chunk_on_server(const ChunkLocation& location, const std::string& filename, const std::vector<char>& chunk_data) {
+        std::string ip = location.server_ip;
+        int port = 8080;
+        size_t pos = ip.find(':');
+        if (pos != std::string::npos) {
+            port = std::stoi(ip.substr(pos + 1));
+            ip = ip.substr(0, pos);
+        }
+        int transfer_port = port + 100;
+        
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) return false;
+
+        struct sockaddr_in serv_addr;
+        serv_addr.sin_family = AF_INET;
+        serv_addr.sin_port = htons(transfer_port);
+
+        if (inet_pton(AF_INET, ip.c_str(), &serv_addr.sin_addr) <= 0) {
+            close(sock);
+            return false;
+        }
+
+        if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+            close(sock);
+            return false;
+        }
+
+        file_transfer::v1::ChunkData msg;
+        std::string unique_chunk_id = filename + "_chunk_" + std::to_string(location.chunk_id);
+        msg.set_chunk_id(unique_chunk_id);
+        msg.set_filename(filename);
+        msg.set_data(chunk_data.data(), chunk_data.size());
+
+        std::string serialized;
+        msg.SerializeToString(&serialized);
+
+        uint32_t type = htonl(1); // Same type as upload (1 = ChunkData)
+        uint32_t len = htonl(serialized.size());
+        
+        send(sock, &type, sizeof(type), 0);
+        send(sock, &len, sizeof(len), 0);
+        
+        size_t total_sent = 0;
+        while(total_sent < serialized.size()) {
+            ssize_t sent = send(sock, serialized.data() + total_sent, serialized.size() - total_sent, 0);
+            if (sent < 0) {
+               close(sock);
+               return false;
+            }
+            total_sent += sent;
+        }
+        
+        uint32_t resp_len_net;
+        if (recv(sock, &resp_len_net, sizeof(resp_len_net), MSG_WAITALL) == 4) {
+            uint32_t resp_len = ntohl(resp_len_net);
+            std::vector<char> resp_buf(resp_len);
+            if (recv(sock, resp_buf.data(), resp_len, MSG_WAITALL) == resp_len) {
+                file_transfer::v1::ChunkResponse resp;
+                if (resp.ParseFromArray(resp_buf.data(), resp_len) && resp.success()) {
+                    close(sock);
+                    return true;
+                }
+            }
+        }
+        close(sock);
+        return false;
+    }
+
+    std::vector<char> read_chunk_from_server(const ChunkLocation& location, const std::string& filename) {
+        std::vector<char> chunk_data;
+        
+        std::string ip = location.server_ip;
+        int port = 8080;
+        size_t pos = ip.find(':');
+        if (pos != std::string::npos) {
+            port = std::stoi(ip.substr(pos + 1));
+            ip = ip.substr(0, pos);
+        }
+        int transfer_port = port + 100;
+        
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) return chunk_data;
+
+        struct sockaddr_in serv_addr;
+        serv_addr.sin_family = AF_INET;
+        serv_addr.sin_port = htons(transfer_port);
+
+        if (inet_pton(AF_INET, ip.c_str(), &serv_addr.sin_addr) <= 0) {
+            close(sock);
+            return chunk_data;
+        }
+
+        if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+            close(sock);
+            return chunk_data;
+        }
+
+        file_transfer::v1::FetchChunkRequest req;
+        std::string unique_chunk_id = filename + "_chunk_" + std::to_string(location.chunk_id);
+        req.set_chunk_id(unique_chunk_id);
+
+        std::string serialized;
+        req.SerializeToString(&serialized);
+
+        uint32_t type = htonl(2);
+        uint32_t len = htonl(serialized.size());
+        
+        send(sock, &type, sizeof(type), 0);
+        send(sock, &len, sizeof(len), 0);
+        
+        size_t total_sent = 0;
+        while(total_sent < serialized.size()) {
+            ssize_t sent = send(sock, serialized.data() + total_sent, serialized.size() - total_sent, 0);
+            if (sent < 0) {
+               close(sock);
+               return chunk_data;
+            }
+            total_sent += sent;
+        }
+        
+        uint32_t resp_len_net;
+        if (recv(sock, &resp_len_net, sizeof(resp_len_net), MSG_WAITALL) != 4) {
+             std::cerr << "Failed to receive fetch response length" << std::endl;
+             close(sock);
+             return chunk_data;
+        }
+        
+        uint32_t resp_len = ntohl(resp_len_net);
+        std::vector<char> resp_buf(resp_len);
+        
+        if (recv(sock, resp_buf.data(), resp_len, MSG_WAITALL) != resp_len) {
+            close(sock);
+            return chunk_data;
+        }
+        
+        file_transfer::v1::FetchChunkResponse resp;
+        if (!resp.ParseFromArray(resp_buf.data(), resp_len) || !resp.success()) {
+            std::cerr << "Server rejected fetch: " << resp.error_message() << std::endl;
+            close(sock);
+            return chunk_data;
+        }
+
+        chunk_data.assign(resp.data().begin(), resp.data().end());
+        close(sock);
+        std::cout << "Read chunk " << location.chunk_id << " (" << chunk_data.size() << " bytes) from " << location.server_ip << std::endl;
         return chunk_data;
     }
 
@@ -116,15 +312,13 @@ public:
             return false;
         }
         
-        // Group chunks by chunk_id and select one location per chunk (for redundancy)
-        std::map<int, ChunkLocation> unique_chunks;
+        // Group chunks by chunk_id to find all replicas
+        std::map<int, std::vector<ChunkLocation>> chunk_replicas;
         for (const auto& location : chunk_locations) {
-            if (unique_chunks.find(location.chunk_id) == unique_chunks.end()) {
-                unique_chunks[location.chunk_id] = location;
-            }
+            chunk_replicas[location.chunk_id].push_back(location);
         }
         
-        std::cout << "Found " << unique_chunks.size() << " unique chunks to reconstruct" << std::endl;
+        std::cout << "Found " << chunk_replicas.size() << " unique chunks to reconstruct" << std::endl;
         
         // Create output file
         std::ofstream output_file(output_path, std::ios::binary);
@@ -133,17 +327,72 @@ public:
             return false;
         }
         
-        // Read and write chunks in order
-        for (const auto& [chunk_id, location] : unique_chunks) {
-            auto chunk_data = read_chunk_from_server(location);
+        // Process each chunk in order (auto sorts by map int key)
+        for (const auto& [chunk_id, replicas] : chunk_replicas) {
+            std::map<std::string, int> hash_counts;
+            std::map<std::string, std::vector<std::pair<ChunkLocation, float>>> hash_to_servers; 
+            std::vector<ChunkLocation> failed_fetches;
+            
+            // 1. Ask all replicas for their chunk hash
+            for (const auto& replica : replicas) {
+                auto resp = get_chunk_hash(replica, filename);
+                if (resp.success()) {
+                    hash_counts[resp.hash()]++;
+                    hash_to_servers[resp.hash()].push_back({replica, resp.load_score()});
+                } else {
+                    failed_fetches.push_back(replica);
+                }
+            }
+            
+            if (hash_counts.empty()) {
+                std::cerr << "Could not verify any hashes for chunk " << chunk_id << " from any replica!" << std::endl;
+                output_file.close();
+                fs::remove(output_path);
+                return false;
+            }
+            
+            // 2. Find the majority hash (voting consensus)
+            std::string majority_hash = "";
+            int max_count = 0;
+            for (const auto& [hash, count] : hash_counts) {
+                if (count > max_count) {
+                    max_count = count;
+                    majority_hash = hash;
+                }
+            }
+            
+            // 3. Select the healthiest server with the majority hash
+            auto& majority_servers = hash_to_servers[majority_hash];
+            std::sort(majority_servers.begin(), majority_servers.end(), [](const auto& a, const auto& b) {
+                return a.second < b.second; // ascending load score (lower load usage is better)
+            });
+            
+            ChunkLocation best_server = majority_servers.front().first;
+            std::cout << "Consensus for chunk " << chunk_id << ": " << majority_hash 
+                      << " (Selected best server " << best_server.server_ip << " with load score " 
+                      << majority_servers.front().second << ")" << std::endl;
+            
+            // 4. Fetch the verified chunk payload
+            auto chunk_data = read_chunk_from_server(best_server, filename);
             if (chunk_data.empty()) {
-                std::cerr << "Failed to read chunk " << chunk_id << std::endl;
+                // Should technically failover to next best server, but simplified for now
+                std::cerr << "Failed to fully stream chunk from selected master server" << std::endl;
                 output_file.close();
                 fs::remove(output_path);
                 return false;
             }
             
             output_file.write(chunk_data.data(), chunk_data.size());
+            
+            // 5. Read Repair: Fix mismatched replicas out of sync with consensus memory
+            for (const auto& [hash, servers] : hash_to_servers) {
+                if (hash != majority_hash) {
+                    for (const auto& [loc, score] : servers) {
+                        std::cerr << "! Data Corruption Detected! Repairing Chunk " << chunk_id << " on " << loc.server_ip << std::endl;
+                        repair_chunk_on_server(loc, filename, chunk_data);
+                    }
+                }
+            }
         }
         
         output_file.close();

@@ -114,6 +114,7 @@ services:
       - METRICS_PORT=9091
       - HEAD_SERVER_HOST=head-server-1
       - HEAD_SERVER_PORT=9669
+      - HEALTH_CHECKER_HOST=health-checker
     volumes:
       - cluster1_data:/tmp/cluster_storage
       - ./logs:/app/logs
@@ -134,7 +135,7 @@ services:
     hostname: cluster-server-2
     container_name: dfg-cluster-server-2
     ports:
-      - "8081:8081"
+      - "8083:8081"
       - "9092:9091"  # Prometheus metrics
     environment:
       - SERVER_ID=2
@@ -142,6 +143,7 @@ services:
       - METRICS_PORT=9091
       - HEAD_SERVER_HOST=head-server-1
       - HEAD_SERVER_PORT=9669
+      - HEALTH_CHECKER_HOST=health-checker
     volumes:
       - cluster2_data:/tmp/cluster_storage
       - ./logs:/app/logs
@@ -170,6 +172,7 @@ services:
       - METRICS_PORT=9091
       - HEAD_SERVER_HOST=head-server-1
       - HEAD_SERVER_PORT=9669
+      - HEALTH_CHECKER_HOST=health-checker
     volumes:
       - cluster3_data:/tmp/cluster_storage
       - ./logs:/app/logs
@@ -311,4 +314,4 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.20.0.0/16
+        - subnet: 172.28.0.0/16

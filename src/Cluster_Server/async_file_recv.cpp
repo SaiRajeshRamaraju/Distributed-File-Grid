@@ -1,5 +1,6 @@
 #include "../include/heart_beat_signal.hpp"
 #include "../include/system_info.hpp"
+#include "metrics_exporter.hpp"
 #include <fstream>
 #include <filesystem>
 #include <vector>
@@ -10,6 +11,12 @@
 #include <chrono>
 #include <unordered_map>
 #include <mutex>
+
+#include "file_transfer.pb.h"
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 
 namespace fs = std::filesystem;
 
@@ -148,57 +155,237 @@ public:
 class ClusterServerService {
 private:
     ChunkStorage storage;
+    MetricsExporter exporter;
     int server_id;
     std::string server_ip;
     int port;
     bool running = false;
     
     async_hb::task heartbeat_sender(async_hb::Reactor& reactor) {
+        // Resolve health checker address from env or default
+        const char* hc_host_env = std::getenv("HEALTH_CHECKER_HOST");
+        std::string hc_host = hc_host_env ? hc_host_env : "127.0.0.1";
+        int hc_port = 9000;
+
+        sockaddr_in hc_addr{};
+        if (!async_hb::resolve_ipv4(hc_host, static_cast<uint16_t>(hc_port), hc_addr)) {
+            std::cerr << "Could not resolve health checker at " << hc_host << std::endl;
+            co_return;
+        }
+
+        int sfd = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        if (sfd < 0) {
+            std::cerr << "Heartbeat UDP socket creation failed\n";
+            co_return;
+        }
+        if (async_hb::set_nonblock(sfd) < 0) {
+            std::cerr << "Heartbeat socket set_nonblock failed\n";
+            ::close(sfd);
+            co_return;
+        }
+        // Connect the UDP socket so we can use send() instead of sendto()
+        if (::connect(sfd, reinterpret_cast<sockaddr*>(&hc_addr), sizeof(hc_addr)) < 0) {
+            std::cerr << "Heartbeat UDP connect failed\n";
+            ::close(sfd);
+            co_return;
+        }
+
+        std::string local_ip_port = server_ip + ":" + std::to_string(port);
+
         while (running) {
             try {
-                // Send heartbeat to head server
-                int result = async_hb::send_signal("127.0.0.1", server_id, 9000);
-                if (result < 0) {
-                    std::cerr << "Failed to send heartbeat" << std::endl;
-                }
+                heart_beat::v1::HeartBeat hb;
+                hb.set_server_id(server_id);
+                hb.set_ip(local_ip_port);
+                *hb.mutable_timestamp() = google::protobuf::util::TimeUtil::GetCurrentTime();
+                auto frame = async_hb::build_frame(hb);
+                co_await async_hb::async_send_all(reactor, sfd, frame.data(), frame.size());
             } catch (const std::exception& e) {
-                std::cerr << "Heartbeat error: " << e.what() << std::endl;
+                std::cerr << "Heartbeat send error: " << e.what() << std::endl;
             }
-            
-            // Sleep outside the try-catch to avoid nested co_await
-            co_await reactor.sleep_for(std::chrono::seconds(30));
+            co_await reactor.sleep_for(std::chrono::seconds(10));
         }
+        ::close(sfd);
     }
     
+    async_hb::task handle_connection(async_hb::Reactor& r, int cfd) {
+        try {
+            uint8_t header[8];
+            co_await async_hb::async_read_exact(r, cfd, header, 8);
+            
+            uint32_t type_net, len_net;
+            memcpy(&type_net, header, 4);
+            memcpy(&len_net, header + 4, 4);
+            
+            uint32_t type = ntohl(type_net);
+            uint32_t len = ntohl(len_net);
+            
+            std::vector<uint8_t> buf(len);
+            if (len > 0) {
+                co_await async_hb::async_read_exact(r, cfd, buf.data(), len);
+            }
+            
+            auto t_start = std::chrono::high_resolution_clock::now();
+            
+            if (type == 1) { // ChunkData
+                file_transfer::v1::ChunkData req;
+                if (!req.ParseFromArray(buf.data(), len)) throw std::runtime_error("Parse chunk error");
+                
+                std::vector<char> data(req.data().begin(), req.data().end());
+                bool ok = store_chunk(req.chunk_id(), data);
+                
+                file_transfer::v1::ChunkResponse resp;
+                resp.set_success(ok);
+                resp.set_chunk_id(req.chunk_id());
+                if (!ok) resp.set_error_message("Failed to store chunk on disk");
+                
+                std::string serialized;
+                resp.SerializeToString(&serialized);
+                uint32_t resp_len = htonl(serialized.size());
+                
+                co_await async_hb::async_send_all(r, cfd, reinterpret_cast<const uint8_t*>(&resp_len), 4);
+                co_await async_hb::async_send_all(r, cfd, reinterpret_cast<const uint8_t*>(serialized.data()), serialized.size());
+                
+                auto t_end = std::chrono::high_resolution_clock::now();
+                exporter.record_message(len, std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_start).count());
+                
+            } else if (type == 2) { // FetchChunkRequest
+                file_transfer::v1::FetchChunkRequest req;
+                if (!req.ParseFromArray(buf.data(), len)) throw std::runtime_error("Parse fetch error");
+                
+                std::vector<char> data = retrieve_chunk(req.chunk_id());
+                bool ok = !data.empty();
+                
+                file_transfer::v1::FetchChunkResponse resp;
+                resp.set_success(ok);
+                resp.set_chunk_id(req.chunk_id());
+                if (ok) {
+                    resp.set_data(data.data(), data.size());
+                } else {
+                    resp.set_error_message("Chunk not found on this server");
+                }
+                
+                std::string serialized;
+                resp.SerializeToString(&serialized);
+                uint32_t resp_len = htonl(serialized.size());
+                
+                co_await async_hb::async_send_all(r, cfd, reinterpret_cast<const uint8_t*>(&resp_len), 4);
+                co_await async_hb::async_send_all(r, cfd, reinterpret_cast<const uint8_t*>(serialized.data()), serialized.size());
+            } else if (type == 3) { // FetchHashRequest
+                file_transfer::v1::FetchHashRequest req;
+                if (!req.ParseFromArray(buf.data(), len)) throw std::runtime_error("Parse fetch hash error");
+                
+                std::vector<char> data = retrieve_chunk(req.chunk_id());
+                bool ok = !data.empty();
+                
+                file_transfer::v1::FetchHashResponse resp;
+                resp.set_success(ok);
+                resp.set_chunk_id(req.chunk_id());
+                if (ok) {
+                    size_t hash = 0;
+                    for (char c : data) {
+                        hash = hash * 31 + static_cast<size_t>(c);
+                    }
+                    std::stringstream ss;
+                    ss << std::hex << hash;
+                    resp.set_hash(ss.str());
+                    
+                    auto usage = system_monitor();
+                    // Load score based on CPU usage and existing RAM limits (lower score means more available bandwidth / less load)
+                     resp.set_load_score(usage.cpu_usage + usage.ram_usage);
+                } else {
+                    resp.set_error_message("Chunk not found on this server");
+                }
+                
+                std::string serialized;
+                resp.SerializeToString(&serialized);
+                uint32_t resp_len = htonl(serialized.size());
+                
+                co_await async_hb::async_send_all(r, cfd, reinterpret_cast<const uint8_t*>(&resp_len), 4);
+                co_await async_hb::async_send_all(r, cfd, reinterpret_cast<const uint8_t*>(serialized.data()), serialized.size());
+            } else {
+                std::cerr << "Unknown message type: " << type << std::endl;
+            }
+        } catch(const std::exception& e) {
+            std::cerr << "handle_connection error: " << e.what() << std::endl;
+        }
+        ::close(cfd);
+        co_return;
+    }
+
     async_hb::task chunk_server(async_hb::Reactor& reactor) {
-        // Simple chunk server implementation
-        // In a real implementation, this would be an HTTP/gRPC server
-        std::cout << "Chunk server started on port " << port << std::endl;
+        int transfer_port = port + 100;
+        int lfd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (lfd < 0) {
+            std::cerr << "Listen socket failed\n";
+            co_return;
+        }
+        int yes = 1;
+        setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(transfer_port);
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+        if (::bind(lfd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+            std::cerr << "Bind failed for chunk server\n";
+            ::close(lfd);
+            co_return;
+        }
+        if (::listen(lfd, 16) < 0) {
+            std::cerr << "Listen failed\n";
+            ::close(lfd);
+            co_return;
+        }
+        if (async_hb::set_nonblock(lfd) < 0) {
+            std::cerr << "Failed to set nonblocking\n";
+            ::close(lfd);
+            co_return;
+        }
+
+        std::cout << "Chunk transfer server started on port " << transfer_port << std::endl;
+        
+        auto print_stats = [this](async_hb::Reactor& r) -> async_hb::task {
+             while (running) {
+                 co_await r.sleep_for(std::chrono::seconds(60));
+                 auto usage = system_monitor();
+                 std::cout << "Server " << server_id << " - CPU: " << usage.cpu_usage 
+                          << "%, RAM: " << usage.ram_usage << "%, Disk: " << usage.disk_usage << "%" << std::endl;
+                 size_t storage_usage = storage.get_storage_usage();
+                 std::cout << "Storage usage: " << storage_usage / (1024*1024) << " MB" << std::endl;
+             }
+        };
+        reactor.spawn(print_stats(reactor));
         
         while (running) {
-            // Simulate chunk operations
-            co_await reactor.sleep_for(std::chrono::seconds(1));
-            
-            // Report system status periodically
-            static int counter = 0;
-            if (++counter % 60 == 0) { // Every minute
-                auto usage = system_monitor();
-                std::cout << "Server " << server_id << " - CPU: " << usage.cpu_usage 
-                         << "%, RAM: " << usage.ram_usage << "%, Disk: " << usage.disk_usage << "%" << std::endl;
-                
-                size_t storage_usage = storage.get_storage_usage();
-                std::cout << "Storage usage: " << storage_usage / (1024*1024) << " MB" << std::endl;
+            int cfd = -1;
+            while (true) {
+                sockaddr_in peer{};
+                socklen_t len = sizeof(peer);
+                cfd = ::accept4(lfd, reinterpret_cast<sockaddr *>(&peer), &len, SOCK_CLOEXEC | SOCK_NONBLOCK);
+                if (cfd >= 0) break;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    co_await reactor.wait_readable(lfd);
+                } else {
+                    std::cerr << "accept error\n";
+                    break;
+                }
+            }
+            if (cfd >= 0) {
+                reactor.spawn(handle_connection(reactor, cfd));
             }
         }
+        ::close(lfd);
     }
 
 public:
     ClusterServerService(int id, const std::string& ip, int p) 
-        : server_id(id), server_ip(ip), port(p) {}
+        : exporter("0.0.0.0:" + std::to_string(9090 + id)), server_id(id), server_ip(ip), port(p) {}
     
     void start() {
         running = true;
         std::cout << "Starting Cluster Server " << server_id << " on " << server_ip << ":" << port << std::endl;
+        std::cout << "Metrics exported on port: " << (9090 + server_id) << std::endl;
         
         async_hb::Reactor reactor;
         

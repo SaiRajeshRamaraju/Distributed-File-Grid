@@ -9,6 +9,11 @@
 #include <vector>
 #include <algorithm>
 
+#include <prometheus/exposer.h>
+#include <prometheus/registry.h>
+#include <prometheus/gauge.h>
+#include <prometheus/counter.h>
+
 struct ServerHealth {
     int server_id;
     std::string ip;
@@ -26,6 +31,15 @@ private:
     bool running = false;
     const int MAX_MISSED_HEARTBEATS = 3;
     const std::chrono::seconds HEARTBEAT_TIMEOUT{60};
+
+    // Prometheus metrics
+    std::shared_ptr<prometheus::Registry> registry_;
+    std::unique_ptr<prometheus::Exposer> exposer_;
+    prometheus::Counter& heartbeats_received_;
+    prometheus::Counter& servers_marked_unhealthy_;
+    prometheus::Counter& servers_recovered_;
+    prometheus::Counter& replications_triggered_;
+    prometheus::Gauge& healthy_server_count_;
     
     async_hb::task heartbeat_receiver(async_hb::Reactor& reactor) {
         std::cout << "Starting heartbeat receiver on port 9000" << std::endl;
@@ -70,7 +84,7 @@ private:
             if (bytes_received > 0) {
                 // Process the received heartbeat
                 heart_beat::v1::HeartBeat hb;
-                if (hb.ParseFromArray(buffer, bytes_received)) {
+                if (bytes_received > 4 && hb.ParseFromArray(buffer + 4, bytes_received - 4)) {
                     process_heartbeat(hb);
                 }
             }
@@ -98,6 +112,7 @@ private:
                 
                 if (health.missed_heartbeats >= MAX_MISSED_HEARTBEATS && health.is_healthy) {
                     health.is_healthy = false;
+                    servers_marked_unhealthy_.Increment();
                     std::cout << "Server " << server_id << " marked as unhealthy (missed " 
                              << health.missed_heartbeats << " heartbeats)" << std::endl;
                     
@@ -108,13 +123,21 @@ private:
                 if (!health.is_healthy && health.missed_heartbeats > 0) {
                     health.is_healthy = true;
                     health.missed_heartbeats = 0;
+                    servers_recovered_.Increment();
                     std::cout << "Server " << server_id << " recovered and marked as healthy" << std::endl;
                 }
             }
         }
+        // Update healthy server count gauge
+        int healthy = 0;
+        for (const auto& [id, h] : servers) {
+            if (h.is_healthy) healthy++;
+        }
+        healthy_server_count_.Set(static_cast<double>(healthy));
     }
     
     void trigger_replication(int failed_server_id) {
+        replications_triggered_.Increment();
         std::cout << "Triggering re-replication for failed server " << failed_server_id << std::endl;
         // In a real implementation, this would:
         // 1. Query Redis for chunks stored on the failed server
@@ -136,6 +159,7 @@ private:
         health.cpu_usage = hb.cpu_usage();
         health.total_storage_used = hb.total_storage_used();
         health.missed_heartbeats = 0;
+        heartbeats_received_.Increment();
         
         if (!health.is_healthy) {
             health.is_healthy = true;
@@ -148,6 +172,32 @@ private:
     }
 
 public:
+    HealthChecker()
+        : registry_(std::make_shared<prometheus::Registry>()),
+          exposer_(std::make_unique<prometheus::Exposer>("0.0.0.0:9096")),
+          heartbeats_received_(prometheus::BuildCounter()
+              .Name("hc_heartbeats_received_total")
+              .Help("Total heartbeats received")
+              .Register(*registry_).Add({})),
+          servers_marked_unhealthy_(prometheus::BuildCounter()
+              .Name("hc_servers_marked_unhealthy_total")
+              .Help("Total times a server was marked unhealthy")
+              .Register(*registry_).Add({})),
+          servers_recovered_(prometheus::BuildCounter()
+              .Name("hc_servers_recovered_total")
+              .Help("Total times a server recovered")
+              .Register(*registry_).Add({})),
+          replications_triggered_(prometheus::BuildCounter()
+              .Name("hc_replications_triggered_total")
+              .Help("Total re-replications triggered")
+              .Register(*registry_).Add({})),
+          healthy_server_count_(prometheus::BuildGauge()
+              .Name("hc_healthy_servers")
+              .Help("Number of currently healthy servers")
+              .Register(*registry_).Add({}))
+    {
+        exposer_->RegisterCollectable(registry_);
+    }
     void start() {
         running = true;
         std::cout << "Starting Health Checker service..." << std::endl;

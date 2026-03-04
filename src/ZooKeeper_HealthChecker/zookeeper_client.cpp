@@ -42,7 +42,7 @@ std::string normalize_path(const std::string& raw) {
 	if (raw.empty()) {
 		return "/";
 	}
-
+	// If path isn't started with '/' this will add it.	
 	std::string path = raw;
 	if (path.front() != '/') {
 		path.insert(path.begin(), '/');

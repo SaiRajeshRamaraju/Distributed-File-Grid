@@ -2,17 +2,13 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
-rule_files:
-  # - "first_rules.yml"
-  # - "second_rules.yml"
-
 scrape_configs:
   # Prometheus itself
   - job_name: 'prometheus'
     static_configs:
       - targets: ['localhost:9090']
 
-  # Distributed File Grid Cluster Servers
+  # Distributed File Grid - Cluster Servers (Prometheus metrics on :9091)
   - job_name: 'dfg-cluster-servers'
     static_configs:
       - targets: 
@@ -22,41 +18,18 @@ scrape_configs:
     scrape_interval: 10s
     metrics_path: /metrics
     
-  # Head Servers (if they expose metrics)
+  # Head Servers (Prometheus metrics on :9095)
   - job_name: 'dfg-head-servers'
     static_configs:
       - targets:
-          - 'head-server-1:9669'
-          - 'head-server-2:9669'
+          - 'head-server-1:9095'
+          - 'head-server-2:9095'
     scrape_interval: 15s
     metrics_path: /metrics
     
-  # Health Checker
+  # Health Checker (Prometheus metrics on :9096)
   - job_name: 'dfg-health-checker'
     static_configs:
-      - targets: ['health-checker:9000']
-    scrape_interval: 30s
-    metrics_path: /metrics
-    
-  # Redis Exporter (if available)
-  - job_name: 'redis'
-    static_configs:
-      - targets: ['redis:6379']
-    scrape_interval: 30s
-    
-  # ZooKeeper (if JMX metrics are exposed)
-  - job_name: 'zookeeper'
-    static_configs:
-      - targets: ['zookeeper:2181']
-    scrape_interval: 30s
-
-  # Node Exporter for system metrics (if available)
-  - job_name: 'node-exporter'
-    static_configs:
-      - targets: 
-          - 'head-server-1:9100'
-          - 'head-server-2:9100'
-          - 'cluster-server-1:9100'
-          - 'cluster-server-2:9100'
-          - 'cluster-server-3:9100'
+      - targets: ['health-checker:9096']
     scrape_interval: 15s
+    metrics_path: /metrics
