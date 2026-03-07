@@ -271,10 +271,16 @@ if(BUILD_TESTS)
     # Add tests
     add_test(NAME SimpleHeartbeatTest COMMAND simple_heartbeat_test)
     
+    add_executable(async_io_test UnitTesting/async_io_test.cpp)
+    target_link_libraries(async_io_test PRIVATE GTest::GTest GTest::Main Threads::Threads ${COMMON_LIBS})
+    add_dependencies(async_io_test cluster_server)
+    target_include_directories(async_io_test PRIVATE ${CMAKE_BINARY_DIR}/generated)
+    add_test(NAME AsyncIoTest COMMAND async_io_test)
+    
     # Add a test target that can be run with 'make test'
-    add_custom_target(check
+    add_custom_target(run_tests
         COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-        DEPENDS simple_heartbeat_test
+        DEPENDS simple_heartbeat_test async_io_test
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     )
 endif()
