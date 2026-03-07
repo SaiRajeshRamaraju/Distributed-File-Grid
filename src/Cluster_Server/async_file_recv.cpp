@@ -11,6 +11,13 @@
 #include <chrono>
 #include <unordered_map>
 #include <mutex>
+#include <future>
+#include <queue>
+#include <condition_variable>
+#include <functional>
+#include <atomic>
+#include <sys/uio.h>
+#include <fcntl.h>
 
 #include "file_transfer.pb.h"
 #include <sys/socket.h>
@@ -20,6 +27,115 @@
 
 namespace fs = std::filesystem;
 
+// ─────────────────────── I/O Thread Pool ───────────────────────
+// Offloads blocking file system operations so the epoll reactor is never stalled.
+class IOThreadPool {
+public:
+    explicit IOThreadPool(size_t num_threads = 4) : stop_(false) {
+        for (size_t i = 0; i < num_threads; ++i) {
+            workers_.emplace_back([this] { worker_loop(); });
+        }
+    }
+
+    ~IOThreadPool() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (auto& t : workers_) {
+            if (t.joinable()) t.join();
+        }
+    }
+
+    // Submit a callable; returns a future for the result.
+    template <typename F>
+    auto submit(F&& fn) -> std::future<decltype(fn())> {
+        using Ret = decltype(fn());
+        auto task = std::make_shared<std::packaged_task<Ret()>>(std::forward<F>(fn));
+        auto fut = task->get_future();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            jobs_.push([task]() { (*task)(); });
+        }
+        cv_.notify_one();
+        return fut;
+    }
+
+private:
+    void worker_loop() {
+        while (true) {
+            std::function<void()> job;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [this] { return stop_ || !jobs_.empty(); });
+                if (stop_ && jobs_.empty()) return;
+                job = std::move(jobs_.front());
+                jobs_.pop();
+            }
+            job();
+        }
+    }
+
+    std::vector<std::thread> workers_;
+    std::queue<std::function<void()>> jobs_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool stop_;
+};
+
+// Global I/O thread pool (shared by all storage operations)
+static IOThreadPool& io_pool() {
+    static IOThreadPool pool(4);
+    return pool;
+}
+
+// ─────────────────── Awaiter: bridge future → coroutine ───────────────────
+// Suspends the coroutine, polls the future on reactor ticks via a timerfd,
+// and resumes once the result is ready.
+template <typename T>
+struct FutureAwaiter {
+    std::future<T> fut;
+    async_hb::Reactor* reactor;
+
+    bool await_ready() const noexcept {
+        return fut.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+    }
+
+    void await_suspend(std::coroutine_handle<> h) {
+        // Spin up a tiny polling coroutine that checks every 1ms.
+        // This is lightweight because timerfd is O(1) in epoll.
+        auto shared_fut = std::make_shared<std::future<T>>(std::move(fut));
+        auto shared_h   = std::make_shared<std::coroutine_handle<>>(h);
+        auto r = reactor;
+
+        auto poll = [r, shared_fut, shared_h](async_hb::Reactor& rx) -> async_hb::task {
+            while (shared_fut->wait_for(std::chrono::microseconds(0)) != std::future_status::ready) {
+                co_await rx.sleep_for(std::chrono::milliseconds(1));
+            }
+            // Result is ready — resume the original coroutine.
+            if (*shared_h && !shared_h->done()) {
+                shared_h->resume();
+            }
+            co_return;
+        };
+
+        reactor->spawn(poll(*reactor));
+        // Move the future back so await_resume can access it.
+        fut = std::move(*shared_fut);
+    }
+
+    T await_resume() {
+        return fut.get();
+    }
+};
+
+template <typename T>
+FutureAwaiter<T> await_future(async_hb::Reactor& r, std::future<T> f) {
+    return FutureAwaiter<T>{std::move(f), &r};
+}
+
+// ──────────────────────── Chunk Storage ────────────────────────
 class ChunkStorage {
 private:
     std::string storage_path = "/tmp/cluster_storage/";
@@ -39,18 +155,31 @@ public:
         ensure_storage_directory();
     }
     
+    // ── Synchronous store (kept for non-coroutine callers) ──
     bool store_chunk(const std::string& chunk_id, const std::vector<char>& data) {
         try {
             std::string chunk_path = generate_chunk_path(chunk_id);
             
-            std::ofstream file(chunk_path, std::ios::binary);
-            if (!file) {
+            // Use POSIX O_DIRECT-friendly writes with explicit fsync
+            int fd = ::open(chunk_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+            if (fd < 0) {
                 std::cerr << "Failed to create chunk file: " << chunk_path << std::endl;
                 return false;
             }
             
-            file.write(data.data(), data.size());
-            file.close();
+            size_t written = 0;
+            while (written < data.size()) {
+                ssize_t n = ::write(fd, data.data() + written, data.size() - written);
+                if (n < 0) {
+                    if (errno == EINTR) continue;
+                    std::cerr << "Write error for chunk " << chunk_id << ": " << strerror(errno) << std::endl;
+                    ::close(fd);
+                    return false;
+                }
+                written += static_cast<size_t>(n);
+            }
+            ::fdatasync(fd);  // Ensure data is persisted
+            ::close(fd);
             
             // Register chunk in memory
             {
@@ -66,6 +195,43 @@ public:
         }
     }
     
+    // ── Async store: offload to I/O thread pool ──
+    std::future<bool> async_store_chunk(const std::string& chunk_id, std::vector<char> data) {
+        // Capture by value so the data lives in the pool thread.
+        auto path = generate_chunk_path(chunk_id);
+        auto* self = this;
+        return io_pool().submit([self, chunk_id, path, data = std::move(data)]() -> bool {
+            int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+            if (fd < 0) {
+                std::cerr << "Failed to create chunk file: " << path << std::endl;
+                return false;
+            }
+            
+            size_t written = 0;
+            while (written < data.size()) {
+                ssize_t n = ::write(fd, data.data() + written, data.size() - written);
+                if (n < 0) {
+                    if (errno == EINTR) continue;
+                    std::cerr << "Write error for chunk " << chunk_id << ": " << strerror(errno) << std::endl;
+                    ::close(fd);
+                    return false;
+                }
+                written += static_cast<size_t>(n);
+            }
+            ::fdatasync(fd);
+            ::close(fd);
+            
+            {
+                std::lock_guard<std::mutex> lock(self->registry_mutex);
+                self->chunk_registry[chunk_id] = path;
+            }
+            
+            std::cout << "Async stored chunk " << chunk_id << " (" << data.size() << " bytes)" << std::endl;
+            return true;
+        });
+    }
+    
+    // ── Synchronous retrieve ──
     std::vector<char> retrieve_chunk(const std::string& chunk_id) {
         std::vector<char> data;
         
@@ -81,20 +247,30 @@ public:
                 chunk_path = it->second;
             }
             
-            std::ifstream file(chunk_path, std::ios::binary);
-            if (!file) {
+            int fd = ::open(chunk_path.c_str(), O_RDONLY | O_CLOEXEC);
+            if (fd < 0) {
                 std::cerr << "Failed to open chunk file: " << chunk_path << std::endl;
                 return data;
             }
             
-            // Get file size
-            file.seekg(0, std::ios::end);
-            size_t file_size = file.tellg();
-            file.seekg(0, std::ios::beg);
+            // Get file size via lseek
+            off_t file_size = ::lseek(fd, 0, SEEK_END);
+            ::lseek(fd, 0, SEEK_SET);
             
-            data.resize(file_size);
-            file.read(data.data(), file_size);
-            file.close();
+            data.resize(static_cast<size_t>(file_size));
+            size_t total_read = 0;
+            while (total_read < data.size()) {
+                ssize_t n = ::read(fd, data.data() + total_read, data.size() - total_read);
+                if (n < 0) {
+                    if (errno == EINTR) continue;
+                    std::cerr << "Read error for chunk " << chunk_id << std::endl;
+                    ::close(fd);
+                    return {};
+                }
+                if (n == 0) break;
+                total_read += static_cast<size_t>(n);
+            }
+            ::close(fd);
             
             std::cout << "Retrieved chunk " << chunk_id << " (" << data.size() << " bytes)" << std::endl;
         } catch (const std::exception& e) {
@@ -102,6 +278,50 @@ public:
         }
         
         return data;
+    }
+    
+    // ── Async retrieve: offload to I/O thread pool ──
+    std::future<std::vector<char>> async_retrieve_chunk(const std::string& chunk_id) {
+        std::string chunk_path;
+        {
+            std::lock_guard<std::mutex> lock(registry_mutex);
+            auto it = chunk_registry.find(chunk_id);
+            if (it == chunk_registry.end()) {
+                // Return an immediately-ready future with empty data.
+                std::promise<std::vector<char>> p;
+                p.set_value({});
+                return p.get_future();
+            }
+            chunk_path = it->second;
+        }
+        
+        return io_pool().submit([chunk_id, chunk_path]() -> std::vector<char> {
+            int fd = ::open(chunk_path.c_str(), O_RDONLY | O_CLOEXEC);
+            if (fd < 0) {
+                std::cerr << "Failed to open chunk file: " << chunk_path << std::endl;
+                return {};
+            }
+            
+            off_t file_size = ::lseek(fd, 0, SEEK_END);
+            ::lseek(fd, 0, SEEK_SET);
+            
+            std::vector<char> data(static_cast<size_t>(file_size));
+            size_t total_read = 0;
+            while (total_read < data.size()) {
+                ssize_t n = ::read(fd, data.data() + total_read, data.size() - total_read);
+                if (n < 0) {
+                    if (errno == EINTR) continue;
+                    ::close(fd);
+                    return {};
+                }
+                if (n == 0) break;
+                total_read += static_cast<size_t>(n);
+            }
+            ::close(fd);
+            
+            std::cout << "Async retrieved chunk " << chunk_id << " (" << data.size() << " bytes)" << std::endl;
+            return data;
+        });
     }
     
     bool delete_chunk(const std::string& chunk_id) {
@@ -227,12 +447,15 @@ private:
             
             auto t_start = std::chrono::high_resolution_clock::now();
             
-            if (type == 1) { // ChunkData
+            if (type == 1) { // ChunkData — async store
                 file_transfer::v1::ChunkData req;
                 if (!req.ParseFromArray(buf.data(), len)) throw std::runtime_error("Parse chunk error");
                 
                 std::vector<char> data(req.data().begin(), req.data().end());
-                bool ok = store_chunk(req.chunk_id(), data);
+                
+                // Offload disk write to I/O thread pool, await without blocking reactor
+                auto fut = storage.async_store_chunk(req.chunk_id(), std::move(data));
+                bool ok = co_await await_future(r, std::move(fut));
                 
                 file_transfer::v1::ChunkResponse resp;
                 resp.set_success(ok);
@@ -249,11 +472,13 @@ private:
                 auto t_end = std::chrono::high_resolution_clock::now();
                 exporter.record_message(len, std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_start).count());
                 
-            } else if (type == 2) { // FetchChunkRequest
+            } else if (type == 2) { // FetchChunkRequest — async retrieve
                 file_transfer::v1::FetchChunkRequest req;
                 if (!req.ParseFromArray(buf.data(), len)) throw std::runtime_error("Parse fetch error");
                 
-                std::vector<char> data = retrieve_chunk(req.chunk_id());
+                // Offload disk read to I/O thread pool
+                auto fut = storage.async_retrieve_chunk(req.chunk_id());
+                std::vector<char> data = co_await await_future(r, std::move(fut));
                 bool ok = !data.empty();
                 
                 file_transfer::v1::FetchChunkResponse resp;
@@ -271,11 +496,13 @@ private:
                 
                 co_await async_hb::async_send_all(r, cfd, reinterpret_cast<const uint8_t*>(&resp_len), 4);
                 co_await async_hb::async_send_all(r, cfd, reinterpret_cast<const uint8_t*>(serialized.data()), serialized.size());
-            } else if (type == 3) { // FetchHashRequest
+            } else if (type == 3) { // FetchHashRequest — async retrieve for hashing
                 file_transfer::v1::FetchHashRequest req;
                 if (!req.ParseFromArray(buf.data(), len)) throw std::runtime_error("Parse fetch hash error");
                 
-                std::vector<char> data = retrieve_chunk(req.chunk_id());
+                // Offload disk read to I/O thread pool
+                auto fut = storage.async_retrieve_chunk(req.chunk_id());
+                std::vector<char> data = co_await await_future(r, std::move(fut));
                 bool ok = !data.empty();
                 
                 file_transfer::v1::FetchHashResponse resp;
@@ -291,8 +518,7 @@ private:
                     resp.set_hash(ss.str());
                     
                     auto usage = system_monitor();
-                    // Load score based on CPU usage and existing RAM limits (lower score means more available bandwidth / less load)
-                     resp.set_load_score(usage.cpu_usage + usage.ram_usage);
+                    resp.set_load_score(usage.cpu_usage + usage.ram_usage);
                 } else {
                     resp.set_error_message("Chunk not found on this server");
                 }
@@ -332,7 +558,7 @@ private:
             ::close(lfd);
             co_return;
         }
-        if (::listen(lfd, 16) < 0) {
+        if (::listen(lfd, 64) < 0) {  // Increased backlog for higher concurrency
             std::cerr << "Listen failed\n";
             ::close(lfd);
             co_return;
@@ -386,6 +612,7 @@ public:
         running = true;
         std::cout << "Starting Cluster Server " << server_id << " on " << server_ip << ":" << port << std::endl;
         std::cout << "Metrics exported on port: " << (9090 + server_id) << std::endl;
+        std::cout << "Async I/O thread pool: 4 threads" << std::endl;
         
         async_hb::Reactor reactor;
         
@@ -404,7 +631,7 @@ public:
         std::cout << "Stopping Cluster Server " << server_id << std::endl;
     }
     
-    // Chunk operations API
+    // Chunk operations API (sync wrappers, still available for external callers)
     bool store_chunk(const std::string& chunk_id, const std::vector<char>& data) {
         return storage.store_chunk(chunk_id, data);
     }

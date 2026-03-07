@@ -8,13 +8,21 @@
 #include <sstream>
 #include <map>
 #include <algorithm>
+#include <future>
+#include <functional>
+#include <queue>
+#include <condition_variable>
+#include <atomic>
 #include "file_transfer.pb.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 namespace fs = std::filesystem;
+
+const int MAX_CONCURRENT_FETCHES = 6; // Max parallel fetch operations
 
 struct ChunkLocation {
     int chunk_id;
@@ -22,13 +30,165 @@ struct ChunkLocation {
     std::string file_path;
 };
 
+// ─────────────────── Fetch Thread Pool ───────────────────
+class FetchPool {
+public:
+    explicit FetchPool(size_t num_threads) : stop_(false) {
+        for (size_t i = 0; i < num_threads; ++i) {
+            workers_.emplace_back([this] { worker_loop(); });
+        }
+    }
+
+    ~FetchPool() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (auto& t : workers_) {
+            if (t.joinable()) t.join();
+        }
+    }
+
+    template <typename F>
+    auto submit(F&& fn) -> std::future<decltype(fn())> {
+        using Ret = decltype(fn());
+        auto task = std::make_shared<std::packaged_task<Ret()>>(std::forward<F>(fn));
+        auto fut = task->get_future();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            jobs_.push([task]() { (*task)(); });
+        }
+        cv_.notify_one();
+        return fut;
+    }
+
+private:
+    void worker_loop() {
+        while (true) {
+            std::function<void()> job;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [this] { return stop_ || !jobs_.empty(); });
+                if (stop_ && jobs_.empty()) return;
+                job = std::move(jobs_.front());
+                jobs_.pop();
+            }
+            job();
+        }
+    }
+
+    std::vector<std::thread> workers_;
+    std::queue<std::function<void()>> jobs_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool stop_;
+};
+
+static FetchPool& fetch_pool() {
+    static FetchPool pool(MAX_CONCURRENT_FETCHES);
+    return pool;
+}
+
 class FileReconstructor {
 private:
+    // ── Non-blocking socket helpers ──
+    static bool send_all_nb(int sock, const void* buf, size_t len) {
+        const uint8_t* p = static_cast<const uint8_t*>(buf);
+        size_t sent = 0;
+        while (sent < len) {
+            ssize_t n = ::send(sock, p + sent, len - sent, MSG_NOSIGNAL);
+            if (n > 0) {
+                sent += static_cast<size_t>(n);
+            } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                fd_set wfds;
+                FD_ZERO(&wfds);
+                FD_SET(sock, &wfds);
+                struct timeval tv = {10, 0};
+                int rc = ::select(sock + 1, nullptr, &wfds, nullptr, &tv);
+                if (rc <= 0) return false;
+            } else {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool recv_all_nb(int sock, void* buf, size_t len) {
+        uint8_t* p = static_cast<uint8_t*>(buf);
+        size_t got = 0;
+        while (got < len) {
+            ssize_t n = ::recv(sock, p + got, len - got, 0);
+            if (n > 0) {
+                got += static_cast<size_t>(n);
+            } else if (n == 0) {
+                return false;
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                fd_set rfds;
+                FD_ZERO(&rfds);
+                FD_SET(sock, &rfds);
+                struct timeval tv = {10, 0};
+                int rc = ::select(sock + 1, &rfds, nullptr, nullptr, &tv);
+                if (rc <= 0) return false;
+            } else {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static int connect_nb(const std::string& ip, int transfer_port, int timeout_sec = 5) {
+        int sock = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+        if (sock < 0) return -1;
+
+        struct sockaddr_in serv_addr{};
+        serv_addr.sin_family = AF_INET;
+        serv_addr.sin_port = htons(transfer_port);
+        if (::inet_pton(AF_INET, ip.c_str(), &serv_addr.sin_addr) <= 0) {
+            ::close(sock);
+            return -1;
+        }
+
+        int rc = ::connect(sock, reinterpret_cast<sockaddr*>(&serv_addr), sizeof(serv_addr));
+        if (rc < 0 && errno == EINPROGRESS) {
+            fd_set wfds;
+            FD_ZERO(&wfds);
+            FD_SET(sock, &wfds);
+            struct timeval tv = {timeout_sec, 0};
+            rc = ::select(sock + 1, nullptr, &wfds, nullptr, &tv);
+            if (rc <= 0) {
+                ::close(sock);
+                return -1;
+            }
+            int err = 0;
+            socklen_t len = sizeof(err);
+            if (::getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
+                ::close(sock);
+                return -1;
+            }
+        } else if (rc < 0) {
+            ::close(sock);
+            return -1;
+        }
+
+        return sock;
+    }
+
+    // Helper to parse ip:port from server_ip string
+    static void parse_server(const std::string& server_ip, std::string& ip, int& port) {
+        ip = server_ip;
+        port = 8080;
+        size_t pos = server_ip.find(':');
+        if (pos != std::string::npos) {
+            port = std::stoi(server_ip.substr(pos + 1));
+            ip = server_ip.substr(0, pos);
+        }
+    }
+
     std::vector<ChunkLocation> get_chunk_locations_from_redis(const std::string& filename) {
         std::vector<ChunkLocation> locations;
         
         try {
-            // Use the read_entry function to get chunk information
             std::stringstream request;
             request << filename;
             
@@ -47,7 +207,6 @@ private:
             std::string line;
             while (std::getline(iss, line)) {
                 if (line.find("chunk:") != std::string::npos) {
-                    // Parse line format: "chunk:X server=Y path=Z"
                     size_t chunk_pos = line.find("chunk:");
                     size_t server_pos = line.find("server=");
                     size_t path_pos = line.find("path=");
@@ -55,21 +214,18 @@ private:
                     if (chunk_pos != std::string::npos && server_pos != std::string::npos && path_pos != std::string::npos) {
                         ChunkLocation loc;
                         
-                        // Extract chunk ID
                         std::string chunk_str = line.substr(chunk_pos + 6);
                         size_t space_pos = chunk_str.find(' ');
                         if (space_pos != std::string::npos) {
                             loc.chunk_id = std::stoi(chunk_str.substr(0, space_pos));
                         }
                         
-                        // Extract server IP
                         std::string server_str = line.substr(server_pos + 7);
                         space_pos = server_str.find(' ');
                         if (space_pos != std::string::npos) {
                             loc.server_ip = server_str.substr(0, space_pos);
                         }
                         
-                        // Extract file path
                         loc.file_path = line.substr(path_pos + 5);
                         
                         locations.push_back(loc);
@@ -83,34 +239,18 @@ private:
         return locations;
     }
     
+    // ── Async hash fetch: non-blocking sockets with timeout ──
     file_transfer::v1::FetchHashResponse get_chunk_hash(const ChunkLocation& location, const std::string& filename) {
         file_transfer::v1::FetchHashResponse resp;
         resp.set_success(false);
-        std::string ip = location.server_ip;
-        int port = 8080;
-        size_t pos = ip.find(':');
-        if (pos != std::string::npos) {
-            port = std::stoi(ip.substr(pos + 1));
-            ip = ip.substr(0, pos);
-        }
+
+        std::string ip;
+        int port;
+        parse_server(location.server_ip, ip, port);
         int transfer_port = port + 100;
         
-        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        int sock = connect_nb(ip, transfer_port);
         if (sock < 0) return resp;
-
-        struct sockaddr_in serv_addr;
-        serv_addr.sin_family = AF_INET;
-        serv_addr.sin_port = htons(transfer_port);
-
-        if (inet_pton(AF_INET, ip.c_str(), &serv_addr.sin_addr) <= 0) {
-            close(sock);
-            return resp;
-        }
-
-        if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-            close(sock);
-            return resp;
-        }
 
         file_transfer::v1::FetchHashRequest req;
         std::string unique_chunk_id = filename + "_chunk_" + std::to_string(location.chunk_id);
@@ -121,64 +261,41 @@ private:
         uint32_t type = htonl(3);
         uint32_t len = htonl(serialized.size());
         
-        send(sock, &type, sizeof(type), 0);
-        send(sock, &len, sizeof(len), 0);
-        
-        size_t total_sent = 0;
-        while(total_sent < serialized.size()) {
-            ssize_t sent = send(sock, serialized.data() + total_sent, serialized.size() - total_sent, 0);
-            if (sent < 0) {
-               close(sock);
-               return resp;
-            }
-            total_sent += sent;
+        if (!send_all_nb(sock, &type, sizeof(type)) ||
+            !send_all_nb(sock, &len, sizeof(len)) ||
+            !send_all_nb(sock, serialized.data(), serialized.size())) {
+            ::close(sock);
+            return resp;
         }
         
         uint32_t resp_len_net;
-        if (recv(sock, &resp_len_net, sizeof(resp_len_net), MSG_WAITALL) != 4) {
-             close(sock);
-             return resp;
+        if (!recv_all_nb(sock, &resp_len_net, sizeof(resp_len_net))) {
+            ::close(sock);
+            return resp;
         }
         
         uint32_t resp_len = ntohl(resp_len_net);
         std::vector<char> resp_buf(resp_len);
         
-        if (recv(sock, resp_buf.data(), resp_len, MSG_WAITALL) != resp_len) {
-            close(sock);
+        if (!recv_all_nb(sock, resp_buf.data(), resp_len)) {
+            ::close(sock);
             return resp;
         }
         
         resp.ParseFromArray(resp_buf.data(), resp_len);
-        close(sock);
+        ::close(sock);
         return resp;
     }
 
+    // ── Async repair: non-blocking ──
     bool repair_chunk_on_server(const ChunkLocation& location, const std::string& filename, const std::vector<char>& chunk_data) {
-        std::string ip = location.server_ip;
-        int port = 8080;
-        size_t pos = ip.find(':');
-        if (pos != std::string::npos) {
-            port = std::stoi(ip.substr(pos + 1));
-            ip = ip.substr(0, pos);
-        }
+        std::string ip;
+        int port;
+        parse_server(location.server_ip, ip, port);
         int transfer_port = port + 100;
         
-        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        int sock = connect_nb(ip, transfer_port);
         if (sock < 0) return false;
-
-        struct sockaddr_in serv_addr;
-        serv_addr.sin_family = AF_INET;
-        serv_addr.sin_port = htons(transfer_port);
-
-        if (inet_pton(AF_INET, ip.c_str(), &serv_addr.sin_addr) <= 0) {
-            close(sock);
-            return false;
-        }
-
-        if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-            close(sock);
-            return false;
-        }
 
         file_transfer::v1::ChunkData msg;
         std::string unique_chunk_id = filename + "_chunk_" + std::to_string(location.chunk_id);
@@ -189,66 +306,43 @@ private:
         std::string serialized;
         msg.SerializeToString(&serialized);
 
-        uint32_t type = htonl(1); // Same type as upload (1 = ChunkData)
+        uint32_t type = htonl(1);
         uint32_t len = htonl(serialized.size());
         
-        send(sock, &type, sizeof(type), 0);
-        send(sock, &len, sizeof(len), 0);
-        
-        size_t total_sent = 0;
-        while(total_sent < serialized.size()) {
-            ssize_t sent = send(sock, serialized.data() + total_sent, serialized.size() - total_sent, 0);
-            if (sent < 0) {
-               close(sock);
-               return false;
-            }
-            total_sent += sent;
+        if (!send_all_nb(sock, &type, sizeof(type)) ||
+            !send_all_nb(sock, &len, sizeof(len)) ||
+            !send_all_nb(sock, serialized.data(), serialized.size())) {
+            ::close(sock);
+            return false;
         }
         
         uint32_t resp_len_net;
-        if (recv(sock, &resp_len_net, sizeof(resp_len_net), MSG_WAITALL) == 4) {
+        if (recv_all_nb(sock, &resp_len_net, sizeof(resp_len_net))) {
             uint32_t resp_len = ntohl(resp_len_net);
             std::vector<char> resp_buf(resp_len);
-            if (recv(sock, resp_buf.data(), resp_len, MSG_WAITALL) == resp_len) {
+            if (recv_all_nb(sock, resp_buf.data(), resp_len)) {
                 file_transfer::v1::ChunkResponse resp;
                 if (resp.ParseFromArray(resp_buf.data(), resp_len) && resp.success()) {
-                    close(sock);
+                    ::close(sock);
                     return true;
                 }
             }
         }
-        close(sock);
+        ::close(sock);
         return false;
     }
 
+    // ── Async chunk fetch: non-blocking ──
     std::vector<char> read_chunk_from_server(const ChunkLocation& location, const std::string& filename) {
         std::vector<char> chunk_data;
         
-        std::string ip = location.server_ip;
-        int port = 8080;
-        size_t pos = ip.find(':');
-        if (pos != std::string::npos) {
-            port = std::stoi(ip.substr(pos + 1));
-            ip = ip.substr(0, pos);
-        }
+        std::string ip;
+        int port;
+        parse_server(location.server_ip, ip, port);
         int transfer_port = port + 100;
         
-        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        int sock = connect_nb(ip, transfer_port);
         if (sock < 0) return chunk_data;
-
-        struct sockaddr_in serv_addr;
-        serv_addr.sin_family = AF_INET;
-        serv_addr.sin_port = htons(transfer_port);
-
-        if (inet_pton(AF_INET, ip.c_str(), &serv_addr.sin_addr) <= 0) {
-            close(sock);
-            return chunk_data;
-        }
-
-        if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-            close(sock);
-            return chunk_data;
-        }
 
         file_transfer::v1::FetchChunkRequest req;
         std::string unique_chunk_id = filename + "_chunk_" + std::to_string(location.chunk_id);
@@ -260,43 +354,37 @@ private:
         uint32_t type = htonl(2);
         uint32_t len = htonl(serialized.size());
         
-        send(sock, &type, sizeof(type), 0);
-        send(sock, &len, sizeof(len), 0);
-        
-        size_t total_sent = 0;
-        while(total_sent < serialized.size()) {
-            ssize_t sent = send(sock, serialized.data() + total_sent, serialized.size() - total_sent, 0);
-            if (sent < 0) {
-               close(sock);
-               return chunk_data;
-            }
-            total_sent += sent;
+        if (!send_all_nb(sock, &type, sizeof(type)) ||
+            !send_all_nb(sock, &len, sizeof(len)) ||
+            !send_all_nb(sock, serialized.data(), serialized.size())) {
+            ::close(sock);
+            return chunk_data;
         }
         
         uint32_t resp_len_net;
-        if (recv(sock, &resp_len_net, sizeof(resp_len_net), MSG_WAITALL) != 4) {
-             std::cerr << "Failed to receive fetch response length" << std::endl;
-             close(sock);
-             return chunk_data;
+        if (!recv_all_nb(sock, &resp_len_net, sizeof(resp_len_net))) {
+            std::cerr << "Failed to receive fetch response length" << std::endl;
+            ::close(sock);
+            return chunk_data;
         }
         
         uint32_t resp_len = ntohl(resp_len_net);
         std::vector<char> resp_buf(resp_len);
         
-        if (recv(sock, resp_buf.data(), resp_len, MSG_WAITALL) != resp_len) {
-            close(sock);
+        if (!recv_all_nb(sock, resp_buf.data(), resp_len)) {
+            ::close(sock);
             return chunk_data;
         }
         
         file_transfer::v1::FetchChunkResponse resp;
         if (!resp.ParseFromArray(resp_buf.data(), resp_len) || !resp.success()) {
             std::cerr << "Server rejected fetch: " << resp.error_message() << std::endl;
-            close(sock);
+            ::close(sock);
             return chunk_data;
         }
 
         chunk_data.assign(resp.data().begin(), resp.data().end());
-        close(sock);
+        ::close(sock);
         std::cout << "Read chunk " << location.chunk_id << " (" << chunk_data.size() << " bytes) from " << location.server_ip << std::endl;
         return chunk_data;
     }
@@ -320,51 +408,85 @@ public:
         
         std::cout << "Found " << chunk_replicas.size() << " unique chunks to reconstruct" << std::endl;
         
-        // Create output file
-        std::ofstream output_file(output_path, std::ios::binary);
-        if (!output_file) {
-            std::cerr << "Failed to create output file: " << output_path << std::endl;
-            return false;
+        // ── Phase 1: Fetch all hashes concurrently ──
+        struct HashResult {
+            int chunk_id;
+            ChunkLocation location;
+            file_transfer::v1::FetchHashResponse response;
+        };
+        
+        std::vector<std::future<HashResult>> hash_futures;
+        
+        for (const auto& [chunk_id, replicas] : chunk_replicas) {
+            for (const auto& replica : replicas) {
+                auto cid = chunk_id;
+                auto loc = replica;
+                auto fname = filename;
+                
+                hash_futures.push_back(fetch_pool().submit([this, cid, loc, fname]() -> HashResult {
+                    auto resp = get_chunk_hash(loc, fname);
+                    return HashResult{cid, loc, resp};
+                }));
+            }
         }
         
-        // Process each chunk in order (auto sorts by map int key)
-        for (const auto& [chunk_id, replicas] : chunk_replicas) {
+        std::cout << "Fetching " << hash_futures.size() << " chunk hashes concurrently..." << std::endl;
+        
+        // Collect hash results by chunk_id
+        struct ChunkConsensus {
             std::map<std::string, int> hash_counts;
-            std::map<std::string, std::vector<std::pair<ChunkLocation, float>>> hash_to_servers; 
+            std::map<std::string, std::vector<std::pair<ChunkLocation, float>>> hash_to_servers;
             std::vector<ChunkLocation> failed_fetches;
-            
-            // 1. Ask all replicas for their chunk hash
-            for (const auto& replica : replicas) {
-                auto resp = get_chunk_hash(replica, filename);
-                if (resp.success()) {
-                    hash_counts[resp.hash()]++;
-                    hash_to_servers[resp.hash()].push_back({replica, resp.load_score()});
-                } else {
-                    failed_fetches.push_back(replica);
-                }
+        };
+        std::map<int, ChunkConsensus> consensus_map;
+        
+        for (auto& fut : hash_futures) {
+            auto result = fut.get();
+            auto& consensus = consensus_map[result.chunk_id];
+            if (result.response.success()) {
+                consensus.hash_counts[result.response.hash()]++;
+                consensus.hash_to_servers[result.response.hash()].push_back(
+                    {result.location, result.response.load_score()});
+            } else {
+                consensus.failed_fetches.push_back(result.location);
             }
-            
-            if (hash_counts.empty()) {
+        }
+        
+        // ── Phase 2: Select best servers and fetch chunk payloads concurrently ──
+        struct ChunkFetchPlan {
+            int chunk_id;
+            ChunkLocation best_server;
+            std::string majority_hash;
+        };
+        
+        std::vector<ChunkFetchPlan> fetch_plans;
+        
+        for (const auto& [chunk_id, consensus] : consensus_map) {
+            if (consensus.hash_counts.empty()) {
                 std::cerr << "Could not verify any hashes for chunk " << chunk_id << " from any replica!" << std::endl;
-                output_file.close();
-                fs::remove(output_path);
                 return false;
             }
             
-            // 2. Find the majority hash (voting consensus)
-            std::string majority_hash = "";
+            // Find majority hash
+            std::string majority_hash;
             int max_count = 0;
-            for (const auto& [hash, count] : hash_counts) {
+            for (const auto& [hash, count] : consensus.hash_counts) {
                 if (count > max_count) {
                     max_count = count;
                     majority_hash = hash;
                 }
             }
             
-            // 3. Select the healthiest server with the majority hash
-            auto& majority_servers = hash_to_servers[majority_hash];
+            // Select healthiest server with majority hash
+            auto it = consensus.hash_to_servers.find(majority_hash);
+            if (it == consensus.hash_to_servers.end() || it->second.empty()) {
+                std::cerr << "No servers available for majority hash of chunk " << chunk_id << std::endl;
+                return false;
+            }
+            
+            auto majority_servers = it->second;
             std::sort(majority_servers.begin(), majority_servers.end(), [](const auto& a, const auto& b) {
-                return a.second < b.second; // ascending load score (lower load usage is better)
+                return a.second < b.second;
             });
             
             ChunkLocation best_server = majority_servers.front().first;
@@ -372,30 +494,90 @@ public:
                       << " (Selected best server " << best_server.server_ip << " with load score " 
                       << majority_servers.front().second << ")" << std::endl;
             
-            // 4. Fetch the verified chunk payload
-            auto chunk_data = read_chunk_from_server(best_server, filename);
-            if (chunk_data.empty()) {
-                // Should technically failover to next best server, but simplified for now
-                std::cerr << "Failed to fully stream chunk from selected master server" << std::endl;
-                output_file.close();
-                fs::remove(output_path);
+            fetch_plans.push_back(ChunkFetchPlan{chunk_id, best_server, majority_hash});
+        }
+        
+        // Fire all chunk fetches concurrently
+        struct ChunkFetchResult {
+            int chunk_id;
+            std::vector<char> data;
+            std::string majority_hash;
+        };
+        
+        std::vector<std::future<ChunkFetchResult>> fetch_futures;
+        
+        for (const auto& plan : fetch_plans) {
+            auto fname = filename;
+            auto p = plan;
+            fetch_futures.push_back(fetch_pool().submit([this, fname, p]() -> ChunkFetchResult {
+                auto data = read_chunk_from_server(p.best_server, fname);
+                return ChunkFetchResult{p.chunk_id, std::move(data), p.majority_hash};
+            }));
+        }
+        
+        std::cout << "Fetching " << fetch_futures.size() << " chunk payloads concurrently..." << std::endl;
+        
+        // Collect all fetched chunks
+        std::map<int, ChunkFetchResult> fetched_chunks;
+        for (auto& fut : fetch_futures) {
+            auto result = fut.get();
+            if (result.data.empty()) {
+                std::cerr << "Failed to fetch chunk " << result.chunk_id << std::endl;
                 return false;
             }
+            fetched_chunks[result.chunk_id] = std::move(result);
+        }
+        
+        // ── Phase 3: Write output file using POSIX I/O ──
+        int out_fd = ::open(output_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (out_fd < 0) {
+            std::cerr << "Failed to create output file: " << output_path << std::endl;
+            return false;
+        }
+        
+        // Write chunks in order
+        for (const auto& [chunk_id, result] : fetched_chunks) {
+            size_t written = 0;
+            while (written < result.data.size()) {
+                ssize_t n = ::write(out_fd, result.data.data() + written, result.data.size() - written);
+                if (n < 0) {
+                    if (errno == EINTR) continue;
+                    std::cerr << "Write error for chunk " << chunk_id << ": " << strerror(errno) << std::endl;
+                    ::close(out_fd);
+                    fs::remove(output_path);
+                    return false;
+                }
+                written += static_cast<size_t>(n);
+            }
+        }
+        
+        ::fdatasync(out_fd);
+        ::close(out_fd);
+        
+        // ── Phase 4: Async read repairs (fire and forget via thread pool) ──
+        for (const auto& [chunk_id, consensus] : consensus_map) {
+            auto it = fetched_chunks.find(chunk_id);
+            if (it == fetched_chunks.end()) continue;
             
-            output_file.write(chunk_data.data(), chunk_data.size());
+            const auto& chunk_data = it->second.data;
+            const auto& majority_hash = it->second.majority_hash;
             
-            // 5. Read Repair: Fix mismatched replicas out of sync with consensus memory
-            for (const auto& [hash, servers] : hash_to_servers) {
+            for (const auto& [hash, servers] : consensus.hash_to_servers) {
                 if (hash != majority_hash) {
                     for (const auto& [loc, score] : servers) {
                         std::cerr << "! Data Corruption Detected! Repairing Chunk " << chunk_id << " on " << loc.server_ip << std::endl;
-                        repair_chunk_on_server(loc, filename, chunk_data);
+                        // Fire repair asynchronously - don't block the download
+                        auto repair_loc = loc;
+                        auto repair_data = chunk_data;
+                        auto fname = filename;
+                        fetch_pool().submit([this, repair_loc, fname, repair_data]() -> bool {
+                            return repair_chunk_on_server(repair_loc, fname, repair_data);
+                        });
                     }
                 }
             }
         }
         
-        output_file.close();
         std::cout << "File reconstructed successfully: " << output_path << std::endl;
         return true;
     }

@@ -5,6 +5,17 @@ project(Distributed-File-Grid VERSION 1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+include(FetchContent)
+
+FetchContent_Declare(
+    abseil-cpp
+    GIT_REPOSITORY https://github.com/abseil/abseil-cpp.git
+    protobuf
+    Protobuf_LIBRARIES
+    Protobuf_INCLUDE_DIRS
+    GIT_TAG 20230125.3
+)
+
 
 # Build configuration
 if(NOT CMAKE_BUILD_TYPE)
@@ -44,11 +55,6 @@ find_package(ZLIB REQUIRED)
 
 # Find or fetch Abseil
 include(FetchContent)
-FetchContent_Declare(
-    abseil-cpp
-    GIT_REPOSITORY https://github.com/abseil/abseil-cpp.git
-    GIT_TAG 20230125.3
-)
 set(ABSL_PROPAGATE_CXX_STD ON)
 set(ABSL_BUILD_TESTING OFF)
 set(ABSL_ENABLE_INSTALL ON)

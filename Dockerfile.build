@@ -1,0 +1,27 @@
+# Lightweight build-only image for compiling DFG binaries
+FROM ubuntu:24.04 AS builder
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    pkg-config \
+    git \
+    libprotobuf-dev \
+    protobuf-compiler \
+    zlib1g-dev \
+    libcurl4-openssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY . .
+
+RUN rm -rf build && mkdir build && cd build && \
+    cmake -DBUILD_TESTS=OFF -DWITH_REDIS=OFF -DCMAKE_BUILD_TYPE=Release .. 2>&1 && \
+    make -j$(nproc) 2>&1
+
+# Copy binaries to /output for extraction
+RUN mkdir -p /output && \
+    cp build/head_server /output/ 2>/dev/null || true && \
+    cp build/cluster_server /output/ 2>/dev/null || true && \
+    cp build/health_checker /output/ 2>/dev/null || true && \
+    cp build/zk_head_server_monitor /output/ 2>/dev/null || true
