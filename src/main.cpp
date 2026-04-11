@@ -1,5 +1,6 @@
 #include "include/version.h"
 #include "Head_Server/redis_handler.hpp"
+#include "include/config_loader.hpp"
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -7,13 +8,11 @@
 #include <vector>
 #include <chrono>
 #include <signal.h>
+#include <unistd.h>
 
-// Forward declarations for service functions
+// Forward declarations for file-operation functions (linked from
+// asyc_file_recv_to_chunks.cpp and chunck_read_to_file.cpp – no main() conflicts).
 extern "C" {
-    int start_cluster_server(int server_id, const char* ip, int port);
-    void stop_cluster_server();
-    int start_health_checker();
-    void stop_health_checker();
     int process_file_upload(const char* filepath, const char* filename);
     int process_file_download(const char* filename, const char* output_path);
     int check_file_exists(const char* filename);
@@ -53,27 +52,64 @@ void print_usage() {
 }
 
 int run_head_server() {
-    std::cout << "Starting Head Server..." << std::endl;
-    
-    // In a real implementation, this would start the HTTP server
-    // For now, just keep the process running
+    auto& cfg = head_server_config();
+    int port = cfg.get_int("server.port", 9669);
+    int replication_factor = cfg.get_int("storage.replication_factor", 3);
+    long long chunk_size = cfg.get_long("storage.chunk_size", 64 * 1024 * 1024);
+
+    std::cout << "╔═══════════════════════════════════════════════════╗" << std::endl;
+    std::cout << "║     Distributed File Grid - Head Server (CLI)     ║" << std::endl;
+    std::cout << "║                  Version " << APP_VERSION << "                    ║" << std::endl;
+    std::cout << "╚═══════════════════════════════════════════════════╝" << std::endl;
+    std::cout << std::endl;
+    std::cout << "Configuration:" << std::endl;
+    std::cout << "  Port:               " << port << std::endl;
+    std::cout << "  Replication Factor: " << replication_factor << std::endl;
+    std::cout << "  Chunk Size:         " << (chunk_size / (1024 * 1024)) << " MB" << std::endl;
+#ifdef WITH_REDIS
+    std::cout << "  Metadata Backend:   Redis" << std::endl;
+#else
+    std::cout << "  Metadata Backend:   On-disk (" << metadata_store::db_path() << ")" << std::endl;
+#endif
+    std::cout << std::endl;
+
+    // Initialize the metadata backend (Redis or on-disk fallback)
+    start_daemon();
+
+    std::cout << "Head Server is ready." << std::endl;
+
+    // Keep the process running until signal
     while (g_running) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
     
+    std::cout << "Head Server shut down gracefully." << std::endl;
     return 0;
 }
 
 int run_cluster_server(int server_id, const std::string& ip, int port) {
     std::cout << "Starting Cluster Server " << server_id << " on " << ip << ":" << port << std::endl;
-    
-    return start_cluster_server(server_id, ip.c_str(), port);
+
+    // The cluster_server binary lives alongside us.
+    // Build argument list and exec into it so it gets its own process.
+    std::string sid_str = std::to_string(server_id);
+    std::string port_str = std::to_string(port);
+    execl("./cluster_server", "cluster_server",
+          "--server-id", sid_str.c_str(),
+          "--ip", ip.c_str(),
+          "--port", port_str.c_str(),
+          nullptr);
+    // If exec returns, it failed
+    std::cerr << "Failed to exec cluster_server binary" << std::endl;
+    return -1;
 }
 
 int run_health_checker() {
     std::cout << "Starting Health Checker..." << std::endl;
-    
-    return start_health_checker();
+
+    execl("./health_checker", "health_checker", nullptr);
+    std::cerr << "Failed to exec health_checker binary" << std::endl;
+    return -1;
 }
 
 int upload_file(const std::string& filepath, const std::string& filename) {

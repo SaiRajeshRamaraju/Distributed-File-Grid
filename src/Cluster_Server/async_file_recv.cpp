@@ -466,12 +466,18 @@ private:
         
         auto print_stats = [this](async_hb::Reactor& r) -> async_hb::task {
              while (running) {
-                 co_await r.sleep_for(std::chrono::seconds(60));
+                 co_await r.sleep_for(std::chrono::seconds(5));
                  auto usage = system_monitor();
-                 std::cout << "Server " << server_id << " - CPU: " << usage.cpu_usage 
-                          << "%, RAM: " << usage.ram_usage << "%, Disk: " << usage.disk_usage << "%" << std::endl;
-                 size_t storage_usage = storage.get_storage_usage();
-                 std::cout << "Storage usage: " << storage_usage / (1024*1024) << " MB" << std::endl;
+                 exporter.update_system_metrics(usage.cpu_usage, usage.ram_usage, usage.disk_usage);
+                 
+                 // Print out stats every minute approx
+                 static int ticks = 0;
+                 if (ticks++ % 12 == 0) {
+                     std::cout << "Server " << server_id << " - CPU: " << usage.cpu_usage 
+                              << "%, RAM: " << usage.ram_usage << "%, Disk: " << usage.disk_usage << "%" << std::endl;
+                     size_t storage_usage = storage.get_storage_usage();
+                     std::cout << "Storage usage: " << storage_usage / (1024*1024) << " MB" << std::endl;
+                 }
              }
         };
         reactor.spawn(print_stats(reactor));

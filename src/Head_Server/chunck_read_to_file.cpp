@@ -1,5 +1,6 @@
 #include "../include/heart_beat_signal.hpp"
 #include "./redis_handler.hpp"
+#include "../include/config_loader.hpp"
 #include <fstream>
 #include <filesystem>
 #include <vector>
@@ -250,7 +251,10 @@ private:
         int transfer_port = port + 100;
         
         int sock = connect_nb(ip, transfer_port);
-        if (sock < 0) return resp;
+        if (sock < 0) {
+            std::cerr << "get_chunk_hash: Connect failed to " << ip << ":" << transfer_port << std::endl;
+            return resp;
+        }
 
         file_transfer::v1::FetchHashRequest req;
         std::string unique_chunk_id = filename + "_chunk_" + std::to_string(location.chunk_id);
@@ -264,12 +268,14 @@ private:
         if (!send_all_nb(sock, &type, sizeof(type)) ||
             !send_all_nb(sock, &len, sizeof(len)) ||
             !send_all_nb(sock, serialized.data(), serialized.size())) {
+            std::cerr << "get_chunk_hash: Send failed" << std::endl;
             ::close(sock);
             return resp;
         }
         
         uint32_t resp_len_net;
         if (!recv_all_nb(sock, &resp_len_net, sizeof(resp_len_net))) {
+            std::cerr << "get_chunk_hash: Recv length failed" << std::endl;
             ::close(sock);
             return resp;
         }
@@ -278,11 +284,16 @@ private:
         std::vector<char> resp_buf(resp_len);
         
         if (!recv_all_nb(sock, resp_buf.data(), resp_len)) {
+            std::cerr << "get_chunk_hash: Recv payload failed" << std::endl;
             ::close(sock);
             return resp;
         }
         
-        resp.ParseFromArray(resp_buf.data(), resp_len);
+        if (!resp.ParseFromArray(resp_buf.data(), resp_len)) {
+            std::cerr << "get_chunk_hash: Parse failed" << std::endl;
+        } else if (!resp.success()) {
+            std::cerr << "get_chunk_hash: Server returned error: " << resp.error_message() << std::endl;
+        }
         ::close(sock);
         return resp;
     }

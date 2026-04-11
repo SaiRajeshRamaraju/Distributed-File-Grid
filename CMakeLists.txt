@@ -83,6 +83,7 @@ FetchContent_Declare(
 )
 set(_DFG_ENABLE_TESTING_BACKUP ${ENABLE_TESTING})
 set(ENABLE_TESTING OFF CACHE BOOL "Build prometheus-cpp tests" FORCE)
+set(ENABLE_PUSH OFF CACHE BOOL "Build prometheus-cpp push (requires CURL)" FORCE)
 FetchContent_MakeAvailable(prometheus-cpp)
 if(DEFINED _DFG_ENABLE_TESTING_BACKUP)
     set(ENABLE_TESTING ${_DFG_ENABLE_TESTING_BACKUP} CACHE BOOL "Build tests" FORCE)
@@ -93,7 +94,6 @@ endif()
 set(PROMETHEUS_LIBS
     prometheus-cpp::core
     prometheus-cpp::pull
-    prometheus-cpp::push
 )
 
 # Make Redis++ optional
@@ -182,6 +182,34 @@ target_link_libraries(cluster_server
         ${ZLIB_LIBRARIES}
 )
 
+# Unified CLI entry point
+# Links with head-server logic (upload / download / metadata) but NOT with
+# the standalone server entry points (they have their own main()).
+add_executable(main
+    src/main.cpp
+    src/Head_Server/asyc_file_recv_to_chunks.cpp
+    src/Head_Server/chunck_read_to_file.cpp
+    ${PROTO_SRCS}
+)
+
+target_include_directories(main PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/include
+    ${CMAKE_BINARY_DIR}/generated
+    ${CMAKE_SOURCE_DIR}/src/protos/v1/generate
+    ${Protobuf_INCLUDE_DIRS}
+)
+
+target_link_libraries(main PRIVATE
+    ${CMAKE_THREAD_LIBS_INIT}
+    protobuf::libprotobuf
+    ${ABSEIL_LIBS}
+    ${PROMETHEUS_LIBS}
+    ${ZLIB_LIBRARIES}
+)
+
+target_compile_options(main PRIVATE -fcoroutines)
+
 # Health Checker
 add_executable(health_checker
     src/Health_Checker/health_checker.cpp
@@ -195,8 +223,9 @@ target_include_directories(health_checker PRIVATE
 
 target_link_libraries(health_checker PRIVATE
     ${COMMON_LIBS}
+    ${ABSEIL_LIBS}
     ${PROMETHEUS_LIBS}
-    absl::log_internal_check_op
+    ${ZLIB_LIBRARIES}
 )
 
 # ZooKeeper Head Server Monitor (now backed by the embedded coordinator)
@@ -244,6 +273,9 @@ if(WITH_REDIS)
     target_include_directories(head_server PRIVATE ${REDIS_PLUS_PLUS_INCLUDE_DIRS})
     target_compile_options(head_server PRIVATE ${REDIS_PLUS_PLUS_CFLAGS_OTHER})
     target_link_libraries(head_server PRIVATE redis++::redis++)
+    target_include_directories(main PRIVATE ${REDIS_PLUS_PLUS_INCLUDE_DIRS})
+    target_compile_options(main PRIVATE ${REDIS_PLUS_PLUS_CFLAGS_OTHER})
+    target_link_libraries(main PRIVATE redis++::redis++)
 endif()
 
 # Compiler options

@@ -1,5 +1,6 @@
 #include "../include/heart_beat_signal.hpp"
 #include "./redis_handler.hpp"
+#include "../include/config_loader.hpp"
 #include <fstream>
 #include <filesystem>
 #include <vector>
@@ -24,8 +25,13 @@
 
 namespace fs = std::filesystem;
 
-const size_t CHUNK_SIZE = 64 * 1024 * 1024; // 64MB chunks
-const int DEFAULT_REPLICATION_FACTOR = 3;
+// Read from config, with sane defaults matching the README spec.
+static size_t config_chunk_size() {
+    return static_cast<size_t>(head_server_config().get_long("storage.chunk_size", 64 * 1024 * 1024));
+}
+static int config_replication_factor() {
+    return head_server_config().get_int("storage.replication_factor", 3);
+}
 const int MAX_CONCURRENT_TRANSFERS = 6; // Max parallel chunk transfers
 
 struct ChunkInfo {
@@ -99,11 +105,19 @@ static TransferPool& transfer_pool() {
 
 class FileChunker {
 private:
-    std::vector<std::string> cluster_servers = {
-        "127.0.0.1:8080",
-        "127.0.0.1:8081", 
-        "127.0.0.1:8082"
-    };
+    std::vector<std::string> cluster_servers;
+
+    void load_cluster_servers() {
+        if (!cluster_servers.empty()) return;
+        auto entries = head_server_config().get_cluster_servers();
+        for (const auto& e : entries) {
+            cluster_servers.push_back(e.host + ":" + std::to_string(e.port));
+        }
+        // Fallback defaults if config was not loaded
+        if (cluster_servers.empty()) {
+            cluster_servers = {"127.0.0.1:8080", "127.0.0.1:8081", "127.0.0.1:8082"};
+        }
+    }
     
     std::string calculate_checksum(const std::vector<char>& data) {
         // Simple checksum - in production use SHA256
@@ -284,8 +298,12 @@ private:
 
 public:
     std::vector<ChunkInfo> split_and_store_file(const std::string& filepath, const std::string& filename) {
+        load_cluster_servers();
         std::vector<ChunkInfo> chunks;
         
+        const size_t CHUNK_SIZE = config_chunk_size();
+        const int replication_factor = config_replication_factor();
+
         // Use POSIX I/O for async-friendly file reading
         int fd = ::open(filepath.c_str(), O_RDONLY | O_CLOEXEC);
         if (fd < 0) {
@@ -297,7 +315,8 @@ public:
         off_t file_size = ::lseek(fd, 0, SEEK_END);
         ::lseek(fd, 0, SEEK_SET);
         
-        std::cout << "Splitting file " << filename << " (" << file_size << " bytes) into chunks..." << std::endl;
+        std::cout << "Splitting file " << filename << " (" << file_size << " bytes) into chunks..."
+                  << " (chunk_size=" << (CHUNK_SIZE / (1024*1024)) << "MB, replication=" << replication_factor << ")" << std::endl;
         
         int chunk_id = 0;
         size_t bytes_read = 0;
@@ -332,7 +351,7 @@ public:
             bytes_read += total_read;
             
             std::string checksum = calculate_checksum(*chunk_data);
-            auto selected_servers = select_servers_for_chunk(DEFAULT_REPLICATION_FACTOR);
+            auto selected_servers = select_servers_for_chunk(replication_factor);
             
             // Fire off all replica transfers concurrently via the thread pool
             for (const auto& server : selected_servers) {
@@ -373,7 +392,7 @@ public:
             }
         }
         
-        std::cout << "File split into " << chunk_id << " chunks with " << DEFAULT_REPLICATION_FACTOR << "x replication" << std::endl;
+        std::cout << "File split into " << chunk_id << " chunks with " << replication_factor << "x replication" << std::endl;
         std::cout << "Successful transfers: " << chunks.size() << "/" << pending.size() << std::endl;
         return chunks;
     }

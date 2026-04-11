@@ -34,6 +34,7 @@ struct Reactor;
 struct task {
   struct promise_type {
     Reactor *reactor{nullptr};
+    std::coroutine_handle<> continuation;
 
     task get_return_object();
     std::suspend_always initial_suspend() noexcept { return {}; }
@@ -65,8 +66,11 @@ struct task {
       h.destroy();
   }
 
+  void detach() { h = nullptr; }
+
   bool await_ready() const noexcept { return false; }
-  void await_suspend(std::coroutine_handle<> /*unused*/) const noexcept {
+  void await_suspend(std::coroutine_handle<> caller) const noexcept {
+    h.promise().continuation = caller;
     h.resume();
   }
   void await_resume() const noexcept {}
@@ -231,6 +235,7 @@ inline void Reactor::spawn(task t) {
   t.h.promise().reactor = this;
   ++active_tasks_;
   t.h.resume();
+  t.detach();
 }
 
 inline void Reactor::run() {
@@ -486,7 +491,11 @@ inline void task::promise_type::final_awaitable::await_suspend(
   if (p.reactor) {
     --p.reactor->active_tasks_;
   }
-  h.destroy();
+  if (p.continuation) {
+    p.continuation.resume();
+  } else {
+    h.destroy();
+  }
 }
 
 } // namespace async_hb

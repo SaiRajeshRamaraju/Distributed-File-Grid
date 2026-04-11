@@ -16,6 +16,18 @@ MetricsExporter::MetricsExporter(const std::string& bind_address)
           .Name("heartbeat_active_connections")
           .Help("Number of active connections")
           .Register(*registry_).Add({})),
+      cpu_usage_(BuildGauge()
+          .Name("system_cpu_usage_percent")
+          .Help("CPU usage percentage")
+          .Register(*registry_).Add({})),
+      ram_usage_(BuildGauge()
+          .Name("system_ram_usage_percent")
+          .Help("RAM usage percentage")
+          .Register(*registry_).Add({})),
+      disk_usage_(BuildGauge()
+          .Name("system_disk_usage_percent")
+          .Help("Disk usage percentage")
+          .Register(*registry_).Add({})),
       // Initialize counters
       messages_received_(BuildCounter()
           .Name("heartbeat_messages_received_total")
@@ -47,6 +59,12 @@ MetricsExporter::MetricsExporter(const std::string& bind_address)
 
 void MetricsExporter::update_connections(int count) {
     active_connections_.Set(count);
+}
+
+void MetricsExporter::update_system_metrics(float cpu, float ram, float disk) {
+    cpu_usage_.Set(cpu);
+    ram_usage_.Set(ram);
+    disk_usage_.Set(disk);
 }
 
 void MetricsExporter::record_message(size_t bytes, double processing_time_ns) {

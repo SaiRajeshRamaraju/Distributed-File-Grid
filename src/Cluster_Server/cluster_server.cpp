@@ -1,5 +1,6 @@
 #include "../include/heart_beat_signal.hpp"
 #include "../include/version.h"
+#include "../include/config_loader.hpp"
 #include <cstring> // for std::strcmp
 #include <iostream>
 #include <ifaddrs.h>

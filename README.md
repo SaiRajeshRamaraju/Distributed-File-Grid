@@ -13,7 +13,9 @@ A **complete distributed file storage system** designed to reduce read/write lat
 ## Build Status
 
 **Successfully builds and tested on Arch Linux with GCC 15.2.1**
-- **4 main executables** compile and run without errors
+- **5 executables** compile and run: `main`, `head_server`, `cluster_server`, `health_checker`, `zk_head_server_monitor`
+- **Unified CLI**: `./build/main` entry point for all file operations and service management
+- **JSON configuration** loaded from `config/` with environment variable overrides
 - **ZooKeeper integration** with leader election and service discovery
 - **Docker deployment** with complete orchestration support
 - **Redis dependencies** properly isolated with conditional compilation

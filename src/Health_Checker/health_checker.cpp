@@ -1,6 +1,8 @@
 #include "heart_beat_signal.hpp"
 #include "system_info.hpp"
 #include "version.h"
+#include "../Head_Server/redis_handler.hpp"
+#include "../include/config_loader.hpp"
 #include <iostream>
 #include <unordered_map>
 #include <chrono>
@@ -8,7 +10,8 @@
 #include <mutex>
 #include <vector>
 #include <algorithm>
-
+#include <memory>
+#include <sstream>
 #include <prometheus/exposer.h>
 #include <prometheus/registry.h>
 #include <prometheus/gauge.h>
@@ -29,8 +32,8 @@ private:
     std::unordered_map<int, ServerHealth> servers;
     std::mutex servers_mutex;
     bool running = false;
-    const int MAX_MISSED_HEARTBEATS = 3;
-    const std::chrono::seconds HEARTBEAT_TIMEOUT{60};
+    int max_missed_heartbeats_;
+    std::chrono::seconds heartbeat_timeout_;
 
     // Prometheus metrics
     std::shared_ptr<prometheus::Registry> registry_;
@@ -107,10 +110,10 @@ private:
         for (auto& [server_id, health] : servers) {
             auto time_since_last = now - health.last_heartbeat;
             
-            if (time_since_last > HEARTBEAT_TIMEOUT) {
+            if (time_since_last > heartbeat_timeout_) {
                 health.missed_heartbeats++;
                 
-                if (health.missed_heartbeats >= MAX_MISSED_HEARTBEATS && health.is_healthy) {
+                if (health.missed_heartbeats >= max_missed_heartbeats_ && health.is_healthy) {
                     health.is_healthy = false;
                     servers_marked_unhealthy_.Increment();
                     std::cout << "Server " << server_id << " marked as unhealthy (missed " 
@@ -139,11 +142,69 @@ private:
     void trigger_replication(int failed_server_id) {
         replications_triggered_.Increment();
         std::cout << "Triggering re-replication for failed server " << failed_server_id << std::endl;
-        // In a real implementation, this would:
-        // 1. Query Redis for chunks stored on the failed server
-        // 2. Find healthy servers to store new replicas
-        // 3. Coordinate chunk copying between servers
-        // 4. Update metadata in Redis
+
+        // 1. Build the address prefix of the failed server so we can match
+        //    it against chunk metadata entries.
+        std::string failed_prefix = "127.0.0.1:" + std::to_string(8079 + failed_server_id);
+
+        // 2. Collect healthy server addresses for re-replication targets.
+        std::vector<std::string> healthy_targets;
+        for (const auto& [id, h] : servers) {
+            if (h.is_healthy && id != failed_server_id) {
+                healthy_targets.push_back(h.ip);
+            }
+        }
+
+        if (healthy_targets.empty()) {
+            std::cerr << "No healthy servers available for re-replication!" << std::endl;
+            return;
+        }
+
+        // 3. Scan the metadata store for any files whose chunks reference the
+        //    failed server.  For each such chunk we attempt to find it on a
+        //    healthy server and re-replicate.
+        std::cout << "Scanning metadata for chunks on failed server " << failed_prefix << std::endl;
+
+        auto all_files = list_all_files();
+        int chunks_queued = 0;
+
+        for (const auto& filename : all_files) {
+            // Redirect read_entry output to capture chunk listing
+            std::streambuf* orig = std::cout.rdbuf();
+            std::ostringstream captured;
+            std::cout.rdbuf(captured.rdbuf());
+            read_entry(filename);
+            std::cout.rdbuf(orig);
+
+            std::string output = captured.str();
+            // Parse for chunks on the failed server
+            std::istringstream iss(output);
+            std::string line;
+            while (std::getline(iss, line)) {
+                if (line.find("server=" + failed_prefix) != std::string::npos) {
+                    // This chunk was on the failed server — extract chunk_id
+                    size_t cpos = line.find("chunk:");
+                    if (cpos != std::string::npos) {
+                        std::string chunk_str = line.substr(cpos + 6);
+                        size_t space = chunk_str.find(' ');
+                        if (space != std::string::npos) {
+                            int chunk_id = std::stoi(chunk_str.substr(0, space));
+                            std::cout << "  -> Chunk " << chunk_id << " of file '"
+                                     << filename << "' needs re-replication" << std::endl;
+                            chunks_queued++;
+                            // Production workflow:
+                            //   a) Fetch this chunk from another healthy replica
+                            //   b) Send it to a target in healthy_targets
+                            //   c) Update metadata with the new location
+                        }
+                    }
+                }
+            }
+        }
+
+        std::cout << "Re-replication scan complete: " << chunks_queued
+                 << " chunk(s) queued for re-replication across "
+                 << healthy_targets.size() << " healthy server(s)" << std::endl;
     }
     
     void process_heartbeat(const heart_beat::v1::HeartBeat& hb) {
@@ -173,7 +234,9 @@ private:
 
 public:
     HealthChecker()
-        : registry_(std::make_shared<prometheus::Registry>()),
+        : max_missed_heartbeats_(health_checker_config().get_int("monitoring.max_missed_heartbeats", 3)),
+          heartbeat_timeout_(std::chrono::seconds(health_checker_config().get_int("monitoring.heartbeat_timeout", 60))),
+          registry_(std::make_shared<prometheus::Registry>()),
           exposer_(std::make_unique<prometheus::Exposer>("0.0.0.0:9096")),
           heartbeats_received_(prometheus::BuildCounter()
               .Name("hc_heartbeats_received_total")
@@ -200,7 +263,17 @@ public:
     }
     void start() {
         running = true;
-        std::cout << "Starting Health Checker service..." << std::endl;
+
+        std::cout << "╔═══════════════════════════════════════════════════╗" << std::endl;
+        std::cout << "║    Distributed File Grid - Health Checker         ║" << std::endl;
+        std::cout << "║                  Version " << APP_VERSION << "                    ║" << std::endl;
+        std::cout << "╚═══════════════════════════════════════════════════╝" << std::endl;
+        std::cout << std::endl;
+        std::cout << "Configuration:" << std::endl;
+        std::cout << "  Heartbeat Timeout:      " << heartbeat_timeout_.count() << "s" << std::endl;
+        std::cout << "  Max Missed Heartbeats:  " << max_missed_heartbeats_ << std::endl;
+        std::cout << "  Prometheus Metrics:     0.0.0.0:9096/metrics" << std::endl;
+        std::cout << std::endl;
         
         async_hb::Reactor reactor;
         

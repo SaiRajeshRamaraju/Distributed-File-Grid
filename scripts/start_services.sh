@@ -118,8 +118,8 @@ if [ ! -f "$BUILD_DIR/head_server" ] || [ ! -f "$BUILD_DIR/cluster_server" ] || 
     exit 1
 fi
 
-# Start Redis
-check_redis || exit 1
+# Start Redis (optional - system works with on-disk metadata if Redis is unavailable)
+check_redis || echo -e "${YELLOW}Redis not available - using on-disk metadata backend${NC}"
 echo ""
 
 # Start Health Checker
@@ -139,14 +139,18 @@ echo ""
 echo -e "${GREEN}=== All services started successfully! ===${NC}"
 echo ""
 echo "Service status:"
-echo "  Health Checker: http://localhost:9000"
-echo "  Head Server: http://localhost:9669"
-echo "  Cluster Server 1: http://localhost:8080"
-echo "  Cluster Server 2: http://localhost:8081"
-echo "  Cluster Server 3: http://localhost:8082"
+echo "  Health Checker:     port 9000  (metrics: http://localhost:9096/metrics)"
+echo "  Head Server:        port 9669  (metrics: http://localhost:9095/metrics)"
+echo "  Cluster Server 1:   port 8080  (metrics: http://localhost:9091/metrics)"
+echo "  Cluster Server 2:   port 8081"
+echo "  Cluster Server 3:   port 8082"
 echo ""
 echo "Logs are available in: $LOGS_DIR"
 echo "PID files are in: $PIDS_DIR"
+echo ""
+echo "To upload a file:    cd $BUILD_DIR && ./main upload <filepath> <name>"
+echo "To download a file:  cd $BUILD_DIR && ./main download <name> <output>"
+echo "To list files:       cd $BUILD_DIR && ./main list"
 echo ""
 echo "To stop all services, run: ./scripts/stop_services.sh"
 echo "To check service status, run: ./scripts/status.sh"

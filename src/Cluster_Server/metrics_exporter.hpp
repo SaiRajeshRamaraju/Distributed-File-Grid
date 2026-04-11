@@ -15,6 +15,7 @@ public:
 
     // Update metrics
     void update_connections(int count);
+    void update_system_metrics(float cpu, float ram, float disk);
     void record_message(size_t bytes, double processing_time_ns);
     void record_error(const std::string& type);
 
@@ -25,6 +26,9 @@ private:
     
     // Gauges
     prometheus::Gauge& active_connections_;
+    prometheus::Gauge& cpu_usage_;
+    prometheus::Gauge& ram_usage_;
+    prometheus::Gauge& disk_usage_;
     
     // Counters
     prometheus::Counter& messages_received_;

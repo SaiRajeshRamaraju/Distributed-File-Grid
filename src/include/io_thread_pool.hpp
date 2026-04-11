@@ -79,7 +79,7 @@ inline IOThreadPool& io_pool() {
 // and resumes once the result is ready.
 template <typename T>
 struct FutureAwaiter {
-    std::future<T> fut;
+    std::shared_future<T> fut;
     async_hb::Reactor* reactor;
 
     bool await_ready() const noexcept {
@@ -87,17 +87,13 @@ struct FutureAwaiter {
     }
 
     void await_suspend(std::coroutine_handle<> h) {
-        // Spin up a tiny polling coroutine that checks every 1ms.
-        // This is lightweight because timerfd is O(1) in epoll.
-        auto shared_fut = std::make_shared<std::future<T>>(std::move(fut));
-        auto shared_h   = std::make_shared<std::coroutine_handle<>>(h);
         auto r = reactor;
-
-        auto poll = [r, shared_fut, shared_h](async_hb::Reactor& rx) -> async_hb::task {
-            while (shared_fut->wait_for(std::chrono::microseconds(0)) != std::future_status::ready) {
+        auto shared_h = std::make_shared<std::coroutine_handle<>>(h);
+        
+        auto poll = [r, f = fut, shared_h](async_hb::Reactor& rx) -> async_hb::task {
+            while (f.wait_for(std::chrono::microseconds(0)) != std::future_status::ready) {
                 co_await rx.sleep_for(std::chrono::milliseconds(1));
             }
-            // Result is ready — resume the original coroutine.
             if (*shared_h && !shared_h->done()) {
                 shared_h->resume();
             }
@@ -105,8 +101,6 @@ struct FutureAwaiter {
         };
 
         reactor->spawn(poll(*reactor));
-        // Move the future back so await_resume can access it.
-        fut = std::move(*shared_fut);
     }
 
     T await_resume() {
@@ -116,5 +110,5 @@ struct FutureAwaiter {
 
 template <typename T>
 FutureAwaiter<T> await_future(async_hb::Reactor& r, std::future<T> f) {
-    return FutureAwaiter<T>{std::move(f), &r};
+    return FutureAwaiter<T>{f.share(), &r};
 }

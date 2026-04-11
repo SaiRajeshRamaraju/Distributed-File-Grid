@@ -1,0 +1,32 @@
+Running system tests...
+Created test file: /tmp/test_file.txt
+
+=== Testing File Upload ===
+Uploading file: /tmp/test_file.txt as test_file.txt
+Splitting file test_file.txt (67012 bytes) into chunks... (chunk_size=64MB, replication=3)
+Waiting for 3 concurrent chunk transfers...
+Stored chunk 0 on server 127.0.0.1:8082
+Stored chunk 0 on server 127.0.0.1:8081
+Failed to receive response length from 127.0.0.1:8080
+Transfer failed: chunk 0 to 127.0.0.1:8080
+File split into 1 chunks with 3x replication
+Successful transfers: 2/3
+Created file entry: test_file.txt
+Metadata stored in Redis for file: test_file.txt
+File uploaded successfully!
+
+=== Testing File Download ===
+Downloading file: test_file.txt to /tmp/downloaded_test_file.txt
+Reconstructing file: test_file.txt
+Found 1 unique chunks to reconstruct
+Fetching 2 chunk hashes concurrently...
+Consensus for chunk 0: 1ecf9cae0cf3d1d (Selected best server 127.0.0.1:8082 with load score 97.1143)
+Fetching 1 chunk payloads concurrently...
+Read chunk 0 (67012 bytes) from 127.0.0.1:8082
+File reconstructed successfully: /tmp/downloaded_test_file.txt
+File downloaded successfully!
+
+=== Verifying File Integrity ===
+File integrity verified - files match!
+
+=== All Tests Passed! ===
