@@ -17,8 +17,6 @@ build:
 clean:
 	@echo "Cleaning build artifacts..."
 	@rm -rf build/
-	@rm -rf logs/
-	@rm -rf pids/
 	@rm -rf /tmp/chunks/
 	@rm -rf /tmp/cluster_storage/
 	@echo "Clean completed!"
@@ -30,14 +28,14 @@ install-deps:
 	@sudo apt-get install -y build-essential cmake pkg-config \
 		libprotobuf-dev protobuf-compiler \
 		redis-server redis-tools \
-		libfmt-dev
+		libfmt-dev zlib1g-dev
 	@echo "Dependencies installed!"
 
 # Install system dependencies (Arch Linux)
 install-deps-arch:
 	@echo "Installing system dependencies for Arch Linux..."
 	@sudo pacman -S --needed base-devel cmake pkg-config \
-		protobuf redis fmt
+		protobuf redis fmt zlib
 	@echo "Dependencies installed!"
 
 # Start all services
@@ -57,20 +55,19 @@ status:
 # Run system tests
 test: build
 	@echo "Running system tests..."
-	@mkdir -p build
-	@cd build && ./main test
+	@cd build && ./dfg test
 
 # Upload a test file
 upload-test: build
 	@echo "Creating and uploading test file..."
 	@echo "This is a test file for the distributed storage system." > /tmp/test_upload.txt
 	@echo "It demonstrates file upload functionality." >> /tmp/test_upload.txt
-	@cd build && ./main upload /tmp/test_upload.txt test_upload.txt
+	@cd build && ./dfg upload /tmp/test_upload.txt test_upload.txt
 
 # Download the test file
 download-test: build
 	@echo "Downloading test file..."
-	@cd build && ./main download test_upload.txt /tmp/test_download.txt
+	@cd build && ./dfg download test_upload.txt /tmp/test_download.txt
 	@echo "Downloaded file contents:"
 	@cat /tmp/test_download.txt
 
@@ -106,8 +103,7 @@ help:
 	@echo "  make help           - Show this help message"
 	@echo ""
 	@echo "Manual Commands:"
-	@echo "  cd build && ./main head-server"
-	@echo "  cd build && ./main cluster-server --server-id 1 --port 8080"
-	@echo "  cd build && ./main health-checker"
-	@echo "  cd build && ./main upload <file> <name>"
-	@echo "  cd build && ./main download <name> <output>"
+	@echo "  cd build && ./dfg head-server"
+	@echo "  cd build && ./dfg cluster-server --server-id 1 --port 8080"
+	@echo "  cd build && ./dfg upload <file> <name>"
+	@echo "  cd build && ./dfg download <name> <output>"

@@ -1,0 +1,69 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "panels": [
+    {
+      "id": 1, "title": "All Service Logs (Live Tail)", "type": "logs",
+      "gridPos": {"h": 12, "w": 24, "x": 0, "y": 0},
+      "targets": [{"expr": "{job=\"dfg-logs\"} | logfmt", "refId": "A"}],
+      "datasource": {"type": "loki", "uid": "loki"},
+      "options": {"showTime": true, "showLabels": true, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none"}
+    },
+    {
+      "id": 2, "title": "Error Logs Only", "type": "logs",
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 12},
+      "targets": [{"expr": "{job=\"dfg-logs\"} |~ \"(?i)(error|fail|fatal|exception|critical)\"", "refId": "A"}],
+      "datasource": {"type": "loki", "uid": "loki"},
+      "options": {"showTime": true, "showLabels": true, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending"}
+    },
+    {
+      "id": 3, "title": "Error Rate Over Time", "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 22},
+      "targets": [{"expr": "sum(count_over_time({job=\"dfg-logs\"} |~ \"(?i)(error|fail|fatal)\" [1m]))", "legendFormat": "Errors/min", "refId": "A"}],
+      "datasource": {"type": "loki", "uid": "loki"},
+      "fieldConfig": {"defaults": {"custom": {"fillOpacity": 30}, "color": {"fixedColor": "red", "mode": "fixed"}}}
+    },
+    {
+      "id": 4, "title": "Warning Rate Over Time", "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 22},
+      "targets": [{"expr": "sum(count_over_time({job=\"dfg-logs\"} |~ \"(?i)(warn|warning)\" [1m]))", "legendFormat": "Warnings/min", "refId": "A"}],
+      "datasource": {"type": "loki", "uid": "loki"},
+      "fieldConfig": {"defaults": {"custom": {"fillOpacity": 30}, "color": {"fixedColor": "orange", "mode": "fixed"}}}
+    },
+    {
+      "id": 5, "title": "Head Server Logs", "type": "logs",
+      "gridPos": {"h": 10, "w": 12, "x": 0, "y": 30},
+      "targets": [{"expr": "{filename=~\".*head_server.*\"}", "refId": "A"}],
+      "datasource": {"type": "loki", "uid": "loki"},
+      "options": {"showTime": true, "showLabels": false, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending"}
+    },
+    {
+      "id": 6, "title": "Cluster Server Logs", "type": "logs",
+      "gridPos": {"h": 10, "w": 12, "x": 12, "y": 30},
+      "targets": [{"expr": "{filename=~\".*cluster_server.*\"}", "refId": "A"}],
+      "datasource": {"type": "loki", "uid": "loki"},
+      "options": {"showTime": true, "showLabels": false, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending"}
+    },
+    {
+      "id": 7, "title": "Health Checker Logs", "type": "logs",
+      "gridPos": {"h": 10, "w": 12, "x": 0, "y": 40},
+      "targets": [{"expr": "{filename=~\".*health_checker.*\"}", "refId": "A"}],
+      "datasource": {"type": "loki", "uid": "loki"},
+      "options": {"showTime": true, "showLabels": false, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending"}
+    },
+    {
+      "id": 8, "title": "ZooKeeper Monitor Logs", "type": "logs",
+      "gridPos": {"h": 10, "w": 12, "x": 12, "y": 40},
+      "targets": [{"expr": "{filename=~\".*zk_monitor.*\"}", "refId": "A"}],
+      "datasource": {"type": "loki", "uid": "loki"},
+      "options": {"showTime": true, "showLabels": false, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending"}
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["dfg", "logs"],
+  "time": {"from": "now-1h", "to": "now"},
+  "timezone": "browser",
+  "title": "DFG - Service Logs & Errors",
+  "uid": "dfg-logs"
+}

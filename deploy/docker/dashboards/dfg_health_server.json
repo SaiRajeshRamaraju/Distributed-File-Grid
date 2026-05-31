@@ -1,0 +1,87 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "id": 1, "title": "Healthy Cluster Servers", "type": "gauge",
+      "gridPos": {"h": 6, "w": 6, "x": 0, "y": 0},
+      "targets": [{"expr": "hc_healthy_servers", "legendFormat": "Healthy"}],
+      "fieldConfig": {"defaults": {"max": 5, "min": 0, "thresholds": {"steps": [{"value": 0, "color": "red"}, {"value": 1, "color": "yellow"}, {"value": 3, "color": "green"}]}}}
+    },
+    {
+      "id": 2, "title": "Heartbeats Received (Rate)", "type": "timeseries",
+      "gridPos": {"h": 6, "w": 12, "x": 6, "y": 0},
+      "targets": [{"expr": "rate(hc_heartbeats_received_total[1m])", "legendFormat": "Heartbeats/sec"}]
+    },
+    {
+      "id": 3, "title": "Servers Marked Unhealthy", "type": "stat",
+      "gridPos": {"h": 6, "w": 6, "x": 18, "y": 0},
+      "targets": [{"expr": "hc_servers_marked_unhealthy_total", "legendFormat": "Total Unhealthy Events"}],
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"steps": [{"value": 0, "color": "green"}, {"value": 1, "color": "red"}]}}}
+    },
+    {
+      "id": 4, "title": "Per-Server Health Status", "type": "table",
+      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 6},
+      "targets": [
+        {"expr": "hc_server_healthy", "legendFormat": "{{server_id}}", "format": "table", "instant": true, "refId": "A"}
+      ],
+      "transformations": [
+        {"id": "organize", "options": {"excludeByName": {"Time": true, "__name__": true, "instance": true, "job": true}, "renameByName": {"server_id": "Server ID", "Value": "Healthy (1=Yes)"}}}
+      ]
+    },
+    {
+      "id": 5, "title": "CPU Usage per Cluster Server", "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "targets": [{"expr": "hc_server_cpu_usage_percent", "legendFormat": "Server {{server_id}}"}],
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100, "custom": {"fillOpacity": 20}}}
+    },
+    {
+      "id": 6, "title": "RAM Usage per Cluster Server", "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "targets": [{"expr": "hc_server_ram_usage_percent", "legendFormat": "Server {{server_id}}"}],
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100, "custom": {"fillOpacity": 20}}}
+    },
+    {
+      "id": 7, "title": "Disk Usage per Cluster Server", "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 20},
+      "targets": [{"expr": "hc_server_disk_usage_percent", "legendFormat": "Server {{server_id}}"}],
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100, "custom": {"fillOpacity": 20}}}
+    },
+    {
+      "id": 8, "title": "Network Ingress per Cluster Server", "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 20},
+      "targets": [{"expr": "hc_server_network_in_bytes_per_sec", "legendFormat": "Server {{server_id}} In"}],
+      "fieldConfig": {"defaults": {"unit": "Bps", "custom": {"fillOpacity": 10}}}
+    },
+    {
+      "id": 9, "title": "Network Egress per Cluster Server", "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 28},
+      "targets": [{"expr": "hc_server_network_out_bytes_per_sec", "legendFormat": "Server {{server_id}} Out"}],
+      "fieldConfig": {"defaults": {"unit": "Bps", "custom": {"fillOpacity": 10}}}
+    },
+    {
+      "id": 10, "title": "Re-replications Triggered", "type": "stat",
+      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 28},
+      "targets": [{"expr": "hc_replications_triggered_total", "legendFormat": "Re-replications"}],
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"steps": [{"value": 0, "color": "green"}, {"value": 1, "color": "orange"}]}}}
+    },
+    {
+      "id": 11, "title": "Servers Recovered", "type": "stat",
+      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 28},
+      "targets": [{"expr": "hc_servers_recovered_total", "legendFormat": "Recoveries"}]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["dfg", "health-checker"],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "DFG - Health Server & Cluster Metrics",
+  "uid": "dfg-health-server"
+}

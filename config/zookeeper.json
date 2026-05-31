@@ -1,0 +1,29 @@
+{
+  "zookeeper": {
+    "hosts": "localhost:2181",
+    "session_timeout_ms": 10000,
+    "connection_timeout_ms": 5000
+  },
+  "monitor": {
+    "interval_seconds": 10,
+    "heartbeat_timeout_seconds": 30
+  },
+  "head_servers": [
+    {
+      "id": "head_server_1",
+      "host": "127.0.0.1",
+      "port": 9669
+    },
+    {
+      "id": "head_server_2",
+      "host": "127.0.0.1",
+      "port": 9670
+    }
+  ],
+  "logging": {
+    "level": "INFO",
+    "file": "logs/zookeeper_monitor.log",
+    "max_size_mb": 50,
+    "max_files": 5
+  }
+}

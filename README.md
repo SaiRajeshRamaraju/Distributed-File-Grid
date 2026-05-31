@@ -1,572 +1,292 @@
 # Distributed File Grid
 
-## Project Summary
+A distributed file storage system that splits files into chunks, replicates them across a cluster of servers, and reassembles them on demand — designed for fault tolerance, not perfection.
 
-A **complete distributed file storage system** designed to reduce read/write latency and ensure fault-tolerant data redundancy across unreliable nodes with advanced monitoring and orchestration capabilities.
-
-- **High-throughput system** using asynchronous, multithreaded I/O to split files into 64 MB chunks with configurable replication
-- **Dual head server architecture** with ZooKeeper-based leader election and automatic failover
-- **Advanced health monitoring** through multiple monitoring services with real-time status reporting
-- **Efficient communication** using Protocol Buffers for heartbeat signals, metadata exchange, and inter-node communication
-- **Production monitoring** with Prometheus metrics, Grafana dashboards, and comprehensive logging
-
-## Build Status
-
-**Successfully builds and tested on Arch Linux with GCC 15.2.1**
-- **5 executables** compile and run: `main`, `head_server`, `cluster_server`, `health_checker`, `zk_head_server_monitor`
-- **Unified CLI**: `./build/main` entry point for all file operations and service management
-- **JSON configuration** loaded from `config/` with environment variable overrides
-- **ZooKeeper integration** with leader election and service discovery
-- **Docker deployment** with complete orchestration support
-- **Redis dependencies** properly isolated with conditional compilation
-- **Prometheus metrics** integration working with Grafana dashboards
-- **Protocol Buffers v32.0.0** compatible with C++20 coroutines
+Built as a learning project inspired by how systems like GFS and HDFS work under the hood. It's not production-grade infrastructure, but it does compile, run, and move bytes around reliably.
 
 ---
 
-## System Architecture
+## What It Does
 
-The Distributed File Grid consists of **four main components**:
+You give it a file. It breaks it into 64 MB chunks, spreads those chunks across multiple storage nodes with configurable replication, and stitches them back together when you ask for the file again.
 
-### 1. Head Servers (Dual Architecture)
+Behind the scenes:
 
-- **Purpose**: Entry point for file operations and metadata management with high availability
-- **Features**:
-  - **Primary/Backup Configuration**: Multiple head servers with automatic leader election
-  - **ZooKeeper Coordination**: Distributed consensus for leader selection and failover
-  - **File Operations**: Upload/download coordination with load balancing
-  - **Chunk Management**: Intelligent placement and replication management
-  - **Metadata Storage**: Redis-based metadata with optional in-memory fallback
+- A **head server** manages metadata and orchestrates uploads/downloads
+- **Cluster servers** store the actual chunks and report their health via heartbeats
+- A **health checker** watches over the cluster and flags unhealthy nodes
+- An optional **ZooKeeper monitor** handles leader election when running multiple head servers
 
-### 2. Cluster Servers (Distributed Storage)
-
-- **Purpose**: Store actual file chunks with configurable replication and monitoring
-- **Features**:
-  - **64MB Chunk Storage**: Optimized chunk size with configurable replication factor
-  - **Prometheus Metrics**: Real-time performance and resource monitoring
-  - **Health Reporting**: Continuous heartbeat signals with resource usage data
-  - **Integrity Verification**: Automatic chunk verification and corruption detection
-  - **Load Balancing**: Intelligent distribution based on server capacity
-
-### 3. Health Checker (Original Monitoring)
-
-- **Purpose**: Traditional heartbeat-based monitoring and cluster coordination
-- **Features**:
-  - **Continuous Monitoring**: Real-time health checks of all cluster servers
-  - **Failure Detection**: Automatic detection and handling of server failures
-  - **Re-replication**: Triggered chunk re-replication on server failures
-  - **Status Reporting**: Comprehensive health status and metrics collection
-
-### 4. ZooKeeper Head Monitor (Advanced Coordination)
-
-- **Purpose**: **NEW** - head server monitoring with distributed coordination
-- **Features**:
-  - **Leader Election**: Automatic leader selection using ZooKeeper consensus
-  - **Service Discovery**: Dynamic head server registration and discovery
-  - **Fault Tolerance**: Automatic failover when leader becomes unhealthy
-  - **Health Monitoring**: TCP-based health checks with configurable timeouts
-  - **Interactive Management**: Command-line interface for real-time operations
+Everything talks over Protocol Buffers. Metrics are exported to Prometheus. Dashboards are pre-configured for Grafana.
 
 ---
 
-## Features
-
-### Core Storage Features
-- **Distributed Storage**: Files split into 64MB chunks across multiple servers
-- **Fault Tolerance**: Configurable replication factor (default: 3x)
-- **High Availability**: Dual head server architecture with automatic failover
-- **Data Integrity**: Chunk-level checksums and automatic corruption detection
-- **Load Balancing**: Intelligent chunk placement based on server capacity
-
-### Advanced Monitoring & Management
-- **ZooKeeper Integration**: Coordination and leader election
-- **Prometheus Metrics**: Real-time performance monitoring with custom metrics
-- **Grafana Dashboards**: Professional monitoring interface with alerting
-- **Health Monitoring**: Multi-layer health checking (heartbeat + ZooKeeper)
-- **Interactive Management**: Command-line tools for real-time operations
-
-### Performance & Scalability
-- **Protocol Buffers**: Efficient binary communication protocols
-- **Asynchronous I/O**: High-performance coroutine-based operations
-- **Resource Monitoring**: Real-time CPU, memory, and disk usage tracking
-- **Horizontal Scaling**: Linear scaling with additional cluster servers
-- **Network Optimization**: Optimized for high-throughput operations
-
----
-
-## Quick Start
+## Getting Started
 
 ### Prerequisites
 
-- **Linux** (tested on Arch Linux)
-- **C++20** compiler (GCC 7+ or Clang 6+) [since protobufs only support C++ 20+]
-- **CMake** 3.16+
-- **Protocol Buffers** compiler (v3.0.0+, tested with v32.0.0)
-- **Prometheus-CPP** library for metrics
-- **Abseil** library for logging and utilities
-- **ZLIB** for compression
-- **Docker** and **Docker Compose** (for containerized deployment - optional)
+| Dependency | Why |
+|---|---|
+| GCC 13+ or Clang 16+ | C++20 with coroutine support |
+| CMake 3.16+ | Build system |
+| protobuf + protoc | Serialization (fetched at build time if missing) |
+| zlib | Compression |
 
-**Note**: Redis dependencies are optional and disabled by default. The system can run without Redis.
+Abseil and Prometheus-cpp are fetched automatically via CMake's `FetchContent`. You don't need to install them.
 
-### Installation
+### Build
 
-#### Option 1: Native Installation
+```bash
+git clone https://github.com/SaiRajeshRamaraju/Distributed-File-Grid.git
+cd Distributed-File-Grid
 
-1. **Install Dependencies**
+mkdir build && cd build
+cmake ..
+make -j$(nproc)
+```
 
-   **Ubuntu/Debian:**
+This produces five binaries in `build/`:
 
-   ```bash
-   sudo apt-get update
-   sudo apt-get install -y build-essential cmake pkg-config \
-       libssl-dev libprotobuf-dev protobuf-compiler \
-       libfmt-dev libasio-dev
-   ```
+| Binary | Purpose |
+|---|---|
+| `dfg` | Unified CLI — the primary way to interact with everything |
+| `head_server` | Standalone head server (if you prefer separate processes) |
+| `cluster_server` | Standalone cluster server |
+| `health_checker` | Heartbeat-based health monitor |
+| `zk_head_server_monitor` | ZooKeeper-based leader election monitor |
 
-   **Arch Linux:**
+### Run
 
-   ```bash
-   sudo pacman -S --needed base-devel cmake pkg-config \
-        protobuf zlib abseil-cpp
-   
-   # Install Prometheus-CPP
-   yay -S prometheus-cpp-git
-   ```
+Open three terminals:
 
-2. **Build the Project**
+```bash
+# Terminal 1 — start the head server
+./build/dfg head-server
 
-   ```bash
-   git clone <repository-url>
-   cd Distributed-File-Grid
-   mkdir build && cd build
-   cmake -DBUILD_TESTS=OFF -DWITH_REDIS=OFF ..
-   make -j$(nproc)
-   ```
+# Terminal 2 — start a storage node
+./build/dfg cluster-server --server-id 1 --ip 127.0.0.1 --port 8080
 
-   This will create four executables:
-   - `head_server` - Main file operations server with Redis integration
-   - `cluster_server` - Chunk storage server with Prometheus metrics
-   - `health_checker` - Traditional heartbeat-based monitoring service
-   - `zk_head_server_monitor` - **NEW** ZooKeeper-based head server coordination
+# Terminal 3 — upload and download a file
+./build/dfg upload /path/to/photo.jpg photo.jpg
+./build/dfg download photo.jpg /tmp/restored.jpg
+```
 
-3. **Start Services (separate terminals)**
-   ```bash
-   # Terminal 1 – metadata/head server
-   ./build/main head-server
-
-   # Terminal 2 – storage node (use unique IDs/ports per replica)
-   ./build/main cluster-server --server-id 1 --ip 127.0.0.1 --port 8080
-
-   # Terminal 3 – heartbeat-based health checker
-   ./build/main health-checker
-   ```
-   Each process runs in the foreground; keep them alive while issuing upload/download commands.
-
-#### Option 2: Docker Deployment (Recommended)
-
-1. **Quick Start with Testing**
-
-   ```bash
-   git clone <repository-url>
-   cd Distributed-File-Grid
-   
-   # Run comprehensive test suite
-   chmod +x docker-test.sh
-   ./docker-test.sh
-   ```
-
-2. **Production Deployment**
-
-   ```bash
-   # Start all services
-   docker-compose up -d
-   
-   # Check service status
-   docker-compose ps
-   
-   # View logs
-   docker-compose logs -f
-   ```
-
-3. **Access Web Interfaces**
-   - **Grafana Dashboard**: http://localhost:3000 (admin/admin)
-   - **Prometheus Metrics**: http://localhost:9090
-   - **Head Server 1**: http://localhost:9669
-   - **Head Server 2**: http://localhost:9670
-
-4. **ZooKeeper Management**
-   ```bash
-   # Interactive ZooKeeper monitor
-   docker-compose exec zk-head-monitor /usr/local/bin/zk_head_server_monitor -i
-   
-   # Commands: register, status, leader, quit
-   ```
+That's it. No containers, no config files, no ceremony.
 
 ---
 
 ## Usage
 
-### File Operations
-
-Interact with the system through the CLI entry point (`./build/main`). Every command expects the services from the Quick Start section to be running in separate terminals.
+All commands go through the `dfg` binary:
 
 ```bash
-# Upload a local file (splits into 64 MB chunks with 3x replication metadata)
-./build/main upload /path/to/file.bin file.bin
+# File operations
+dfg upload <local-path> <name>        # Upload a file to the grid
+dfg download <name> <local-path>      # Download a file from the grid
+dfg list                              # List all stored files
 
-# Download a tracked file
-./build/main download file.bin /tmp/restored.bin
+# Server management (talks to head server's control API)
+dfg add-server --host 10.0.0.5 --port 8081
+dfg remove-server --id 3
+dfg list-servers
 
-# List all files known to the metadata store (Redis or fallback)
-./build/main list
+# Start services
+dfg head-server                       # Start head server
+dfg cluster-server --server-id 2      # Start cluster server
+
+# Diagnostics
+dfg test                              # Run a built-in upload/download round-trip
+dfg --version
 ```
-
-> **Note:** The REST API referenced in earlier drafts is still under development. Use the CLI workflow above for the current release.
 
 ### Configuration
 
-Configuration files are located in the `config/` directory:
+Config files live in `config/` and use plain JSON:
 
-- `head_server_config.json` - Head server settings
-- `health_checker_config.json` - Health checker settings
+| File | Controls |
+|---|---|
+| `head_server.json` | Ports, replication factor, chunk size, control API |
+| `cluster_server.json` | Server ID, bind address, heartbeat target |
+| `health_checker.json` | Heartbeat timeout, max missed beats |
+| `zookeeper.json` | ZK ensemble hosts, session timeout |
 
-Key configuration options:
+Every setting can be overridden with an environment variable prefixed with `DFG_`. For example, `DFG_SERVER_PORT=9669` overrides `server.port` in the JSON.
 
-```json
-{
-  "replication_factor": 3, // Number of chunk replicas
-  "chunk_size": 67108864, // 64MB chunks
-  "heartbeat_timeout": 60, // Health check interval (seconds)
-  "max_connections": 1000 // Maximum concurrent connections
-}
-```
+### Metadata Storage
 
-### Metadata Storage Modes
-
-- **Redis-backed (recommended for production):** Configure the build with `-DWITH_REDIS=ON`. The head server automatically starts/uses a local Redis instance (or connects to the one you provide) for chunk metadata, replication coordination, and TTL support.
-- **Embedded fallback (default):** When Redis is disabled, metadata is stored in a simple on-disk database at `/tmp/dfg_metadata.db`. Override the location via the `DFG_METADATA_DB` environment variable if you want the data under version control or a persistent volume.
-- **Listing helper:** Regardless of the backend, `./build/main list` enumerates every tracked file by calling the new `list_all_files()` helper in `redis_handler.hpp`.
-
-### Monitoring & Management
-
-#### Grafana Dashboard (http://localhost:3000)
-- **System Overview**: Real-time health status of all services
-- **Performance Metrics**: CPU, memory, disk usage across cluster
-- **Network Monitoring**: Throughput, latency, and connection metrics
-- **Error Tracking**: Error rates and failure patterns
-- **Custom Alerts**: Configurable alerting for critical events
-
-#### Prometheus Metrics (http://localhost:9090)
-- **Cluster Metrics**: `heartbeat_active_connections`, `heartbeat_messages_received_total`
-- **Performance Metrics**: `heartbeat_processing_time_seconds`, `heartbeat_errors_total`
-- **System Metrics**: CPU, memory, disk usage per service
-- **Custom Queries**: Advanced metric analysis and correlation
-
-#### ZooKeeper Management
-```bash
-# Interactive management
-./build/zk_head_server_monitor -i
-
-# Available commands:
-register head_server_3 192.168.1.100 9671  # Register new head server
-status                                       # Show health status
-leader                                       # Show current leader
-quit                                         # Exit
-```
-
-#### Health Check Endpoints
-```bash
-# Service health checks
-curl http://localhost:9669/health    # Head server (if implemented)
-curl http://localhost:9091/metrics   # Cluster server metrics
-curl http://localhost:9090/targets   # Prometheus targets
-```
+- **Default**: An embedded on-disk store at `/tmp/dfg_metadata.db` (override with `DFG_METADATA_DB`)
+- **Redis** (optional): Build with `cmake -DWITH_REDIS=ON ..` for production-grade metadata persistence
 
 ---
 
-## Architecture Details
+## Architecture
 
-### File Storage Process
+```
+                        ┌─────────────────┐
+                        │    dfg CLI      │
+                        └────────┬────────┘
+                                 │
+                    ┌────────────▼────────────┐
+                    │      Head Server        │
+                    │  - metadata management  │
+                    │  - upload/download      │
+                    │  - control API (:9670)  │
+                    │  - heartbeat receiver   │
+                    └────┬──────┬──────┬─────┘
+                         │      │      │
+              ┌──────────▼──┐ ┌─▼────┐ ┌▼──────────┐
+              │  Cluster 1  │ │  C2  │ │  Cluster 3 │
+              │  :8080      │ │:8081 │ │  :8082     │
+              │  chunks/    │ │      │ │  chunks/   │
+              └─────────────┘ └──────┘ └────────────┘
+                    ▲              ▲             ▲
+                    │   heartbeats (UDP)         │
+                    └──────────┬────────────────┘
+                               │
+                    ┌──────────▼──────────┐
+                    │   Health Checker     │
+                    │   + ZK Monitor       │
+                    └─────────────────────┘
+```
 
-1. **Upload**:
-   - File received by head server
-   - Split into 64MB chunks
-   - Chunks distributed to cluster servers based on available storage
-   - Replication factor enforced across servers
+### How Upload Works
 
-2. **Download**:
-   - Head server retrieves file metadata
-   - Chunks fetched from cluster servers
-   - File reconstructed and served to client
-   - Integrity verified using stored hashes
+1. The CLI sends the file to the head server
+2. The head server splits it into 64 MB chunks
+3. Each chunk is replicated to *N* cluster servers (default: 3)
+4. Metadata (chunk→server mappings) is stored in the metadata backend
+5. The cluster servers send heartbeats back to confirm they're alive
 
-3. **Health Monitoring**:
-   - Heartbeat signals sent every 30 seconds
-   - Resource usage reported (CPU, memory, disk)
-   - Failed servers detected automatically
-   - Re-replication triggered for failed chunks
+### How Download Works
 
-### Fault Tolerance
+1. The CLI asks the head server for the file
+2. The head server looks up which cluster servers hold each chunk
+3. Chunks are fetched in parallel and reassembled
+4. The reconstructed file is written to the output path
 
-- **Replication**: Each chunk stored on multiple servers
-- **Health Checks**: Continuous monitoring of all servers
-- **Auto-Recovery**: Failed chunks automatically re-replicated
-- **Leader Election**: Health checker coordinates failover
-- **Graceful Degradation**: System continues operating with reduced capacity
+### Health Monitoring
+
+Cluster servers send UDP heartbeats every second containing system metrics (CPU, RAM, disk, network). The head server tracks these and marks a server as unhealthy after configurable missed beats. The health checker provides an additional monitoring layer with Prometheus-compatible metrics.
 
 ---
 
-## Development
+## Docker Deployment
 
-### Project Structure
+For a full setup with monitoring, use Docker Compose:
+
+```bash
+cd deploy/docker
+docker-compose up -d
+```
+
+This spins up:
+
+| Service | Port | Description |
+|---|---|---|
+| Head Server | 9669 | Metadata + file operations |
+| Cluster Servers ×3 | 8080–8082 | Chunk storage |
+| Health Checker | 9091 | Heartbeat monitor |
+| ZK Monitor | — | Leader election |
+| Prometheus | 9090 | Metrics collection |
+| Grafana | 3000 | Dashboards (admin/admin) |
+
+Pre-built Grafana dashboards are included for cluster overview, per-server metrics, and log aggregation.
+
+---
+
+## Project Structure
 
 ```
 Distributed-File-Grid/
+├── CMakeLists.txt                  # Root build config (~65 lines)
+├── cmake/
+│   ├── Dependencies.cmake          # Abseil, Prometheus FetchContent
+│   └── ProtobufGen.cmake           # Proto codegen helper
 ├── src/
-│   ├── Cluster_Server/           # Chunk storage with metrics
-│   ├── Head_Server/              # File operations and metadata
-│   ├── Health_Checker/           # Traditional monitoring
-│   ├── ZooKeeper_HealthChecker/  # NEW: ZooKeeper coordination
-│   ├── include/                  # Shared headers and utilities
-│   └── protos/v1/               # Protocol Buffer definitions
-├── docker/                       # Docker configuration files
-│   ├── start-services.sh        # Service startup script
-│   ├── healthcheck.sh           # Health check script
-│   ├── prometheus.yml           # Prometheus configuration
-│   └── grafana-*.yml            # Grafana configuration
-├── config/                       # Service configuration files
-├── UnitTesting/                  # Test suites and validation
-├── docker-compose.yml            # Complete orchestration
-├── Dockerfile                    # Multi-stage container build
-├── docker-test.sh               # Comprehensive test suite
-└── test_zookeeper.sh            # ZooKeeper integration tests
-```
-
-### Building from Source
-
-```bash
-# Generate protocol buffer files
-protoc --cpp_out=generated protos/*.proto
-
-# Build with CMake
-mkdir build && cd build
-cmake -DBUILD_TESTS=OFF -DWITH_REDIS=OFF ..
-make -j$(nproc)
-```
-
-### Recent Major Updates (September 2025)
-
-#### **ZooKeeper Integration (NEW)**
-- **Leader Election**: Automatic head server leader election using ZooKeeper consensus
-- **Service Discovery**: Dynamic server registration and discovery
-- **Fault Tolerance**: Automatic failover when leader becomes unhealthy
-- **Interactive Management**: Command-line interface for real-time operations
-
-#### **Docker & Orchestration (NEW)**
-- **Complete Docker Setup**: Multi-service orchestration with docker-compose
-- **Resource checking**: Health checks, logging, metrics, and monitoring
-- **Automated Testing**: Comprehensive test suite with `docker-test.sh`
-- **Grafana Integration**: Professional monitoring dashboards
-
-#### **Build System Improvements**
-- **Redis Dependencies**: Properly isolated with conditional compilation (`WITH_REDIS=OFF`)
-- **Prometheus Metrics**: Fixed API usage for labeled metrics support
-- **CMake Configuration**: Enhanced build system with proper dependency management
-- **C++20 Support**: Full coroutine support with modern C++ features
-
-#### **Production Features**
-- **Multi-stage Docker Build**: Optimized container images
-- **Health Monitoring**: Multiple monitoring layers (heartbeat + ZooKeeper)
-- **Configuration Management**: Environment-based configuration
-- **Logging & Debugging**: Comprehensive logging with centralized collection
-
-**All executables compile and run successfully on Arch Linux with GCC 15.2.1**
-
-## Current Status
-
-- **CLI-first workflow**: `./build/main` drives the system via the `head-server`, `cluster-server`, `health-checker`, `upload`, `download`, and `list` commands. An HTTP API is planned but not yet implemented.
-- **Metadata backends**: Redis remains fully supported (`-DWITH_REDIS=ON`), while builds without Redis transparently fall back to an on-disk metadata store at `/tmp/dfg_metadata.db` (override with `DFG_METADATA_DB`).
-- **Embedded coordinator**: The ZooKeeper-style head monitor now ships with a built-in coordination layer, so the `zk_head_server_monitor` binary is always available without any external C dependencies.
-- **Docker scripts**: Container and orchestration assets are provided for future work but are not required for the native CLI workflow described below.
-
-### Running Tests
-
-#### Native Testing
-```bash
-# Build and test all executables
-./test_system.sh
-
-# Test ZooKeeper integration specifically
-./test_zookeeper.sh
-
-# Manual testing
-make test  # Unit tests (if BUILD_TESTS=ON)
-```
-
-#### Docker Testing (Recommended)
-```bash
-# Comprehensive system test with Docker
-./docker-test.sh
-
-# Manual Docker testing
-docker-compose up -d
-docker-compose ps
-docker-compose logs -f
-
-# Test ZooKeeper in Docker
-docker-compose exec zk-head-monitor /usr/local/bin/zk_head_server_monitor -i
+│   ├── common/                     # Shared library (dfg_common)
+│   │   ├── include/dfg/            # Public headers: #include <dfg/...>
+│   │   └── src/                    # Shared implementations
+│   ├── proto/v1/                   # Protobuf definitions
+│   ├── head_server/                # Head server sources
+│   ├── cluster_server/             # Cluster server sources
+│   ├── health_checker/             # Health checker entry point
+│   ├── zk_monitor/                 # ZooKeeper monitor entry point
+│   └── cli/                        # Unified dfg binary
+├── config/                         # JSON configuration files
+├── scripts/                        # Service management scripts
+├── tests/
+│   ├── unit/                       # C++ unit tests
+│   └── integration/                # Shell-based integration tests
+├── deploy/docker/                  # Dockerfile, Compose, monitoring configs
+├── docs/                           # Additional documentation
+├── Makefile                        # Convenience targets
+└── README.md
 ```
 
 ---
 
-## Performance
+## Building with Options
 
-### Benchmarks
+```bash
+# Default build (no Redis, no tests)
+cmake ..
 
-- **Throughput**: 2× lower latency compared to traditional file systems
-- **Scalability**: Linear scaling with additional cluster servers
-- **Reliability**: Zero data loss during simulated multi-node failures
-- **Efficiency**: 64MB chunks optimized for network transfer
+# With Redis metadata backend
+cmake -DWITH_REDIS=ON ..
 
-### Resource Requirements
+# With tests
+cmake -DBUILD_TESTS=ON ..
 
-- **Head Server**: 2GB RAM, 2 CPU cores
-- **Cluster Server**: 4GB RAM, 4 CPU cores (per server)
-- **Health Checker**: 1GB RAM, 1 CPU core
-- **Storage**: 100GB+ per cluster server (depending on replication factor)
+# Release build
+cmake -DCMAKE_BUILD_TYPE=Release ..
+```
+
+### Makefile Shortcuts
+
+```bash
+make build          # Build everything
+make clean          # Remove build artifacts
+make test           # Run the built-in test suite
+make start          # Start all services via scripts/
+make stop           # Stop all services
+make install-deps   # Install system deps (Ubuntu/Debian)
+```
 
 ---
 
 ## Troubleshooting
 
-### Common Issues
+**Build fails with protobuf errors**
+Make sure `protoc` is installed and matches the version of `libprotobuf-dev`. On Arch, `pacman -S protobuf` gets you both.
 
-1. **Service Won't Start**
-   - Check if ports are available (9669, 8080-8082, 6379)
-   - Check logs in `logs/` directory
+**Services won't start — port in use**
+Default ports: head server on 9669, control API on 9670, cluster servers on 8080+, heartbeat on 9000. Check with `ss -tlnp | grep 9669`.
 
-2. **High Resource Usage**
-   - Adjust `replication_factor` in configuration
-   - Add more cluster servers
-   - Monitor with dashboard at http://localhost:3000
+**Uploads fail immediately**
+Make sure at least one cluster server is running and has registered with the head server. Check the head server's console output for registration messages.
 
-3. **File Upload Failures**
-   - Verify cluster servers are healthy
-   - Check available storage on cluster servers
-   - Review head server logs
-
-### Logs and Debugging
-
-#### Native Deployment
-- **Head Server**: `logs/head_server.log`
-- **Cluster Servers**: `logs/cluster_server_*.log`
-- **Health Checker**: `logs/health_checker.log`
-- **ZooKeeper Monitor**: `logs/zk_monitor.log`
-
-#### Docker Deployment
-```bash
-# View all service logs
-docker-compose logs -f
-
-# View specific service logs
-docker-compose logs -f head-server-1
-docker-compose logs -f zk-head-monitor
-
-# Real-time log monitoring
-docker-compose logs -f --tail=100
-```
-
-### Health Checks
-
-#### Service Health Endpoints
-```bash
-# Head servers
-curl http://localhost:9669/health    # Head server 1
-curl http://localhost:9670/health    # Head server 2
-
-# Cluster servers
-curl http://localhost:8080/health    # Cluster server 1
-curl http://localhost:8081/health    # Cluster server 2
-curl http://localhost:8082/health    # Cluster server 3
-
-# Monitoring services
-curl http://localhost:9090/api/v1/targets  # Prometheus targets
-curl http://localhost:3000/api/health      # Grafana health
-```
-
-#### ZooKeeper Health Monitoring
-```bash
-# Check ZooKeeper monitor status
-docker-compose exec zk-head-monitor ps aux | grep zk_head_server_monitor
-
-# Interactive health check
-docker-compose exec zk-head-monitor /usr/local/bin/zk_head_server_monitor -i
-# Then use: status, leader commands
-```
+**Zero metrics in Prometheus/Grafana**
+Verify the cluster server's metrics exporter is bound — look for the `Prometheus metrics on 0.0.0.0:9091/metrics` log line at startup.
 
 ---
 
-## Contributing
+## Tech Stack
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests for new functionality
-5. Submit a pull request
-
-### Development Setup
-
-```bash
-# Install development dependencies
-make install-deps
-
-# Set up development environment
-make dev
-
-# Run tests
-make test
-```
-
-## Additional Documentation
-
-- **[Docker Deployment Guide](README_DOCKER.md)** - Comprehensive Docker setup and deployment
-- **[ZooKeeper Integration Guide](ZOOKEEPER_DOCKER_IMPLEMENTATION.md)** - ZooKeeper features and usage
-- **[Build Success Report](BUILD_SUCCESS_REPORT.md)** - Detailed build and testing results
-- **[Test Results](ZOOKEEPER_TEST_RESULTS.md)** - Comprehensive testing validation
-
-## Production Deployment
-
-### Quick Production Setup
-```bash
-# 1. Clone and test
-git clone <repository-url>
-cd Distributed-File-Grid
-./docker-test.sh
-
-# 2. Production deployment
-docker-compose up -d
-
-# 3. Monitor and manage
-docker-compose ps
-docker-compose logs -f
-```
-
-### Features Ready
-- **High Availability**: Dual head servers with ZooKeeper coordination
-- **Monitoring**: Prometheus + Grafana with custom dashboards
-- **Orchestration**: Complete Docker and Kubernetes support
-- **Fault Tolerance**: Multi-layer health monitoring and automatic recovery
-- **Scalability**: Horizontal scaling with load balancing
-- **Security**: Network isolation and configurable authentication
+| Component | Technology |
+|---|---|
+| Language | C++20 (coroutines, concepts) |
+| Serialization | Protocol Buffers v3 |
+| Build | CMake 3.16+ |
+| Metrics | Prometheus-cpp |
+| Logging | Abseil |
+| Coordination | Built-in ZooKeeper client (no external C deps) |
+| Deployment | Docker, Docker Compose |
+| Monitoring | Grafana + Loki + Promtail |
 
 ## Acknowledgments
 
-- Inspired by distributed file systems such as **Google File System (GFS)** and **Hadoop HDFS**
-- Uses **[Protocol Buffers](https://developers.google.com/protocol-buffers)** for efficient serialization
-- **[ZooKeeper](https://zookeeper.apache.org/)** for distributed coordination and consensus
-- **[Prometheus](https://prometheus.io/)** and **[Grafana](https://grafana.com/)** for monitoring
-- Built with **modern C++20**, **Docker**
+This project draws inspiration from the design papers and architecture of [Google File System](https://research.google/pubs/pub51/) and [Hadoop HDFS](https://hadoop.apache.org/docs/stable/hadoop-project-dist/hadoop-hdfs/HdfsDesign.html). It uses [Protocol Buffers](https://protobuf.dev/) for serialization, [Prometheus](https://prometheus.io/) and [Grafana](https://grafana.com/) for observability, and [Abseil](https://abseil.io/) for foundational utilities.
 
----
-**Version**: 1.0.0  
+## License
+
+This project is licensed under the [GNU General Public License v2.0](LICENSE).

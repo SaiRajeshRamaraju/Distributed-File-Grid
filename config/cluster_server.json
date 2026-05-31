@@ -1,0 +1,27 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8080,
+    "max_connections": 500
+  },
+  "storage": {
+    "chunk_dir": "/data/chunks",
+    "max_storage_gb": 100
+  },
+  "heartbeat": {
+    "target_host": "127.0.0.1",
+    "target_port": 9000,
+    "interval_seconds": 10
+  },
+  "head_server": {
+    "host": "127.0.0.1",
+    "port": 9669,
+    "control_port": 9670
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "logs/cluster_server.log",
+    "max_size_mb": 50,
+    "max_files": 5
+  }
+}

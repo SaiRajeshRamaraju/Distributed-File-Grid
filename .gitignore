@@ -1,3 +1,29 @@
 # Build directories
 /build/
-/logs
+/cmake-build-*/
+
+# Runtime artifacts
+/logs/
+/pids/
+*.log
+*.pid
+
+# IDE / Editor
+.cache/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+compile_commands.json
+.clangd/
+
+# Generated proto output (built in build/)
+src/proto/v1/generate/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Dependencies fetched at build time
+_deps/

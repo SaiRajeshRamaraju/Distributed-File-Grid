@@ -1,2 +1,8 @@
-# src/CMakeLists.txt
-# This file intentionally left blank as all source files are included from the root CMakeLists.txt
+# src/CMakeLists.txt — rolls up all component subdirectories
+
+add_subdirectory(common)
+add_subdirectory(head_server)
+add_subdirectory(cluster_server)
+add_subdirectory(health_checker)
+add_subdirectory(zk_monitor)
+add_subdirectory(cli)

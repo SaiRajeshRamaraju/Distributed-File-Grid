@@ -1,0 +1,76 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "panels": [
+    {
+      "id": 1, "title": "Files Uploaded", "type": "stat",
+      "gridPos": {"h": 5, "w": 6, "x": 0, "y": 0},
+      "targets": [{"expr": "head_files_uploaded_total", "legendFormat": "Uploads"}],
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"steps": [{"value": 0, "color": "blue"}]}}}
+    },
+    {
+      "id": 2, "title": "Files Downloaded", "type": "stat",
+      "gridPos": {"h": 5, "w": 6, "x": 6, "y": 0},
+      "targets": [{"expr": "head_files_downloaded_total", "legendFormat": "Downloads"}],
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"steps": [{"value": 0, "color": "purple"}]}}}
+    },
+    {
+      "id": 3, "title": "Chunks Created", "type": "stat",
+      "gridPos": {"h": 5, "w": 6, "x": 12, "y": 0},
+      "targets": [{"expr": "head_chunks_created_total", "legendFormat": "Chunks"}]
+    },
+    {
+      "id": 4, "title": "Bytes Ingested", "type": "stat",
+      "gridPos": {"h": 5, "w": 6, "x": 18, "y": 0},
+      "targets": [{"expr": "head_bytes_ingested_total", "legendFormat": "Bytes"}],
+      "fieldConfig": {"defaults": {"unit": "bytes"}}
+    },
+    {
+      "id": 5, "title": "Upload/Download Rate", "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 5},
+      "targets": [
+        {"expr": "rate(head_files_uploaded_total[5m])", "legendFormat": "Uploads/sec"},
+        {"expr": "rate(head_files_downloaded_total[5m])", "legendFormat": "Downloads/sec"}
+      ]
+    },
+    {
+      "id": 6, "title": "Chunk Transfer Rate", "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 5},
+      "targets": [{"expr": "rate(head_chunks_transferred_total[5m])", "legendFormat": "{{instance}}"}]
+    },
+    {
+      "id": 7, "title": "Chunk Transfer Latency (p99)", "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 13},
+      "targets": [{"expr": "histogram_quantile(0.99, rate(head_chunk_transfer_duration_seconds_bucket[5m]))", "legendFormat": "p99 {{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+    {
+      "id": 8, "title": "Read Repairs & Corruptions", "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 13},
+      "targets": [
+        {"expr": "rate(head_read_repairs_total[5m])", "legendFormat": "Read Repairs/sec"},
+        {"expr": "rate(head_corruption_detected_total[5m])", "legendFormat": "Corruptions/sec"}
+      ],
+      "fieldConfig": {"defaults": {"custom": {"fillOpacity": 20}}}
+    },
+    {
+      "id": 9, "title": "Head Server Errors by Type", "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 21},
+      "targets": [{"expr": "rate(head_errors_total[5m])", "legendFormat": "{{type}}"}],
+      "fieldConfig": {"defaults": {"custom": {"fillOpacity": 30}}}
+    },
+    {
+      "id": 10, "title": "Healthy Cluster Servers (Head View)", "type": "gauge",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 21},
+      "targets": [{"expr": "head_healthy_cluster_servers", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"max": 5, "min": 0, "thresholds": {"steps": [{"value": 0, "color": "red"}, {"value": 1, "color": "yellow"}, {"value": 3, "color": "green"}]}}}
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 39,
+  "tags": ["dfg", "head-server"],
+  "time": {"from": "now-1h", "to": "now"},
+  "timezone": "browser",
+  "title": "DFG - Head Server Operations",
+  "uid": "dfg-head-server"
+}

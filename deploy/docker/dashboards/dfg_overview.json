@@ -1,0 +1,93 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "panels": [
+    {
+      "id": 100, "title": "", "type": "text",
+      "gridPos": {"h": 2, "w": 24, "x": 0, "y": 0},
+      "options": {"mode": "markdown", "content": "# Distributed File Grid — System Overview\nReal-time overview of all DFG components. Drill into dedicated dashboards for details."}
+    },
+    {
+      "id": 1, "title": "Healthy Cluster Servers", "type": "gauge",
+      "gridPos": {"h": 6, "w": 6, "x": 0, "y": 2},
+      "targets": [{"expr": "hc_healthy_servers", "legendFormat": "Healthy Servers"}],
+      "fieldConfig": {"defaults": {"thresholds": {"steps": [{"value": 0, "color": "red"}, {"value": 1, "color": "yellow"}, {"value": 3, "color": "green"}]}, "max": 5, "min": 0}}
+    },
+    {
+      "id": 2, "title": "ZK Leader Status", "type": "stat",
+      "gridPos": {"h": 6, "w": 6, "x": 6, "y": 2},
+      "targets": [{"expr": "zk_has_leader", "legendFormat": "Leader"}],
+      "fieldConfig": {"defaults": {"mappings": [{"type": "value", "options": {"0": {"text": "NO LEADER ⚠️", "color": "red"}, "1": {"text": "LEADER OK ✅", "color": "green"}}}]}}
+    },
+    {
+      "id": 3, "title": "Heartbeats/sec", "type": "stat",
+      "gridPos": {"h": 6, "w": 6, "x": 12, "y": 2},
+      "targets": [{"expr": "rate(hc_heartbeats_received_total[1m])", "legendFormat": "HB/sec"}],
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"steps": [{"value": 0, "color": "red"}, {"value": 0.5, "color": "green"}]}}}
+    },
+    {
+      "id": 4, "title": "File Uploads Total", "type": "stat",
+      "gridPos": {"h": 6, "w": 6, "x": 18, "y": 2},
+      "targets": [{"expr": "sum(head_files_uploaded_total)", "legendFormat": "Uploads"}],
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"steps": [{"value": 0, "color": "blue"}]}}}
+    },
+    {
+      "id": 5, "title": "Cluster CPU Usage", "type": "timeseries",
+      "gridPos": {"h": 7, "w": 8, "x": 0, "y": 8},
+      "targets": [
+        {"expr": "hc_server_cpu_usage_percent", "legendFormat": "Server {{server_id}}"},
+        {"expr": "system_cpu_usage_percent", "legendFormat": "{{instance}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100, "custom": {"fillOpacity": 15}}}
+    },
+    {
+      "id": 6, "title": "Cluster RAM Usage", "type": "timeseries",
+      "gridPos": {"h": 7, "w": 8, "x": 8, "y": 8},
+      "targets": [
+        {"expr": "hc_server_ram_usage_percent", "legendFormat": "Server {{server_id}}"},
+        {"expr": "system_ram_usage_percent", "legendFormat": "{{instance}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100, "custom": {"fillOpacity": 15}}}
+    },
+    {
+      "id": 7, "title": "Cluster Disk Usage", "type": "timeseries",
+      "gridPos": {"h": 7, "w": 8, "x": 16, "y": 8},
+      "targets": [
+        {"expr": "hc_server_disk_usage_percent", "legendFormat": "Server {{server_id}}"},
+        {"expr": "system_disk_usage_percent", "legendFormat": "{{instance}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100, "custom": {"fillOpacity": 15}}}
+    },
+    {
+      "id": 8, "title": "Heartbeat Rate", "type": "timeseries",
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 15},
+      "targets": [
+        {"expr": "rate(hc_heartbeats_received_total[1m])", "legendFormat": "Received"},
+        {"expr": "rate(heartbeat_messages_received_total[1m])", "legendFormat": "{{instance}}"}
+      ]
+    },
+    {
+      "id": 9, "title": "Network I/O (Cluster Servers)", "type": "timeseries",
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 15},
+      "targets": [
+        {"expr": "hc_server_network_in_bytes_per_sec", "legendFormat": "In - Server {{server_id}}"},
+        {"expr": "hc_server_network_out_bytes_per_sec", "legendFormat": "Out - Server {{server_id}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "Bps"}}
+    },
+    {
+      "id": 10, "title": "Recent Error Logs", "type": "logs",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 22},
+      "targets": [{"expr": "{job=\"dfg-logs\"} |~ \"(?i)(error|fail|fatal|exception)\"", "refId": "A"}],
+      "datasource": {"type": "loki", "uid": "loki"},
+      "options": {"showTime": true, "showLabels": true, "wrapLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending"}
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["dfg", "overview"],
+  "time": {"from": "now-1h", "to": "now"},
+  "timezone": "browser",
+  "title": "Distributed File Grid - Overview",
+  "uid": "dfg-overview"
+}

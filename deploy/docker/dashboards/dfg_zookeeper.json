@@ -1,0 +1,74 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "panels": [
+    {
+      "id": 1, "title": "ZooKeeper Connected", "type": "stat",
+      "gridPos": {"h": 5, "w": 4, "x": 0, "y": 0},
+      "targets": [{"expr": "zk_connected", "legendFormat": "Connected"}],
+      "fieldConfig": {"defaults": {"mappings": [{"type": "value", "options": {"0": {"text": "DISCONNECTED", "color": "red"}, "1": {"text": "CONNECTED", "color": "green"}}}]}}
+    },
+    {
+      "id": 2, "title": "Leader Elected", "type": "stat",
+      "gridPos": {"h": 5, "w": 4, "x": 4, "y": 0},
+      "targets": [{"expr": "zk_has_leader", "legendFormat": "Has Leader"}],
+      "fieldConfig": {"defaults": {"mappings": [{"type": "value", "options": {"0": {"text": "NO LEADER", "color": "red"}, "1": {"text": "LEADER OK", "color": "green"}}}]}}
+    },
+    {
+      "id": 3, "title": "Total Head Servers", "type": "stat",
+      "gridPos": {"h": 5, "w": 4, "x": 8, "y": 0},
+      "targets": [{"expr": "zk_total_head_servers", "legendFormat": "Total"}]
+    },
+    {
+      "id": 4, "title": "Healthy Head Servers", "type": "gauge",
+      "gridPos": {"h": 5, "w": 4, "x": 12, "y": 0},
+      "targets": [{"expr": "zk_healthy_head_servers", "legendFormat": "Healthy"}],
+      "fieldConfig": {"defaults": {"max": 3, "min": 0, "thresholds": {"steps": [{"value": 0, "color": "red"}, {"value": 1, "color": "yellow"}, {"value": 2, "color": "green"}]}}}
+    },
+    {
+      "id": 5, "title": "Leader Elections", "type": "stat",
+      "gridPos": {"h": 5, "w": 4, "x": 16, "y": 0},
+      "targets": [{"expr": "zk_leader_elections_total", "legendFormat": "Elections"}],
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"steps": [{"value": 0, "color": "green"}, {"value": 3, "color": "yellow"}, {"value": 10, "color": "red"}]}}}
+    },
+    {
+      "id": 6, "title": "Health Check Failure Rate", "type": "timeseries",
+      "gridPos": {"h": 5, "w": 4, "x": 20, "y": 0},
+      "targets": [
+        {"expr": "rate(zk_health_check_failures_total[5m])", "legendFormat": "Failures/sec"},
+        {"expr": "rate(zk_health_checks_total[5m])", "legendFormat": "Checks/sec"}
+      ]
+    },
+    {
+      "id": 7, "title": "Head Server Status (per server)", "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 5},
+      "targets": [{"expr": "zk_head_server_status", "legendFormat": "{{server}}"}],
+      "fieldConfig": {"defaults": {"mappings": [{"type": "value", "options": {"0": {"text": "DOWN"}, "1": {"text": "UP"}}}], "custom": {"fillOpacity": 30}}}
+    },
+    {
+      "id": 8, "title": "Head Server CPU Usage", "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 5},
+      "targets": [{"expr": "zk_head_server_cpu_percent", "legendFormat": "{{server}}"}],
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100, "custom": {"fillOpacity": 15}}}
+    },
+    {
+      "id": 9, "title": "Head Server Memory Usage", "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 13},
+      "targets": [{"expr": "zk_head_server_memory_percent", "legendFormat": "{{server}}"}],
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100, "custom": {"fillOpacity": 15}}}
+    },
+    {
+      "id": 10, "title": "Leader Elections Over Time", "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 13},
+      "targets": [{"expr": "rate(zk_leader_elections_total[5m])", "legendFormat": "Elections/sec"}],
+      "fieldConfig": {"defaults": {"custom": {"fillOpacity": 30}}}
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 39,
+  "tags": ["dfg", "zookeeper"],
+  "time": {"from": "now-1h", "to": "now"},
+  "timezone": "browser",
+  "title": "DFG - ZooKeeper & Leader Election",
+  "uid": "dfg-zookeeper"
+}

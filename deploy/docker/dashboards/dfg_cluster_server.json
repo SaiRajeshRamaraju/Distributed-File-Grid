@@ -1,0 +1,59 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "panels": [
+    {
+      "id": 1, "title": "Active Connections", "type": "timeseries",
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 0},
+      "targets": [{"expr": "heartbeat_active_connections", "legendFormat": "{{instance}}"}]
+    },
+    {
+      "id": 2, "title": "Messages Received Rate", "type": "timeseries",
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 0},
+      "targets": [{"expr": "rate(heartbeat_messages_received_total[1m])", "legendFormat": "{{instance}}"}]
+    },
+    {
+      "id": 3, "title": "Cluster CPU Usage", "type": "timeseries",
+      "gridPos": {"h": 7, "w": 8, "x": 0, "y": 7},
+      "targets": [{"expr": "system_cpu_usage_percent", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100, "custom": {"fillOpacity": 15}}}
+    },
+    {
+      "id": 4, "title": "Cluster RAM Usage", "type": "timeseries",
+      "gridPos": {"h": 7, "w": 8, "x": 8, "y": 7},
+      "targets": [{"expr": "system_ram_usage_percent", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100, "custom": {"fillOpacity": 15}}}
+    },
+    {
+      "id": 5, "title": "Cluster Disk Usage", "type": "timeseries",
+      "gridPos": {"h": 7, "w": 8, "x": 16, "y": 7},
+      "targets": [{"expr": "system_disk_usage_percent", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100, "custom": {"fillOpacity": 15}}}
+    },
+    {
+      "id": 6, "title": "Bytes Received Rate", "type": "timeseries",
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 14},
+      "targets": [{"expr": "rate(heartbeat_bytes_received_total[5m])", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "Bps"}}
+    },
+    {
+      "id": 7, "title": "Processing Time (p95)", "type": "timeseries",
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 14},
+      "targets": [{"expr": "histogram_quantile(0.95, rate(heartbeat_processing_time_seconds_bucket[5m]))", "legendFormat": "p95 {{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+    {
+      "id": 8, "title": "Errors by Type", "type": "timeseries",
+      "gridPos": {"h": 7, "w": 24, "x": 0, "y": 21},
+      "targets": [{"expr": "rate(heartbeat_errors_total[5m])", "legendFormat": "{{type}} - {{instance}}"}],
+      "fieldConfig": {"defaults": {"custom": {"fillOpacity": 30}}}
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["dfg", "cluster-server"],
+  "time": {"from": "now-1h", "to": "now"},
+  "timezone": "browser",
+  "title": "DFG - Cluster Server Performance",
+  "uid": "dfg-cluster-server"
+}
