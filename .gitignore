@@ -1,6 +1,5 @@
 # Build directories
 /build/
-/cmake-build-*/
 
 # Runtime artifacts
 /logs/
@@ -17,9 +16,6 @@
 *~
 compile_commands.json
 .clangd/
-
-# Generated proto output (built in build/)
-src/proto/v1/generate/
 
 # OS files
 .DS_Store
