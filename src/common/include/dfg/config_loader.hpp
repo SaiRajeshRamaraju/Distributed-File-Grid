@@ -18,6 +18,7 @@
 // any value with an environment variable using the DFG_ prefix:
 //   DFG_SERVER_PORT=8000  → overrides "server.port" config key.
 
+// This need to singletons all the configs ones.
 class ConfigLoader {
 public:
   /// Load and parse a JSON configuration file.

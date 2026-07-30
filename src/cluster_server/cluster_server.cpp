@@ -7,6 +7,8 @@
 #include <dfg/net_utils.hpp>
 #include <dfg/version.hpp>
 
+#include <map>
+
 #include <arpa/inet.h>
 #include <chrono>
 #include <cstring>
@@ -24,9 +26,7 @@ static std::string chooseLanAddress() {
   struct ifaddrs *ifaddr, *ifa;
   char host[NI_MAXHOST];
 
-  std::vector<std::string>
-      interfaceNames; // NOTE: This should a map rather than vector
-  std::vector<std::string> interfaceIps;
+  std::map<std::string, std::string> interfaces; // name -> IP
 
   // return linked list of network interfaces
   if (getifaddrs(&ifaddr) == -1) {
@@ -41,41 +41,42 @@ static std::string chooseLanAddress() {
         continue;
       if (getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in), host,
                       NI_MAXHOST, nullptr, 0, NI_NUMERICHOST) == 0) {
-        interfaceNames.push_back(ifa->ifa_name);
-        interfaceIps.push_back(host);
+        interfaces[ifa->ifa_name] = host;
       }
     }
   }
   freeifaddrs(ifaddr);
 
-  if (interfaceIps.empty()) {
+  if (interfaces.empty()) {
     std::cerr << "No usable network interfaces found" << std::endl;
     return "";
   }
 
   std::cout << "Available network interfaces:" << std::endl;
-  for (size_t i = 0; i < interfaceIps.size(); ++i) {
-    std::cout << "  " << (i + 1) << ") " << interfaceNames[i] << " -> "
-              << interfaceIps[i] << std::endl;
+  size_t idx = 1;
+  for (const auto &[name, ip] : interfaces) {
+    std::cout << "  " << idx++ << ") " << name << " -> " << ip << std::endl;
   }
 
   if (!isatty(fileno(stdin))) {
-
+    const auto &first = *interfaces.begin();
     std::cout << "Non-interactive mode (stdin fd isn't available)" << std::endl;
-    std::cout << "Auto-selecting the first network interface "
-              << interfaceNames[0] << " -> " << interfaceIps[0] << std::endl;
-    return interfaceIps[0];
+    std::cout << "Auto-selecting the first network interface " << first.first
+              << " -> " << first.second << std::endl;
+    return first.second;
   }
 
   size_t choice = 0;
   std::cout << "\nSelect interface number: ";
   std::cin >> choice;
-  if (choice < 1 || choice > interfaceIps.size()) {
-    std::cerr << "Invalid selection select between 1 and" << interfaceIps.size()
+  if (choice < 1 || choice > interfaces.size()) {
+    std::cerr << "Invalid selection select between 1 and " << interfaces.size()
               << std::endl;
     return "";
   }
-  return interfaceIps[choice - 1];
+  auto it = interfaces.begin();
+  std::advance(it, choice - 1);
+  return it->second;
 }
 
 /// Self-register with the head server's control API.
@@ -89,22 +90,18 @@ static bool self_register_with_head(const std::string &head_host,
               << ":" << head_control_port << std::endl;
     return false;
   }
-  // NOTE: why the hell do we need this?
-  // Why not simple std::cout?
+  // HTTP 1.,1 Post request headers
   std::ostringstream body;
   body << "{\"server_id\":" << server_id << ",\"host\":\"" << ip
        << "\",\"port\":" << port << "}";
   std::string body_str = body.str();
-  // NOTE: Same why do we need c character stream output rather than cout forrr
-  // this ?
   std::ostringstream req;
   req << "POST /api/v1/servers/cluster/register HTTP/1.1\r\n"
       << "Host: " << head_host << "\r\n"
       << "Content-Type: application/json\r\n"
       << "Content-Length: " << body_str.size() << "\r\n"
       << "Connection: close\r\n"
-      << "\r\n"
-      << body_str;
+      << "\r\n// what about head server or zk server" << body_str;
 
   std::string request = req.str();
   if (!dfg::net::send_all(sock, request.data(), request.size())) {
@@ -130,8 +127,6 @@ static bool self_register_with_head(const std::string &head_host,
   return false;
 }
 
-// WARNING: Problem every common file have there own main functions which aren't
-// ideal
 int main(int argc, char **argv) {
   if (argc > 1) {
     std::string arg = argv[1];
@@ -229,6 +224,6 @@ int main(int argc, char **argv) {
         });
     reg_thread.detach();
   }
-
+  // what about head server or zk server
   return start_cluster_server(server_id, ip.c_str(), port);
 }

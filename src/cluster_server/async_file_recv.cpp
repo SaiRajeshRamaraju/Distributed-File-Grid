@@ -617,9 +617,8 @@ public:
     // Run the reactor
     reactor.run();
   }
-
-  // BUG: This is not really stopping the cluster server ?
-  // TODO: Once we called stop we need to stop the server underneath.
+  // We changed the running state to false, so this is changing the state once
+  // this function called.
   void stop() {
     running = false;
     std::cout << "Stopping Cluster Server " << server_id << std::endl;
@@ -644,10 +643,6 @@ public:
 // Global cluster server instance
 static std::unique_ptr<ClusterServerService> g_cluster_server;
 
-// TODO: We used extern "C" so functin name mangling doesn't happen.
-// But I didn't seen any use for this , check in future if this really needed or
-// not. If not remove this.
-extern "C" {
 int start_cluster_server(int server_id, const char *ip, int port) {
   try {
     g_cluster_server =
@@ -665,5 +660,4 @@ void stop_cluster_server() {
     g_cluster_server->stop();
     g_cluster_server.reset();
   }
-}
 }

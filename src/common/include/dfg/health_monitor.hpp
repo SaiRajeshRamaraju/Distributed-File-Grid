@@ -62,8 +62,7 @@ public:
 
     record = health;
     record.is_healthy =
-        true; // doesn't this invalidate whatever was_healthy check for ? did we
-              // ever used this? Why are we overwriting this
+        true; // this will be true , this send from a live server
     record.missed_heartbeats = 0;
     record.last_heartbeat = std::chrono::steady_clock::now();
 
