@@ -20,9 +20,7 @@
 // Forward declarations — linked from other translation units
 int run_head_server(int argc, char **argv);
 
-extern "C" {
 int start_cluster_server(int server_id, const char *ip, int port);
-}
 
 int process_file_upload(const char *filepath, const char *filename);
 int process_file_download(const char *filename, const char *output_path);

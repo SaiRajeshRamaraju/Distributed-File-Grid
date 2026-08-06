@@ -1,4 +1,5 @@
 #include "metrics_exporter.hpp"
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -31,11 +32,36 @@ namespace fs = std::filesystem;
 // ──────────────────────── Chunk Storage ────────────────────────
 class ChunkStorage {
 private:
-  std::string storage_path = "/tmp/cluster_storage/";
+  std::string storage_path = "/var/cluster_storage/ 2>&1";
   std::unordered_map<std::string, std::string> chunk_registry;
   std::mutex registry_mutex;
 
-  void ensure_storage_directory() { fs::create_directories(storage_path); }
+  int ensure_storage_directory() {
+    FILE *pipe = popen(storage_path.c_str(), "r");
+    if (!pipe) {
+      std::cerr << "popen failed to create pipe and run bash script"
+                << std::endl;
+      return -1;
+    }
+    std::array<char, 128> buffer;
+    std::string output;
+    while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
+      output += buffer.data();
+    }
+    int returnCode = pclose(pipe);
+    int exitStatus = WEXITSTATUS(returnCode);
+    if (exitStatus != 0) {
+      std::string error = std::format(
+          "BASH script error (EXIT code \"{}\"\n {}", exitStatus, output);
+      std::cerr << error << std::endl;
+      return -1;
+    } else {
+      std::cout << "Directory /var/cluster_storage/ created succesfully"
+                << std::endl;
+      std::cout << output << std::endl;
+    }
+    return 0;
+  }
 
   std::string generate_chunk_path(const std::string &chunk_id) {
     auto now = std::chrono::system_clock::now();
@@ -46,7 +72,12 @@ private:
   }
 
 public:
-  ChunkStorage() { ensure_storage_directory(); }
+  ChunkStorage() {
+    int status = ensure_storage_directory();
+    if (status != 0) {
+      throw std::runtime_error("Error creating storage directory");
+    }
+  }
 
   // ── Synchronous store (kept for non-coroutine callers) ──
   bool store_chunk(const std::string &chunk_id, const std::vector<char> &data) {
@@ -246,6 +277,9 @@ public:
         std::lock_guard<std::mutex> lock(registry_mutex);
         auto it = chunk_registry.find(chunk_id);
         if (it == chunk_registry.end()) {
+          std::cerr << "Chunk id " << chunk_id
+                    << "not found in chunk registry. Error deleting chunk"
+                    << std::endl;
           return false;
         }
         chunk_path = it->second;
@@ -256,8 +290,9 @@ public:
       std::cout << "Deleted chunk " << chunk_id << std::endl;
       return true;
     } catch (const std::exception &e) {
-      std::cerr << "Error deleting chunk " << chunk_id << ": " << e.what()
-                << std::endl;
+      std::cerr << "Delete chunk from local registyr. But error deleting chunk "
+                   "in the filesystem "
+                << chunk_id << ": " << e.what() << std::endl;
       return false;
     }
   }
@@ -514,7 +549,9 @@ private:
   }
 
   async_hb::task chunk_server(async_hb::Reactor &reactor) {
-    int transfer_port = port + 100;
+    int transfer_port = port + 100; // NOTE: Why not a static port id rather
+                                    // than 100+ current server port? Come out
+                                    // with a static port number
     int lfd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (lfd < 0) {
       std::cerr << "Listen socket failed\n";

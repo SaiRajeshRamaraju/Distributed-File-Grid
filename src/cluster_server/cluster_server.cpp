@@ -20,7 +20,7 @@
 #include <unistd.h>
 
 // Forward declaration from async_file_recv.cpp
-extern "C" int start_cluster_server(int server_id, const char *ip, int port);
+int start_cluster_server(int server_id, const char *ip, int port);
 
 static std::string chooseLanAddress() {
   struct ifaddrs *ifaddr, *ifa;
@@ -224,6 +224,5 @@ int main(int argc, char **argv) {
         });
     reg_thread.detach();
   }
-  // what about head server or zk server
   return start_cluster_server(server_id, ip.c_str(), port);
 }

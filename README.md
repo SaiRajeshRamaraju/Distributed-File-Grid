@@ -1,11 +1,7 @@
 # Distributed File Grid
 
-A distributed file storage system that splits files into chunks, replicates them across a cluster of servers, and reassembles them on demand — designed for fault tolerance, not perfection.
-
-Built as a learning project inspired by how systems like GFS and HDFS work under the hood. It's not production-grade infrastructure, but it does compile, run, and move bytes around reliably.
-
+A distributed file storage system that splits files into chunks, each chunk is replicated across a cluster of servers, and reassembles them on demand.
 ---
-
 ## What It Does
 
 You give it a file. It breaks it into 64 MB chunks, spreads those chunks across multiple storage nodes with configurable replication, and stitches them back together when you ask for the file again.
@@ -67,7 +63,7 @@ Open three terminals:
 ./build/dfg cluster-server --server-id 1 --ip 127.0.0.1 --port 8080
 
 # Terminal 3 — upload and download a file
-./build/dfg upload /path/to/photo.jpg photo.jpg
+./build/dfg upload photo.jpg
 ./build/dfg download photo.jpg /tmp/restored.jpg
 ```
 
@@ -81,8 +77,8 @@ All commands go through the `dfg` binary:
 
 ```bash
 # File operations
-dfg upload <local-path> <name>        # Upload a file to the grid
-dfg download <name> <local-path>      # Download a file from the grid
+dfg upload <localfile-name>        # Upload a file to the grid
+dfg download <name> <savingfile-path>      # Download a file from the grid
 dfg list                              # List all stored files
 
 # Server management (talks to head server's control API)
@@ -194,37 +190,6 @@ Pre-built Grafana dashboards are included for cluster overview, per-server metri
 
 ---
 
-## Project Structure
-
-```
-Distributed-File-Grid/
-├── CMakeLists.txt                  # Root build config (~65 lines)
-├── cmake/
-│   ├── Dependencies.cmake          # Abseil, Prometheus FetchContent
-│   └── ProtobufGen.cmake           # Proto codegen helper
-├── src/
-│   ├── common/                     # Shared library (dfg_common)
-│   │   ├── include/dfg/            # Public headers: #include <dfg/...>
-│   │   └── src/                    # Shared implementations
-│   ├── proto/v1/                   # Protobuf definitions
-│   ├── head_server/                # Head server sources
-│   ├── cluster_server/             # Cluster server sources
-│   ├── health_checker/             # Health checker entry point
-│   ├── zk_monitor/                 # ZooKeeper monitor entry point
-│   └── cli/                        # Unified dfg binary
-├── config/                         # JSON configuration files
-├── scripts/                        # Service management scripts
-├── tests/
-│   ├── unit/                       # C++ unit tests
-│   └── integration/                # Shell-based integration tests
-├── deploy/docker/                  # Dockerfile, Compose, monitoring configs
-├── docs/                           # Additional documentation
-├── Makefile                        # Convenience targets
-└── README.md
-```
-
----
-
 ## Building with Options
 
 ```bash
@@ -274,7 +239,7 @@ Verify the cluster server's metrics exporter is bound — look for the `Promethe
 
 | Component | Technology |
 |---|---|
-| Language | C++20 (coroutines, concepts) |
+| Language | C++20 |
 | Serialization | Protocol Buffers v3 |
 | Build | CMake 3.16+ |
 | Metrics | Prometheus-cpp |
@@ -282,10 +247,6 @@ Verify the cluster server's metrics exporter is bound — look for the `Promethe
 | Coordination | Built-in ZooKeeper client (no external C deps) |
 | Deployment | Docker, Docker Compose |
 | Monitoring | Grafana + Loki + Promtail |
-
-## Acknowledgments
-
-This project draws inspiration from the design papers and architecture of [Google File System](https://research.google/pubs/pub51/) and [Hadoop HDFS](https://hadoop.apache.org/docs/stable/hadoop-project-dist/hadoop-hdfs/HdfsDesign.html). It uses [Protocol Buffers](https://protobuf.dev/) for serialization, [Prometheus](https://prometheus.io/) and [Grafana](https://grafana.com/) for observability, and [Abseil](https://abseil.io/) for foundational utilities.
 
 ## License
 
