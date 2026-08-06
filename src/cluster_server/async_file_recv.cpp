@@ -32,12 +32,16 @@ namespace fs = std::filesystem;
 // ──────────────────────── Chunk Storage ────────────────────────
 class ChunkStorage {
 private:
-  std::string storage_path = "/var/cluster_storage/ 2>&1";
+  std::string storage_path = "/var/cluster_storage/";
   std::unordered_map<std::string, std::string> chunk_registry;
   std::mutex registry_mutex;
 
   int ensure_storage_directory() {
-    FILE *pipe = popen(storage_path.c_str(), "r");
+    // Resolve script path relative to the executable (build/../scripts/)
+    fs::path exe_dir = fs::read_symlink("/proc/self/exe").parent_path();
+    fs::path script = (exe_dir / "../scripts/make_directory.sh").lexically_normal();
+    std::string cmd = "bash " + script.string() + " 2>&1";
+    FILE *pipe = popen(cmd.c_str(), "r");
     if (!pipe) {
       std::cerr << "popen failed to create pipe and run bash script"
                 << std::endl;
@@ -51,13 +55,11 @@ private:
     int returnCode = pclose(pipe);
     int exitStatus = WEXITSTATUS(returnCode);
     if (exitStatus != 0) {
-      std::string error = std::format(
-          "BASH script error (EXIT code \"{}\"\n {}", exitStatus, output);
-      std::cerr << error << std::endl;
+      std::cerr << std::format("BASH script error (EXIT code \"{}\")\n {}",
+                               exitStatus, output)
+                << std::endl;
       return -1;
     } else {
-      std::cout << "Directory /var/cluster_storage/ created succesfully"
-                << std::endl;
       std::cout << output << std::endl;
     }
     return 0;

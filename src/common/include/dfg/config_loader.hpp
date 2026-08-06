@@ -1,10 +1,14 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
+#include <csignal>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <mutex>
+#include <shared_mutex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -14,7 +18,7 @@
 // pulling in a full JSON library.  Supports nested objects via dotted
 // key paths, e.g. "server.port" → "9669".
 //
-// This is intentionally simple – production deployments can override
+// This is intentionally simple - production deployments can override
 // any value with an environment variable using the DFG_ prefix:
 //   DFG_SERVER_PORT=8000  → overrides "server.port" config key.
 
@@ -24,37 +28,33 @@ public:
   /// Load and parse a JSON configuration file.
   /// Returns false if the file cannot be opened.
   bool load(const std::string &filepath) {
-    std::ifstream in(filepath);
-    if (!in.is_open()) {
-      return false;
-    }
+    std::unique_lock lock(mutex_);
+    return load_impl(filepath);
+  }
 
-    std::string content((std::istreambuf_iterator<char>(in)),
-                        std::istreambuf_iterator<char>());
-    in.close();
-
-    // Validate that the file has actual JSON content (not empty /
-    // whitespace-only)
-    std::string trimmed = trim(content);
-    if (trimmed.empty() || trimmed[0] != '{') {
-      std::cerr << "\033[33m[WARNING]\033[0m ConfigLoader: File '" << filepath
-                << "' does not contain valid JSON (empty or malformed)"
+  /// Reload config from the previously loaded file.
+  /// Returns false if no file was loaded before or reload fails.
+  bool reload() {
+    std::unique_lock lock(mutex_);
+    if (filepath_.empty()) {
+      std::cerr << "\033[31m[ERROR]\033[0m ConfigLoader: cannot reload — no "
+                   "file was previously loaded"
                 << std::endl;
       return false;
     }
-
-    parse_json(content, "");
-
-    // Verify we actually parsed something
-    if (values_.empty()) {
-      std::cerr << "\033[33m[WARNING]\033[0m ConfigLoader: File '" << filepath
-                << "' was parsed but yielded zero config entries" << std::endl;
-      return false;
+    std::string path = filepath_;
+    values_.clear();
+    loaded_ = false;
+    filepath_.clear();
+    bool ok = load_impl(path);
+    if (ok) {
+      std::cout << "\033[32m[CONFIG]\033[0m Reloaded configuration from "
+                << filepath_ << std::endl;
+    } else {
+      std::cerr << "\033[31m[ERROR]\033[0m Failed to reload configuration from "
+                << path << std::endl;
     }
-
-    filepath_ = filepath;
-    loaded_ = true;
-    return true;
+    return ok;
   }
 
   /// Get a string value.  Returns `default_val` if key is absent.
@@ -66,6 +66,7 @@ public:
     if (env && *env)
       return std::string(env);
 
+    std::shared_lock lock(mutex_);
     auto it = values_.find(key);
     if (it != values_.end())
       return it->second;
@@ -142,6 +143,7 @@ public:
 
   /// Debug: dump all parsed key-value pairs.
   void dump() const {
+    std::shared_lock lock(mutex_);
     std::cout << "=== Config loaded from " << filepath_ << " ===" << std::endl;
     for (const auto &[k, v] : values_) {
       std::cout << "  " << k << " = " << v << std::endl;
@@ -204,6 +206,40 @@ private:
   std::map<std::string, std::string> values_;
   std::string filepath_;
   bool loaded_ = false;
+  mutable std::shared_mutex mutex_;
+
+  /// Internal load without locking (caller must hold exclusive lock).
+  bool load_impl(const std::string &filepath) {
+    std::ifstream in(filepath);
+    if (!in.is_open()) {
+      return false;
+    }
+
+    std::string content((std::istreambuf_iterator<char>(in)),
+                        std::istreambuf_iterator<char>());
+    in.close();
+
+    std::string trimmed = trim(content);
+    if (trimmed.empty() || trimmed[0] != '{') {
+      std::cerr << "\033[33m[WARNING]\033[0m ConfigLoader: File '" << filepath
+                << "' does not contain valid JSON (empty or malformed)"
+                << std::endl;
+      return false;
+    }
+
+    values_.clear();
+    parse_json(content, "");
+
+    if (values_.empty()) {
+      std::cerr << "\033[33m[WARNING]\033[0m ConfigLoader: File '" << filepath
+                << "' was parsed but yielded zero config entries" << std::endl;
+      return false;
+    }
+
+    filepath_ = filepath;
+    loaded_ = true;
+    return true;
+  }
 
   /// Convert "server.port" → "SERVER_PORT" for env-var lookup.
   static std::string to_env_name(const std::string &key) {
@@ -378,6 +414,27 @@ private:
   }
 };
 
+// ─────────────────── SIGHUP Hot-Reload Support ───────────────────
+// Send SIGHUP to the process to trigger a config reload on next access.
+//   kill -HUP <pid>
+
+namespace config_reload {
+inline std::atomic<uint64_t> generation{0};
+
+inline void sighup_handler(int) {
+  generation.fetch_add(1, std::memory_order_release);
+}
+
+/// Call once at startup to register the SIGHUP handler.
+inline void install() {
+  struct sigaction sa{};
+  sa.sa_handler = sighup_handler;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = SA_RESTART;
+  sigaction(SIGHUP, &sa, nullptr);
+}
+} // namespace config_reload
+
 // ─────────────────── Global Config Singletons ───────────────────
 
 /// Search paths used by each service config loader (kept visible so
@@ -399,9 +456,10 @@ inline const std::vector<std::string> zookeeper = {
 
 inline ConfigLoader &head_server_config() {
   static ConfigLoader cfg;
-  static bool tried = false;
-  if (!tried) {
-    tried = true;
+  static std::atomic<uint64_t> loaded_gen{0};
+  static std::once_flag init_flag;
+
+  std::call_once(init_flag, [&] {
     for (const auto &path : config_paths::head_server) {
       if (cfg.load(path))
         break;
@@ -418,15 +476,25 @@ inline ConfigLoader &head_server_config() {
                                   {"redis.port", "6379"},
                                   {"logging.level", "INFO"},
                               });
+    loaded_gen.store(config_reload::generation.load(std::memory_order_acquire),
+                     std::memory_order_release);
+  });
+
+  // SIGHUP reload check
+  uint64_t cur = config_reload::generation.load(std::memory_order_acquire);
+  uint64_t prev = loaded_gen.load(std::memory_order_acquire);
+  if (cur != prev && loaded_gen.compare_exchange_strong(prev, cur)) {
+    cfg.reload();
   }
   return cfg;
 }
 
 inline ConfigLoader &health_checker_config() {
   static ConfigLoader cfg;
-  static bool tried = false;
-  if (!tried) {
-    tried = true;
+  static std::atomic<uint64_t> loaded_gen{0};
+  static std::once_flag init_flag;
+
+  std::call_once(init_flag, [&] {
     for (const auto &path : config_paths::health_checker) {
       if (cfg.load(path))
         break;
@@ -442,16 +510,24 @@ inline ConfigLoader &health_checker_config() {
                                   {"failover.enable_auto_failover", "true"},
                                   {"logging.level", "INFO"},
                               });
+    loaded_gen.store(config_reload::generation.load(std::memory_order_acquire),
+                     std::memory_order_release);
+  });
+
+  uint64_t cur = config_reload::generation.load(std::memory_order_acquire);
+  uint64_t prev = loaded_gen.load(std::memory_order_acquire);
+  if (cur != prev && loaded_gen.compare_exchange_strong(prev, cur)) {
+    cfg.reload();
   }
   return cfg;
 }
 
-// TODO: Make sure thsi is singletons all the configs ones.
 inline ConfigLoader &cluster_server_config() {
   static ConfigLoader cfg;
-  static bool tried = false;
-  if (!tried) {
-    tried = true;
+  static std::atomic<uint64_t> loaded_gen{0};
+  static std::once_flag init_flag;
+
+  std::call_once(init_flag, [&] {
     for (const auto &path : config_paths::cluster_server) {
       if (cfg.load(path))
         break;
@@ -470,15 +546,24 @@ inline ConfigLoader &cluster_server_config() {
                                   {"head_server.port", "9669"},
                                   {"logging.level", "INFO"},
                               });
+    loaded_gen.store(config_reload::generation.load(std::memory_order_acquire),
+                     std::memory_order_release);
+  });
+
+  uint64_t cur = config_reload::generation.load(std::memory_order_acquire);
+  uint64_t prev = loaded_gen.load(std::memory_order_acquire);
+  if (cur != prev && loaded_gen.compare_exchange_strong(prev, cur)) {
+    cfg.reload();
   }
   return cfg;
 }
 
 inline ConfigLoader &zookeeper_config() {
   static ConfigLoader cfg;
-  static bool tried = false;
-  if (!tried) {
-    tried = true;
+  static std::atomic<uint64_t> loaded_gen{0};
+  static std::once_flag init_flag;
+
+  std::call_once(init_flag, [&] {
     for (const auto &path : config_paths::zookeeper) {
       if (cfg.load(path))
         break;
@@ -492,6 +577,14 @@ inline ConfigLoader &zookeeper_config() {
                                   {"monitor.heartbeat_timeout_seconds", "30"},
                                   {"logging.level", "INFO"},
                               });
+    loaded_gen.store(config_reload::generation.load(std::memory_order_acquire),
+                     std::memory_order_release);
+  });
+
+  uint64_t cur = config_reload::generation.load(std::memory_order_acquire);
+  uint64_t prev = loaded_gen.load(std::memory_order_acquire);
+  if (cur != prev && loaded_gen.compare_exchange_strong(prev, cur)) {
+    cfg.reload();
   }
   return cfg;
 }
