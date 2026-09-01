@@ -18,21 +18,24 @@ A high-performance, fault-tolerant distributed file storage grid in modern **C++
 ## Architecture
 
 ```
-                                  ┌───────────────────────────┐
-                                  │      dfg Unified CLI      │
-                                  └─────────────┬─────────────┘
-                                                │
-                                   TCP Commands / Operations
-                                                │
-                                  ┌─────────────▼─────────────┐
-                                  │        Head Server        │
-                                  │  - Metadata Store         │
-                                  │  - Chunk Placement Engine │
-                                  │  - Control API (:9670)    │
-                                  │  - Metrics (:9095)        │
-                                  └──────┬──────────┬────────┬┘
-                                         │          │        │
-                     ┌───────────────────┘          │        └───────────────────┐
+                       ┌────────────────────────────────────────────────────────┐
+                       │                   User Applications                    │
+                       │   ┌──────────────────┐          ┌──────────────────┐   │
+                       │   │  dfg Unified CLI │          │ dfg_client / App │   │
+                       │   └─────────┬────────┘          └────────┬─────────┘   │
+                       └─────────────┼────────────────────────────┼─────────────┘
+                                     │                            │
+                     HTTP Control    │                            │ TCP Streaming
+                     API (:9670)     │                            │ (:9669)
+                                     ▼                            ▼
+                       ┌────────────────────────────────────────────────────────┐
+                       │                      Head Server                       │
+                       │  - Metadata Store (Redis / On-Disk)                    │
+                       │  - Chunk Placement Engine & Consensus Voting           │
+                       │  - Control API (:9670) & Metrics Exporter (:9095)      │
+                       └──────┬──────────────────────┬───────────────────┬──────┘
+                              │                      │                   │
+                     ┌────────┘                      │                   └────────┐
              TCP Chunk Transfers            TCP Chunk Transfers          TCP Chunk Transfers
              (:8180)                        (:8181)                      (:8182)
                      │                              │                            │
@@ -187,28 +190,56 @@ Open multiple terminals:
 
 ---
 
-## CLI Usage
+## Client Applications
 
-All grid operations are available through the unified `dfg` executable:
+The grid provides two client interfaces for interacting with the cluster:
+
+### 1. Unified Client CLI (`dfg`)
+
+The primary client interface supporting complete file lifecycle management and diagnostic status:
 
 ```bash
-# Upload a file to the grid
-dfg upload <local-file-path> <remote-grid-name>
+# Upload a file (splits, calculates hashes, replicates to storage nodes)
+./build/dfg upload <local-file-path> <remote-grid-name>
+# Example: ./build/dfg upload document.pdf my_doc.pdf
 
-# Download and verify a file from the grid
-dfg download <remote-grid-name> <output-file-path>
+# Download a file (queries replicas, consensus hash voting, read repair, assembly)
+./build/dfg download <remote-grid-name> <output-file-path>
+# Example: ./build/dfg download my_doc.pdf /tmp/restored_doc.pdf
 
-# List all stored files
-dfg list
+# List all stored files with metadata
+./build/dfg list
 
-# Server management (Control API)
-dfg list-servers
-dfg add-server --host 127.0.0.1 --port 8084
-dfg remove-server --id 4
+# Check chunk distribution and replica health for a file
+./build/dfg status <remote-grid-name>
 
-# Run built-in diagnostic test
-dfg test
+# Run an end-to-end upload/download verification test
+./build/dfg test
+
+# Cluster Server Management (via Head Server Control API)
+./build/dfg list-servers
+./build/dfg add-server --host 192.168.1.50 --port 8083
+./build/dfg remove-server --id 4
 ```
+
+### 2. Standalone Download Client (`dfg_client`)
+
+A lightweight, dedicated network client binary that communicates directly with the Head Server TCP streaming port (`:9669`):
+
+```bash
+# Usage: dfg_client <head_ip> <head_port> <filename> <output_path>
+./build/dfg_client 127.0.0.1 9669 my_doc.pdf /tmp/downloaded_doc.pdf
+```
+
+#### Client Protocol & Integrity Guarantees
+
+The client and head server communicate over a deterministic line-delimited and binary stream protocol:
+
+1. **Download Request**: Client initiates connection to TCP `:9669` and issues `DOWNLOAD <filename>\n`.
+2. **File Hash Handshake**: Server responds with `FILE_HASH <sha256_digest>\n`.
+3. **Chunk Streaming**: Server streams each chunk with header `CHUNK <order_id> <chunk_size> <chunk_sha256>\n` followed by raw binary payload.
+4. **Per-Chunk Verification**: The client calculates SHA-256 in real-time as each chunk arrives. If corrupted, it aborts and deletes partial data.
+5. **End-of-Stream & File Hash Check**: Upon receiving `EOF\n`, the client verifies the full aggregated SHA-256 digest against the expected server hash.
 
 ---
 
