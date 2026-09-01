@@ -1,7 +1,8 @@
 # src/health_checker/CMakeLists.txt
 
 add_executable(health_checker
-    main.cpp
+    health_checker.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/src/zookeeper_client.cpp
 )
 
 target_include_directories(health_checker PRIVATE

@@ -2,7 +2,8 @@
 
 add_executable(cluster_server
     cluster_server.cpp
-    async_file_recv.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/src/zookeeper_client.cpp
+    chunk_service.cpp
     metrics_exporter.cpp
 )
 

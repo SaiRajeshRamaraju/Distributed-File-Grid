@@ -171,7 +171,7 @@ int ZooKeeperClient::create_node(const std::string& path, const std::string& dat
 		created_path = actual_path;
 	}
 
-	invoke_watch(ZOO_CREATED_EVENT, ZOO_CHANGED_EVENT, created_path);
+	invoke_watch(ZOO_CREATED_EVENT, ZOO_CONNECTED_STATE, created_path);
 	return ZOK;
 }
 
@@ -200,7 +200,7 @@ int ZooKeeperClient::delete_node(const std::string& path, int /*version*/) {
 		nodes.erase(it);
 	}
 
-	invoke_watch(ZOO_DELETED_EVENT, ZOO_CHANGED_EVENT, normalized);
+	invoke_watch(ZOO_DELETED_EVENT, ZOO_CONNECTED_STATE, normalized);
 	return ZOK;
 }
 
@@ -238,7 +238,7 @@ int ZooKeeperClient::set_node_data(const std::string& path, const std::string& d
 		++it->second.version;
 	}
 
-	invoke_watch(ZOO_CHANGED_EVENT, ZOO_CHANGED_EVENT, normalized);
+	invoke_watch(ZOO_CHANGED_EVENT, ZOO_CONNECTED_STATE, normalized);
 	return ZOK;
 }
 

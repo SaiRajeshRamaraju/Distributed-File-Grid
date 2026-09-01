@@ -34,6 +34,7 @@ message FetchHashResponse {
   string hash = 3;
   string error_message = 4;
   float load_score = 5;
+  int32 active_connections = 6;
 }
 
 message ReplicateChunkRequest {

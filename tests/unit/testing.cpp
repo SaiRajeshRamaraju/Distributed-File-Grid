@@ -3,7 +3,8 @@
 #include <chrono>
 #include <vector>
 #include <atomic>
-#include "../src/include/heart_beat_signal.hpp"
+#include <dfg/async_net.hpp>
+#include <dfg/system_info.hpp>
 
 using namespace std::chrono_literals;
 
@@ -30,7 +31,7 @@ protected:
     }
     
     void run_echo_server() {
-        int server_fd = socket(AF_INET6, SOCK_STREAM, 0);
+        int server_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (server_fd < 0) {
             perror("socket");
             return;
@@ -43,10 +44,10 @@ protected:
             return;
         }
         
-        sockaddr_in6 addr{};
-        addr.sin6_family = AF_INET6;
-        addr.sin6_addr = in6addr_any;
-        addr.sin6_port = htons(TEST_PORT);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        addr.sin_port = htons(TEST_PORT);
         
         if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
             perror("bind");
@@ -77,7 +78,7 @@ protected:
             }
             
             if (activity > 0 && FD_ISSET(server_fd, &read_fds)) {
-                sockaddr_in6 client_addr{};
+                sockaddr_in client_addr{};
                 socklen_t client_len = sizeof(client_addr);
                 
                 int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
@@ -110,7 +111,7 @@ protected:
 
 TEST_F(HeartbeatTest, TestBasicHeartbeat) {
     // Test basic heartbeat sending
-    int result = send_signal("::1", SERVER_ID, TEST_PORT);
+    int result = send_signal("127.0.0.1", SERVER_ID, TEST_PORT);
     ASSERT_EQ(result, 0) << "Failed to send heartbeat";
     
     // Add a small delay to ensure the server processes the message
@@ -120,7 +121,7 @@ TEST_F(HeartbeatTest, TestBasicHeartbeat) {
 TEST_F(HeartbeatTest, TestMultipleHeartbeats) {
     // Test sending multiple heartbeats
     for (int i = 0; i < NUM_HEARTBEATS; ++i) {
-        int result = send_signal("::1", SERVER_ID + i, TEST_PORT);
+        int result = send_signal("127.0.0.1", SERVER_ID + i, TEST_PORT);
         ASSERT_EQ(result, 0) << "Failed to send heartbeat " << i;
         std::this_thread::sleep_for(50ms);
     }
@@ -128,7 +129,7 @@ TEST_F(HeartbeatTest, TestMultipleHeartbeats) {
 
 TEST_F(HeartbeatTest, TestInvalidServer) {
     // Test with invalid port (port 1 is usually restricted)
-    int result = send_signal("::1", SERVER_ID, 1);
+    int result = send_signal("127.0.0.1", SERVER_ID, 1);
     EXPECT_NE(result, 0) << "Expected send to fail on restricted port";
 }
 
@@ -144,7 +145,7 @@ TEST_F(HeartbeatTest, TestConcurrentHeartbeats) {
         threads.emplace_back([&, i] {
             for (int j = 0; j < HEARTBEATS_PER_THREAD; ++j) {
                 int result = send_signal(
-                    "::1", 
+                    "127.0.0.1", 
                     SERVER_ID + i * HEARTBEATS_PER_THREAD + j, 
                     TEST_PORT
                 );

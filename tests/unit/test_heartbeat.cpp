@@ -1,10 +1,12 @@
-#include "./test_heartbeat.cpp"
+#include <dfg/async_net.hpp>
+#include <dfg/system_info.hpp>
 #include <atomic>
 #include <gtest/gtest.h>
 #include <thread>
 #include <vector>
 
 using namespace std::chrono_literals;
+using namespace async_hb;
 
 class HeartbeatTest : public ::testing::Test {
 protected:
@@ -19,22 +21,21 @@ protected:
     // Start server in a separate thread
     server_running = true;
     server_thread = std::thread([this]() {
-      int sfd = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0);
+      int sfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
       if (sfd < 0) {
         GTEST_FAIL() << "Failed to create server socket";
         return;
       }
 
-      // Allow both IPv4 and IPv6
       int opt = 1;
       setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
       // Set up server address
-      struct sockaddr_in6 addr;
+      struct sockaddr_in addr;
       memset(&addr, 0, sizeof(addr));
-      addr.sin6_family = AF_INET6;
-      addr.sin6_addr = in6addr_any;
-      addr.sin6_port = htons(TEST_PORT);
+      addr.sin_family = AF_INET;
+      addr.sin_addr.s_addr = htonl(INADDR_ANY);
+      addr.sin_port = htons(TEST_PORT);
 
       if (bind(sfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         close(sfd);
@@ -45,7 +46,7 @@ protected:
       listen(sfd, 5);
 
       while (server_running) {
-        struct sockaddr_in6 client_addr;
+        struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
         int client_fd =
             accept(sfd, (struct sockaddr *)&client_addr, &client_len);
@@ -67,9 +68,16 @@ protected:
             if (bytes <= 0)
               break;
 
-            // Parse heartbeat
+            // Parse heartbeat (handle length-prefixed or raw frame)
             heart_beat::v1::HeartBeat hb;
-            if (hb.ParseFromArray(buffer, bytes)) {
+            bool parsed = false;
+            if (bytes > 4) {
+              parsed = hb.ParseFromArray(buffer + 4, bytes - 4);
+            }
+            if (!parsed) {
+              parsed = hb.ParseFromArray(buffer, bytes);
+            }
+            if (parsed) {
               received_heartbeats++;
               last_received_ip = hb.ip();
               last_received_id = hb.server_id();
@@ -109,7 +117,7 @@ protected:
 
 TEST_F(HeartbeatTest, TestHeartbeatSending) {
   // Send a heartbeat
-  int result = send_signal("::1", 123, TEST_PORT);
+  int result = send_signal("127.0.0.1", 123, TEST_PORT);
   ASSERT_EQ(result, 0) << "Failed to send heartbeat";
 
   // Wait for the heartbeat to be received
@@ -125,7 +133,7 @@ TEST_F(HeartbeatTest, TestMultipleHeartbeats) {
 
   // Send multiple heartbeats
   for (int i = 0; i < NUM_HEARTBEATS; ++i) {
-    int result = send_signal("::1", 100 + i, TEST_PORT);
+    int result = send_signal("127.0.0.1", 100 + i, TEST_PORT);
     ASSERT_EQ(result, 0) << "Failed to send heartbeat " << i;
     std::this_thread::sleep_for(50ms);
   }
@@ -141,7 +149,7 @@ TEST_F(HeartbeatTest, TestMultipleHeartbeats) {
 
 TEST_F(HeartbeatTest, TestInvalidServer) {
   // Try to send to an invalid port
-  int result = send_signal("::1", 123, 1); // Port 1 is usually restricted
+  int result = send_signal("127.0.0.1", 123, 1); // Port 1 is usually restricted
   EXPECT_NE(result, 0) << "Expected send to fail on restricted port";
 }
 

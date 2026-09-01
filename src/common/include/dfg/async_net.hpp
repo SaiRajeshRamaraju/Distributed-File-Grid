@@ -35,6 +35,7 @@ struct task {
   struct promise_type {
     Reactor *reactor{nullptr};
     std::coroutine_handle<> continuation;
+    std::exception_ptr exception_ptr;
 
     task get_return_object();
     std::suspend_always initial_suspend() noexcept { return {}; }
@@ -44,7 +45,7 @@ struct task {
       void await_resume() noexcept {}
     };
     final_awaitable final_suspend() noexcept { return {}; }
-    void unhandled_exception() { std::terminate(); }
+    void unhandled_exception() { exception_ptr = std::current_exception(); }
     void return_void() {}
   };
 
@@ -73,7 +74,11 @@ struct task {
     h.promise().continuation = caller;
     h.resume();
   }
-  void await_resume() const noexcept {}
+  void await_resume() const {
+    if (h && h.promise().exception_ptr) {
+      std::rethrow_exception(h.promise().exception_ptr);
+    }
+  }
 };
 
 inline task task::promise_type::get_return_object() {
@@ -87,6 +92,13 @@ struct Reactor {
     if (epfd_ < 0)
       throw std::runtime_error("epoll_create1 failed");
   }
+  
+  // Rule of Five
+  Reactor(const Reactor &) = delete;
+  Reactor &operator=(const Reactor &) = delete;
+  Reactor(Reactor &&) = delete;
+  Reactor &operator=(Reactor &&) = delete;
+  
   ~Reactor() {
     if (epfd_ >= 0)
       ::close(epfd_);
@@ -355,11 +367,12 @@ inline bool resolve_ipv4(const std::string &host, uint16_t port,
   return true;
 }
 
-inline task send_heartbeats(Reactor &r, int sfd, int server_id, const std::string& local_ip_port) {
+inline task send_heartbeats(Reactor &r, int sfd, int server_id, const std::string& local_ip_port = "", int count = -1) {
   heart_beat::v1::HeartBeat hb;
   hb.set_server_id(server_id);
   hb.set_ip(local_ip_port);
-  while (true) {
+  int sent = 0;
+  while (count < 0 || sent < count) {
     *hb.mutable_timestamp() =
         google::protobuf::util::TimeUtil::GetCurrentTime();
 
@@ -386,6 +399,10 @@ inline task send_heartbeats(Reactor &r, int sfd, int server_id, const std::strin
 
     auto frame = build_frame(hb);
     co_await async_send_all(r, sfd, frame.data(), frame.size());
+    sent++;
+    if (count > 0 && sent >= count) {
+      co_return;
+    }
     co_await r.sleep_for(std::chrono::seconds(1));
   }
 }
@@ -410,14 +427,24 @@ recv_heartbeats(Reactor &r, int sfd,
   }
 }
 
-inline int send_signal(std::string server_ip, int server_id, int port = 9000, std::string local_ip_port = "") {
+inline task send_heartbeat_session(Reactor &r, int sfd, sockaddr_in addr, int server_id, const std::string& local_ip_port, int count, bool &success) {
+  try {
+    co_await async_connect(r, sfd, addr);
+    co_await send_heartbeats(r, sfd, server_id, local_ip_port, count);
+    success = true;
+  } catch (...) {
+    success = false;
+  }
+}
+
+inline int send_signal(std::string server_ip, int server_id, int port = 9000, std::string local_ip_port = "", int count = 1) {
   try {
     sockaddr_in addr{};
     if (!resolve_ipv4(server_ip, static_cast<uint16_t>(port), addr)) {
       std::cerr << "Could not resolve hostname\n";
       return 1;
     }
-    int sfd = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    int sfd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (sfd < 0) {
       std::cerr << "Socket creation failed\n";
       return 1;
@@ -428,19 +455,19 @@ inline int send_signal(std::string server_ip, int server_id, int port = 9000, st
       return 1;
     }
 
+    bool success = false;
     Reactor r;
-    r.spawn(async_connect(r, sfd, addr));
-    r.spawn(send_heartbeats(r, sfd, server_id, local_ip_port));
+    r.spawn(send_heartbeat_session(r, sfd, addr, server_id, local_ip_port, count, success));
     r.run();
     ::close(sfd);
-    return 0;
+    return success ? 0 : 1;
   } catch (const std::exception &e) {
     std::cerr << "send_signal error: " << e.what() << "\n";
     return 1;
   }
 }
 
-inline int recieve_signal(int port = 9000) {
+inline int receive_signal(int port = 9000) {
   try {
     int lfd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (lfd < 0) {
@@ -501,9 +528,14 @@ inline int recieve_signal(int port = 9000) {
     r.run();
     return 0;
   } catch (const std::exception &e) {
-    std::cerr << "recieve_signal error: " << e.what() << "\n";
+    std::cerr << "receive_signal error: " << e.what() << "\n";
     return 1;
   }
+}
+
+// Backward compatible alias
+inline int recieve_signal(int port = 9000) {
+  return receive_signal(port);
 }
 
 // Implementation of final_awaitable::await_suspend after Reactor is fully defined

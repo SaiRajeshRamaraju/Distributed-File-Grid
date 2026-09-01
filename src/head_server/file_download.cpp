@@ -3,7 +3,7 @@
 // performs read repairs, and reassembles the original file.
 // Uses shared net_utils and thread_pool.
 
-#include <dfg/heart_beat_signal.hpp>
+#include <dfg/async_net.hpp>
 #include <dfg/config_loader.hpp>
 #include <dfg/net_utils.hpp>
 #include <dfg/thread_pool.hpp>
@@ -40,56 +40,25 @@ static dfg::ThreadPool& fetch_pool() {
 
 class FileReconstructor {
 private:
-    std::vector<ChunkLocation> get_chunk_locations_from_metadata(const std::string& filename) {
+    std::pair<std::vector<ChunkLocation>, std::string> get_chunk_locations_from_metadata(const std::string& filename) {
         std::vector<ChunkLocation> locations;
+        std::string file_hash;
         
         try {
-            std::stringstream request;
-            request << filename;
-            
-            // Capture output from read_entry
-            std::streambuf* orig = std::cout.rdbuf();
-            std::ostringstream captured;
-            std::cout.rdbuf(captured.rdbuf());
-            
-            read_entry(request.str());
-            
-            std::cout.rdbuf(orig);
-            std::string output = captured.str();
-            
-            std::istringstream iss(output);
-            std::string line;
-            while (std::getline(iss, line)) {
-                if (line.find("chunk:") != std::string::npos) {
-                    size_t chunk_pos = line.find("chunk:");
-                    size_t server_pos = line.find("server=");
-                    size_t path_pos = line.find("path=");
-                    
-                    if (chunk_pos != std::string::npos && server_pos != std::string::npos && path_pos != std::string::npos) {
-                        ChunkLocation loc;
-                        
-                        std::string chunk_str = line.substr(chunk_pos + 6);
-                        size_t space_pos = chunk_str.find(' ');
-                        if (space_pos != std::string::npos) {
-                            loc.chunk_id = std::stoi(chunk_str.substr(0, space_pos));
-                        }
-                        
-                        std::string server_str = line.substr(server_pos + 7);
-                        space_pos = server_str.find(' ');
-                        if (space_pos != std::string::npos) {
-                            loc.server_ip = server_str.substr(0, space_pos);
-                        }
-                        
-                        loc.file_path = line.substr(path_pos + 5);
-                        locations.push_back(loc);
-                    }
-                }
+            auto record = query_metadata(filename);
+            file_hash = record.file_hash;
+            for (const auto& chunk : record.chunks) {
+                ChunkLocation loc;
+                loc.chunk_id = static_cast<int>(chunk.chunk_id);
+                loc.server_ip = chunk.server;
+                loc.file_path = chunk.path;
+                locations.push_back(loc);
             }
         } catch (const std::exception& e) {
             std::cerr << "Error getting chunk locations: " << e.what() << std::endl;
         }
         
-        return locations;
+        return {locations, file_hash};
     }
     
     file_transfer::v1::FetchHashResponse get_chunk_hash(const ChunkLocation& location, const std::string& filename) {
@@ -242,7 +211,7 @@ public:
     bool reconstruct_file(const std::string& filename, const std::string& output_path) {
         std::cout << "Reconstructing file: " << filename << std::endl;
         
-        auto chunk_locations = get_chunk_locations_from_metadata(filename);
+        auto [chunk_locations, file_hash] = get_chunk_locations_from_metadata(filename);
         if (chunk_locations.empty()) {
             std::cerr << "No chunks found for file: " << filename << std::endl;
             return false;
@@ -280,9 +249,14 @@ public:
         
         std::cout << "Fetching " << hash_futures.size() << " chunk hashes concurrently..." << std::endl;
         
+        struct ServerInfo {
+            ChunkLocation loc;
+            float load_score;
+            int active_connections;
+        };
         struct ChunkConsensus {
             std::map<std::string, int> hash_counts;
-            std::map<std::string, std::vector<std::pair<ChunkLocation, float>>> hash_to_servers;
+            std::map<std::string, std::vector<ServerInfo>> hash_to_servers;
             std::vector<ChunkLocation> failed_fetches;
         };
         std::map<int, ChunkConsensus> consensus_map;
@@ -293,7 +267,7 @@ public:
             if (result.response.success()) {
                 consensus.hash_counts[result.response.hash()]++;
                 consensus.hash_to_servers[result.response.hash()].push_back(
-                    {result.location, result.response.load_score()});
+                    {result.location, result.response.load_score(), result.response.active_connections()});
             } else {
                 consensus.failed_fetches.push_back(result.location);
             }
@@ -331,10 +305,12 @@ public:
             
             auto majority_servers = it->second;
             std::sort(majority_servers.begin(), majority_servers.end(), [](const auto& a, const auto& b) {
-                return a.second < b.second;
+                if (a.active_connections != b.active_connections)
+                    return a.active_connections < b.active_connections;
+                return a.load_score < b.load_score;
             });
             
-            fetch_plans.push_back(ChunkFetchPlan{chunk_id, majority_servers.front().first, majority_hash});
+            fetch_plans.push_back(ChunkFetchPlan{chunk_id, majority_servers.front().loc, majority_hash});
         }
         
         // Fire all fetches
@@ -399,9 +375,9 @@ public:
             
             for (const auto& [hash, servers] : consensus.hash_to_servers) {
                 if (hash != majority_hash) {
-                    for (const auto& [loc, score] : servers) {
-                        std::cerr << "! Data Corruption Detected! Repairing Chunk " << chunk_id << " on " << loc.server_ip << std::endl;
-                        auto repair_loc = loc;
+                    for (const auto& srv : servers) {
+                        std::cerr << "! Data Corruption Detected! Repairing Chunk " << chunk_id << " on " << srv.loc.server_ip << std::endl;
+                        auto repair_loc = srv.loc;
                         auto repair_data = chunk_data;
                         auto fname = filename;
                         fetch_pool().submit([this, repair_loc, fname, repair_data]() -> bool {
@@ -416,8 +392,140 @@ public:
         return true;
     }
     
+    bool stream_file_to_client(const std::string& filename, int fd) {
+        auto [chunk_locations, file_hash] = get_chunk_locations_from_metadata(filename);
+        if (chunk_locations.empty()) {
+            std::string err = "ERROR: No chunks found for file\n";
+            ::send(fd, err.data(), err.size(), 0);
+            return false;
+        }
+
+        std::string hash_msg = "FILE_HASH " + file_hash + "\n";
+        ::send(fd, hash_msg.data(), hash_msg.size(), 0);
+
+        std::map<int, std::vector<ChunkLocation>> chunk_replicas;
+        for (const auto& location : chunk_locations) {
+            chunk_replicas[location.chunk_id].push_back(location);
+        }
+
+        struct HashResult {
+            int chunk_id;
+            ChunkLocation location;
+            file_transfer::v1::FetchHashResponse response;
+        };
+        
+        std::vector<std::future<HashResult>> hash_futures;
+        for (const auto& [chunk_id, replicas] : chunk_replicas) {
+            for (const auto& replica : replicas) {
+                auto cid = chunk_id;
+                auto loc = replica;
+                auto fname = filename;
+                hash_futures.push_back(fetch_pool().submit([this, cid, loc, fname]() -> HashResult {
+                    auto resp = get_chunk_hash(loc, fname);
+                    return HashResult{cid, loc, resp};
+                }));
+            }
+        }
+
+        struct ServerInfo {
+            ChunkLocation loc;
+            float load_score;
+            int active_connections;
+        };
+        struct ChunkConsensus {
+            std::map<std::string, int> hash_counts;
+            std::map<std::string, std::vector<ServerInfo>> hash_to_servers;
+        };
+        std::map<int, ChunkConsensus> consensus_map;
+        
+        for (auto& fut : hash_futures) {
+            auto result = fut.get();
+            auto& consensus = consensus_map[result.chunk_id];
+            if (result.response.success()) {
+                consensus.hash_counts[result.response.hash()]++;
+                consensus.hash_to_servers[result.response.hash()].push_back(
+                    {result.location, result.response.load_score(), result.response.active_connections()});
+            }
+        }
+
+        struct ChunkFetchPlan {
+            int chunk_id;
+            ChunkLocation best_server;
+            std::string majority_hash;
+        };
+        
+        std::vector<ChunkFetchPlan> fetch_plans;
+        for (const auto& [chunk_id, consensus] : consensus_map) {
+            if (consensus.hash_counts.empty()) {
+                std::string err = "ERROR: Could not verify hashes for chunk " + std::to_string(chunk_id) + "\n";
+                ::send(fd, err.data(), err.size(), 0);
+                return false;
+            }
+            std::string majority_hash;
+            int max_count = 0;
+            for (const auto& [hash, count] : consensus.hash_counts) {
+                if (count > max_count) {
+                    max_count = count;
+                    majority_hash = hash;
+                }
+            }
+            auto majority_servers = consensus.hash_to_servers.at(majority_hash);
+            std::sort(majority_servers.begin(), majority_servers.end(), [](const auto& a, const auto& b) {
+                if (a.active_connections != b.active_connections)
+                    return a.active_connections < b.active_connections;
+                return a.load_score < b.load_score;
+            });
+            fetch_plans.push_back(ChunkFetchPlan{chunk_id, majority_servers.front().loc, majority_hash});
+        }
+        
+        struct ChunkFetchResult {
+            int chunk_id;
+            std::vector<char> data;
+            std::string majority_hash;
+        };
+        
+        std::vector<std::future<ChunkFetchResult>> fetch_futures;
+        for (const auto& plan : fetch_plans) {
+            auto fname = filename;
+            auto p = plan;
+            fetch_futures.push_back(fetch_pool().submit([this, fname, p]() -> ChunkFetchResult {
+                auto data = read_chunk_from_server(p.best_server, fname);
+                return ChunkFetchResult{p.chunk_id, std::move(data), p.majority_hash};
+            }));
+        }
+
+        for (auto& fut : fetch_futures) {
+            auto result = fut.get();
+            if (result.data.empty()) {
+                std::string err = "ERROR: Failed to fetch chunk " + std::to_string(result.chunk_id) + "\n";
+                ::send(fd, err.data(), err.size(), 0);
+                return false;
+            }
+            std::string header = "CHUNK " + std::to_string(result.chunk_id) + " " + std::to_string(result.data.size()) + " " + result.majority_hash + "\n";
+            ::send(fd, header.data(), header.size(), 0);
+            
+            size_t written = 0;
+            while (written < result.data.size()) {
+                ssize_t n = ::send(fd, result.data.data() + written, result.data.size() - written, 0);
+                if (n < 0) {
+                    if (errno == EINTR) continue;
+                    return false;
+                }
+                written += n;
+            }
+            
+            // Explicitly clear the chunk data from memory immediately after sending
+            result.data.clear();
+            result.data.shrink_to_fit();
+        }
+        
+        std::string eof = "FILE_HASH " + file_hash + "\nEOF\n";
+        ::send(fd, eof.data(), eof.size(), 0);
+        return true;
+    }
+
     bool file_exists(const std::string& filename) {
-        auto chunk_locations = get_chunk_locations_from_metadata(filename);
+        auto [chunk_locations, file_hash] = get_chunk_locations_from_metadata(filename);
         return !chunk_locations.empty();
     }
 };
@@ -440,4 +548,8 @@ int check_file_exists(const char* filename) {
         std::cerr << "Error checking file existence: " << e.what() << std::endl;
         return -1;
     }
+}
+
+void handle_client_download(int fd, const std::string& filename) {
+    g_file_reconstructor.stream_file_to_client(filename, fd);
 }

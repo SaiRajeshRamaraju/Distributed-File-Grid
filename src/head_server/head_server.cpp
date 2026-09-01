@@ -8,7 +8,7 @@
 #include "redis_handler.hpp"
 #include <dfg/config_loader.hpp>
 #include <dfg/health_monitor.hpp>
-#include <dfg/heart_beat_signal.hpp>
+#include <dfg/async_net.hpp>
 #include <dfg/server_registry.hpp>
 #include <dfg/version.hpp>
 
@@ -31,7 +31,7 @@ static std::unique_ptr<HeadServerMetrics> g_head_metrics;
 HeadServerMetrics *get_head_metrics() { return g_head_metrics.get(); }
 
 // Global health monitor and server registry
-static std::unique_ptr<dfg::HealthMonitor> g_health_monitor;
+std::unique_ptr<dfg::HealthMonitor> g_health_monitor;
 static std::unique_ptr<dfg::ServerRegistry> g_cluster_registry;
 static std::unique_ptr<dfg::ControlAPI> g_control_api;
 
@@ -250,6 +250,57 @@ int run_head_server(int argc, char **argv) {
 
   // Start the head server daemon (initializes metadata backend)
   start_daemon();
+  
+  // Start client listener thread
+  std::thread client_listener_thread([port]() {
+      int sfd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+      if (sfd < 0) return;
+      int yes = 1;
+      setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+      sockaddr_in addr{};
+      addr.sin_family = AF_INET;
+      addr.sin_port = htons(port);
+      addr.sin_addr.s_addr = htonl(INADDR_ANY);
+      if (::bind(sfd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+          std::cerr << "Failed to bind client listener on port " << port << std::endl;
+          ::close(sfd);
+          return;
+      }
+      ::listen(sfd, 16);
+      std::cout << "Client listener ready on TCP port " << port << std::endl;
+      
+      while (g_head_running) {
+          sockaddr_in peer{};
+          socklen_t plen = sizeof(peer);
+          int cfd = ::accept(sfd, reinterpret_cast<sockaddr *>(&peer), &plen);
+          if (cfd < 0) {
+              if (errno == EINTR) continue;
+              break;
+          }
+          if (!g_head_running) { ::close(cfd); break; }
+          
+          std::thread([cfd]() {
+              char buf[1024];
+              ssize_t n = ::recv(cfd, buf, sizeof(buf) - 1, 0);
+              if (n > 0) {
+                  buf[n] = 0;
+                  std::string req(buf);
+                  if (req.rfind("DOWNLOAD ", 0) == 0) {
+                      std::string filename = req.substr(9);
+                      // trim trailing newline
+                      while (!filename.empty() && (filename.back() == '\n' || filename.back() == '\r')) {
+                          filename.pop_back();
+                      }
+                      extern void handle_client_download(int fd, const std::string& filename);
+                      handle_client_download(cfd, filename);
+                  }
+              }
+              ::close(cfd);
+          }).detach();
+      }
+      ::close(sfd);
+  });
+  client_listener_thread.detach();
 
   std::cout << "Head Server is ready on port " << port << std::endl;
   std::cout << "Dynamic server management: http://localhost:" << control_port

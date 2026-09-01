@@ -189,15 +189,15 @@ echo "Services are running. Press Ctrl+C to stop."
 echo "Logs are available in /app/logs/"
 
 # Monitor loop
-while true do
+while true; do
     sleep 30
     
     # Check if all services are still running
     all_running=true
     for pid_file in /tmp/*.pid; do
         if [ -f "$pid_file" ]; then
-            local pid=$(cat "$pid_file")
-            local service_name=$(basename "$pid_file" .pid)
+            pid=$(cat "$pid_file")
+            service_name=$(basename "$pid_file" .pid)
             
             if ! kill -0 "$pid" 2>/dev/null; then
                 echo "WARNING: $service_name (PID: $pid) has stopped unexpectedly"

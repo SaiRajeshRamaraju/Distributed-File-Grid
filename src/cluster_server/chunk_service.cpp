@@ -1,9 +1,10 @@
 #include "metrics_exporter.hpp"
+#include "dfg/sha256.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <dfg/heart_beat_signal.hpp>
+#include <dfg/async_net.hpp>
 #include <dfg/system_info.hpp>
 #include <fcntl.h>
 #include <filesystem>
@@ -23,7 +24,53 @@
 #include "file_transfer.pb.h"
 #include <arpa/inet.h>
 #include <chrono>
-#include <dfg/io_thread_pool.hpp>
+#include <dfg/thread_pool.hpp>
+
+// ─────────────────── Awaiter: bridge future → coroutine ───────────────────
+// Suspends the coroutine, polls the future on reactor ticks via a timerfd,
+// and resumes once the result is ready.
+template <typename T>
+struct FutureAwaiter {
+    std::shared_future<T> fut;
+    async_hb::Reactor* reactor;
+
+    bool await_ready() const noexcept {
+        return fut.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+    }
+
+    void await_suspend(std::coroutine_handle<> h) {
+        auto r = reactor;
+        auto shared_h = std::make_shared<std::coroutine_handle<>>(h);
+        
+        auto poll = [r, f = fut, shared_h](async_hb::Reactor& rx) -> async_hb::task {
+            while (f.wait_for(std::chrono::microseconds(0)) != std::future_status::ready) {
+                co_await rx.sleep_for(std::chrono::milliseconds(1));
+            }
+            if (*shared_h && !shared_h->done()) {
+                shared_h->resume();
+            }
+            co_return;
+        };
+
+        reactor->spawn(poll(*reactor));
+    }
+
+    T await_resume() {
+        return fut.get();
+    }
+};
+
+template <typename T>
+FutureAwaiter<T> await_future(async_hb::Reactor& r, std::future<T> f) {
+    return FutureAwaiter<T>{f.share(), &r};
+}
+
+// Global I/O thread pool (shared by all storage operations)
+inline dfg::ThreadPool& io_pool() {
+    static dfg::ThreadPool pool(4);
+    return pool;
+}
+
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -81,51 +128,6 @@ public:
     }
   }
 
-  // ── Synchronous store (kept for non-coroutine callers) ──
-  bool store_chunk(const std::string &chunk_id, const std::vector<char> &data) {
-    try {
-      std::string chunk_path = generate_chunk_path(chunk_id);
-
-      // Use POSIX O_DIRECT-friendly writes with explicit fsync
-      int fd = ::open(chunk_path.c_str(),
-                      O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-      if (fd < 0) {
-        std::cerr << "Failed to create chunk file: " << chunk_path << std::endl;
-        return false;
-      }
-
-      size_t written = 0;
-      while (written < data.size()) {
-        ssize_t n = ::write(fd, data.data() + written, data.size() - written);
-        if (n < 0) {
-          if (errno == EINTR)
-            continue;
-          std::cerr << "Write error for chunk " << chunk_id << ": "
-                    << strerror(errno) << std::endl;
-          ::close(fd);
-          return false;
-        }
-        written += static_cast<size_t>(n);
-      }
-      ::fdatasync(fd); // Ensure data is persisted
-      ::close(fd);
-
-      // Register chunk in memory
-      {
-        std::lock_guard<std::mutex> lock(registry_mutex);
-        chunk_registry[chunk_id] = chunk_path;
-      }
-
-      std::cout << "Stored chunk " << chunk_id << " (" << data.size()
-                << " bytes)" << std::endl;
-      return true;
-    } catch (const std::exception &e) {
-      std::cerr << "Error storing chunk " << chunk_id << ": " << e.what()
-                << std::endl;
-      return false;
-    }
-  }
-
   // ── Async store: offload to I/O thread pool ──
   std::future<bool> async_store_chunk(const std::string &chunk_id,
                                       std::vector<char> data) {
@@ -166,61 +168,6 @@ public:
                 << " bytes)" << std::endl;
       return true;
     });
-  }
-
-  // ── Synchronous retrieve ──
-  std::vector<char> retrieve_chunk(const std::string &chunk_id) {
-    std::vector<char> data;
-
-    try {
-      std::string chunk_path;
-      {
-        std::lock_guard<std::mutex> lock(registry_mutex);
-        auto it = chunk_registry.find(chunk_id);
-        if (it == chunk_registry.end()) {
-          std::cerr << "Chunk " << chunk_id << " not found in registry"
-                    << std::endl;
-          return data;
-        }
-        chunk_path = it->second;
-      }
-
-      int fd = ::open(chunk_path.c_str(), O_RDONLY | O_CLOEXEC);
-      if (fd < 0) {
-        std::cerr << "Failed to open chunk file: " << chunk_path << std::endl;
-        return data;
-      }
-
-      // Get file size via lseek
-      off_t file_size = ::lseek(fd, 0, SEEK_END);
-      ::lseek(fd, 0, SEEK_SET);
-
-      data.resize(static_cast<size_t>(file_size));
-      size_t total_read = 0;
-      while (total_read < data.size()) {
-        ssize_t n =
-            ::read(fd, data.data() + total_read, data.size() - total_read);
-        if (n < 0) {
-          if (errno == EINTR)
-            continue;
-          std::cerr << "Read error for chunk " << chunk_id << std::endl;
-          ::close(fd);
-          return {};
-        }
-        if (n == 0)
-          break;
-        total_read += static_cast<size_t>(n);
-      }
-      ::close(fd);
-
-      std::cout << "Retrieved chunk " << chunk_id << " (" << data.size()
-                << " bytes)" << std::endl;
-    } catch (const std::exception &e) {
-      std::cerr << "Error retrieving chunk " << chunk_id << ": " << e.what()
-                << std::endl;
-    }
-
-    return data;
   }
 
   // ── Async retrieve: offload to I/O thread pool ──
@@ -423,7 +370,16 @@ private:
     ::close(sfd);
   }
 
+  std::atomic<int> active_connections{0};
+
+  struct ConnectionTracker {
+      std::atomic<int>& counter;
+      ConnectionTracker(std::atomic<int>& c) : counter(c) { counter++; }
+      ~ConnectionTracker() { counter--; }
+  };
+
   async_hb::task handle_connection(async_hb::Reactor &r, int cfd) {
+    ConnectionTracker tracker(active_connections);
     try {
       uint8_t header[8];
       co_await async_hb::async_read_exact(r, cfd, header, 8);
@@ -517,16 +473,11 @@ private:
         resp.set_success(ok);
         resp.set_chunk_id(req.chunk_id());
         if (ok) {
-          size_t hash = 0;
-          for (char c : data) {
-            hash = hash * 31 + static_cast<size_t>(c);
-          }
-          std::stringstream ss;
-          ss << std::hex << hash;
-          resp.set_hash(ss.str());
+          resp.set_hash(dfg::hash::sha256(data));
 
           auto usage = system_monitor();
           resp.set_load_score(usage.cpu_usage + usage.ram_usage);
+          resp.set_active_connections(active_connections.load());
         } else {
           resp.set_error_message("Chunk not found on this server");
         }
@@ -664,14 +615,6 @@ public:
   }
 
   // Chunk operations API (sync wrappers, still available for external callers)
-  bool store_chunk(const std::string &chunk_id, const std::vector<char> &data) {
-    return storage.store_chunk(chunk_id, data);
-  }
-
-  std::vector<char> retrieve_chunk(const std::string &chunk_id) {
-    return storage.retrieve_chunk(chunk_id);
-  }
-
   bool delete_chunk(const std::string &chunk_id) {
     return storage.delete_chunk(chunk_id);
   }

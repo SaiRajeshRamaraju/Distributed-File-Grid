@@ -1,18 +1,18 @@
-#include "../../src/common/include/dfg/io_thread_pool.hpp"
+#include "../../src/common/include/dfg/thread_pool.hpp"
 #include <chrono>
 #include <gtest/gtest.h>
 #include <thread>
 #include <vector>
 
-TEST(IOThreadPoolTest, SubmitAndReturnValue) {
-  IOThreadPool pool(2);
+TEST(ThreadPoolTest, SubmitAndReturnValue) {
+  dfg::ThreadPool pool(2);
   auto fut = pool.submit([] { return 42; });
 
   EXPECT_EQ(fut.get(), 42);
 }
 
-TEST(IOThreadPoolTest, SubmitAndExecuteConcurrently) {
-  IOThreadPool pool(4);
+TEST(ThreadPoolTest, SubmitAndExecuteConcurrently) {
+  dfg::ThreadPool pool(4);
   auto start = std::chrono::steady_clock::now();
 
   auto fut1 = pool.submit([] {
@@ -46,8 +46,8 @@ TEST(IOThreadPoolTest, SubmitAndExecuteConcurrently) {
   EXPECT_LT(dur, 300);
 }
 
-TEST(IOThreadPoolTest, SubmitsManyJobs) {
-  IOThreadPool pool(2);
+TEST(ThreadPoolTest, SubmitsManyJobs) {
+  dfg::ThreadPool pool(2);
   std::vector<std::future<int>> futures;
 
   for (int i = 0; i < 100; ++i) {

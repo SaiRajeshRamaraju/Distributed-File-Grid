@@ -68,7 +68,7 @@ services:
       - zookeeper
     command: ["/usr/local/bin/head_server"]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9669/health", "||", "exit", "1"]
+      test: ["CMD", "curl", "-f", "http://localhost:9670/api/v1/status", "||", "exit", "1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -100,7 +100,7 @@ services:
       - zookeeper
     command: ["/usr/local/bin/head_server"]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9669/health", "||", "exit", "1"]
+      test: ["CMD", "curl", "-f", "http://localhost:9670/api/v1/status", "||", "exit", "1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -223,7 +223,7 @@ services:
       - cluster-server-3
     command: ["/usr/local/bin/health_checker"]
     healthcheck:
-      test: ["CMD", "nc", "-z", "localhost", "9000"]
+      test: ["CMD", "curl", "-f", "http://localhost:9096/metrics", "||", "exit", "1"]
       interval: 30s
       timeout: 10s
       retries: 3

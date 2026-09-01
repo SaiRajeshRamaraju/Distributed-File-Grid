@@ -3,8 +3,6 @@
 # Distributed File Grid - Service Status Script
 # This script checks the status of all components
 
-set -e
-
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'

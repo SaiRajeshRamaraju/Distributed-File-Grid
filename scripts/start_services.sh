@@ -50,6 +50,7 @@ start_service() {
     # Start the service in background
     nohup "$executable" $args > "$log_file" 2>&1 &
     local pid=$!
+    disown $pid 2>/dev/null || true
     echo $pid > "$pid_file"
     
     # Wait a moment and check if it's still running
@@ -148,9 +149,9 @@ echo ""
 echo "Logs are available in: $LOGS_DIR"
 echo "PID files are in: $PIDS_DIR"
 echo ""
-echo "To upload a file:    cd $BUILD_DIR && ./main upload <filepath> <name>"
-echo "To download a file:  cd $BUILD_DIR && ./main download <name> <output>"
-echo "To list files:       cd $BUILD_DIR && ./main list"
+echo "To upload a file:    cd $BUILD_DIR && ./dfg upload <filepath> <name>"
+echo "To download a file:  cd $BUILD_DIR && ./dfg download <name> <output>"
+echo "To list files:       cd $BUILD_DIR && ./dfg list"
 echo ""
 echo "To stop all services, run: ./scripts/stop_services.sh"
 echo "To check service status, run: ./scripts/status.sh"

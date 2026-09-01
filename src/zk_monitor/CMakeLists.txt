@@ -1,7 +1,7 @@
 # src/zk_monitor/CMakeLists.txt
 
 add_executable(zk_head_server_monitor
-    main.cpp
+    zk_monitor.cpp
     ${CMAKE_SOURCE_DIR}/src/common/src/zookeeper_client.cpp
 )
 

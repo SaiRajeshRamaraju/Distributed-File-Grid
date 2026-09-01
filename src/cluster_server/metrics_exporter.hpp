@@ -11,7 +11,6 @@
 class MetricsExporter {
 public:
     MetricsExporter(const std::string& bind_address = "0.0.0.0:9091");
-    ~MetricsExporter() = default;
 
     // Update metrics
     void update_connections(int count);

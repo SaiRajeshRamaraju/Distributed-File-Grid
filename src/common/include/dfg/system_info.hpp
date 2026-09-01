@@ -1,18 +1,18 @@
 #ifndef SYSTEM_INFO_HPP
 #define SYSTEM_INFO_HPP
 
+#include <atomic>
+#include <chrono>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <sys/statvfs.h>
 #include <tuple>
 #include <unistd.h>
-#include <utility>  // for std::pair
-#include <atomic>
-#include <mutex>
-#include <chrono>
+#include <utility> // for std::pair
 
 struct system_usage {
   float cpu_usage;
@@ -107,13 +107,13 @@ inline NetworkStats readNetworkStats() {
 
     unsigned long long rBytes, rPackets, rErrs, rDrop, rFifo, rFrame,
         rCompressed, rMulticast;
-    unsigned long long tBytes, tPackets, tErrs, tDrop, tFifo, tColls,
-        tCarrier, tCompressed;
+    unsigned long long tBytes, tPackets, tErrs, tDrop, tFifo, tColls, tCarrier,
+        tCompressed;
 
     ss >> rBytes >> rPackets >> rErrs >> rDrop >> rFifo >> rFrame >>
         rCompressed >> rMulticast;
-    ss >> tBytes >> tPackets >> tErrs >> tDrop >> tFifo >> tColls >>
-        tCarrier >> tCompressed;
+    ss >> tBytes >> tPackets >> tErrs >> tDrop >> tFifo >> tColls >> tCarrier >>
+        tCompressed;
 
     // Skip loopback interface
     if (iface != "lo") {
@@ -163,6 +163,7 @@ inline std::pair<float, float> getRamUsageGBPercent() {
       sscanf(line.c_str(), "Buffers: %ld kB", &buffersKB);
     } else if (line.find("Cached:") == 0 && line.find("SwapCached:") != 0) {
       sscanf(line.c_str(), "Cached: %ld kB", &cachedKB);
+      break;
     }
   }
   file.close();
@@ -170,7 +171,17 @@ inline std::pair<float, float> getRamUsageGBPercent() {
   long usedMemKB = totalMemKB - freeMemKB;
   float totalGB = totalMemKB / (1024.0 * 1024.0);
   float usedGB = usedMemKB / (1024.0 * 1024.0);
-  float usedPercent = (totalGB > 0) ? (usedGB / totalGB) * 100.0 : 0.0;
+  float usedPercent = 0.0f;
+
+  if (totalGB > 0) {
+    usedPercent = (usedGB / totalGB) * 100.0f;
+  } else {
+    std::cerr
+        << "Error: Error calculating memory usage, totalGB shows less than or "
+           "equal to 0GB"
+        << std::endl
+        << "Which is wrong.Report this if you see this message" << std::endl;
+  }
 
   return {usedGB, usedPercent};
 }
@@ -179,9 +190,15 @@ inline std::pair<float, float> getRamUsageGBPercent() {
 inline std::pair<float, float> getDiskUsageGBPercent() {
   struct statvfs stat;
   if (statvfs("/", &stat) != 0) {
+    std::cerr << "Error while running statvfs syscall,check if your linux "
+                 "kernel support this syscall or not."
+              << std::endl;
     return {0.0f, 0.0f};
   }
-
+  // TODO: This is great if we are only using root partiion drive for storage,
+  // But if we are using differnt partition for storage , this will not work.
+  // Fix this to work for multiple partitions and only checks the partition
+  // attached to storage.
   unsigned long long totalBytes =
       (unsigned long long)stat.f_blocks * stat.f_frsize;
   unsigned long long freeBytes =
@@ -220,25 +237,17 @@ inline std::pair<std::string, std::string> getNetworkBandwidthFormatted() {
 
 class CachedSystemMonitor {
 public:
-  static CachedSystemMonitor& instance() {
+  static CachedSystemMonitor &instance() {
     static CachedSystemMonitor inst;
     return inst;
   }
 
   /// Call periodically (e.g. every few seconds) to take a new sample.
-  /// This DOES call sleep(1) internally, so run from a thread or
-  /// coroutine that can afford it.
+  /// This is now completely non-blocking.
   void sample() {
-    // CPU: two snapshots 1s apart
-    auto cpu1 = readCpuStats();
-    auto net1 = readNetworkStats();
-    sleep(1);
-    auto cpu2 = readCpuStats();
-    auto net2 = readNetworkStats();
-
-    unsigned long long totalDiff = cpu2.getTotal() - cpu1.getTotal();
-    unsigned long long idleDiff = cpu2.getTotalIdle() - cpu1.getTotalIdle();
-    float cpu_pct = (totalDiff > 0) ? (float)(totalDiff - idleDiff) / totalDiff * 100.0f : 0.0f;
+    auto now = std::chrono::steady_clock::now();
+    auto curr_cpu = readCpuStats();
+    auto curr_net = readNetworkStats();
 
     // RAM
     auto [ramGB, ramPct] = getRamUsageGBPercent();
@@ -246,26 +255,47 @@ public:
     // Disk
     auto [diskGB, diskPct] = getDiskUsageGBPercent();
 
-    // Network
-    unsigned long long inBps  = (net2.rxBytes >= net1.rxBytes) ? (net2.rxBytes - net1.rxBytes) : 0;
-    unsigned long long outBps = (net2.txBytes >= net1.txBytes) ? (net2.txBytes - net1.txBytes) : 0;
+    std::lock_guard<std::mutex> lock(mu_);
+    
+    if (has_sample_) {
+      auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_time_).count();
+      if (duration > 0) {
+        unsigned long long totalDiff = curr_cpu.getTotal() - last_cpu_.getTotal();
+        unsigned long long idleDiff = curr_cpu.getTotalIdle() - last_cpu_.getTotalIdle();
+        float cpu_pct = (totalDiff > 0)
+                            ? (float)(totalDiff - idleDiff) / totalDiff * 100.0f
+                            : 0.0f;
 
-    std::string inFmt  = formatBandwidth(inBps);
-    std::string outFmt = formatBandwidth(outBps);
+        // Convert duration to seconds for bps calculation
+        double seconds = duration / 1000.0;
+        unsigned long long inBps = (curr_net.rxBytes >= last_net_.rxBytes) ? 
+            (curr_net.rxBytes - last_net_.rxBytes) / seconds : 0;
+        unsigned long long outBps = (curr_net.txBytes >= last_net_.txBytes) ? 
+            (curr_net.txBytes - last_net_.txBytes) / seconds : 0;
 
-    // Commit to cache atomically
-    {
-      std::lock_guard<std::mutex> lock(mu_);
-      cached_.cpu_usage    = cpu_pct;
-      cached_.ram_usage    = ramPct;
-      cached_.total_ram    = ramGB;
-      cached_.disk_usage   = diskPct;
-      cached_.network_in   = inFmt;
-      cached_.network_out  = outFmt;
-      cached_.network_in_bytes_per_sec  = inBps;
-      cached_.network_out_bytes_per_sec = outBps;
-      has_sample_ = true;
+        cached_.cpu_usage = cpu_pct;
+        cached_.network_in = formatBandwidth(inBps);
+        cached_.network_out = formatBandwidth(outBps);
+        cached_.network_in_bytes_per_sec = inBps;
+        cached_.network_out_bytes_per_sec = outBps;
+      }
+    } else {
+      // First sample, initialize with 0 for deltas
+      cached_.cpu_usage = 0.0f;
+      cached_.network_in = formatBandwidth(0);
+      cached_.network_out = formatBandwidth(0);
+      cached_.network_in_bytes_per_sec = 0;
+      cached_.network_out_bytes_per_sec = 0;
     }
+
+    cached_.ram_usage = ramPct;
+    cached_.total_ram = ramGB;
+    cached_.disk_usage = diskPct;
+
+    last_cpu_ = curr_cpu;
+    last_net_ = curr_net;
+    last_time_ = now;
+    has_sample_ = true;
   }
 
   /// Get the latest cached sample (never blocks).
@@ -284,6 +314,9 @@ private:
   mutable std::mutex mu_;
   system_usage cached_{};
   bool has_sample_ = false;
+  CpuStats last_cpu_{};
+  NetworkStats last_net_{};
+  std::chrono::steady_clock::time_point last_time_{};
 };
 
 /// Original blocking system_monitor (kept for backward compat).

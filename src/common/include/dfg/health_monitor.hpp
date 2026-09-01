@@ -53,49 +53,69 @@ public:
 
   // Update health record from a received heartbeat.
   void record_heartbeat(int server_id, const ServerHealth &health) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto &record = servers_[server_id];
-    bool was_unhealthy =
-        !record.is_healthy &&
-        record.last_heartbeat !=
-            std::chrono::steady_clock::time_point{}; // doesn't this should or?
+    RecoveredCallback cb;
+    ServerHealth record_copy;
+    bool trigger_recovered = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto &record = servers_[server_id];
+      bool was_unhealthy =
+          !record.is_healthy &&
+          record.last_heartbeat !=
+              std::chrono::steady_clock::time_point{};
 
-    record = health;
-    record.is_healthy =
-        true; // this will be true , this send from a live server
-    record.missed_heartbeats = 0;
-    record.last_heartbeat = std::chrono::steady_clock::now();
+      record = health;
+      record.is_healthy = true;
+      record.missed_heartbeats = 0;
+      record.last_heartbeat = std::chrono::steady_clock::now();
 
-    if (was_unhealthy && recovered_cb_) {
-      recovered_cb_(server_id, record);
+      if (was_unhealthy && recovered_cb_) {
+        trigger_recovered = true;
+        record_copy = record;
+        cb = recovered_cb_;
+      }
+    }
+    if (trigger_recovered && cb) {
+      cb(server_id, record_copy);
     }
   }
 
   /// Check all servers for stale heartbeats. Call this periodically.
   void check_health() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto now = std::chrono::steady_clock::now();
+    std::vector<std::pair<int, ServerHealth>> newly_unhealthy;
+    UnhealthyCallback cb;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto now = std::chrono::steady_clock::now();
 
-    for (auto &[sid, health] : servers_) {
-      if (health.last_heartbeat == std::chrono::steady_clock::time_point{})
-        continue;
+      for (auto &[sid, health] : servers_) {
+        if (health.last_heartbeat == std::chrono::steady_clock::time_point{})
+          continue;
 
-      auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                         now - health.last_heartbeat)
-                         .count();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                           now - health.last_heartbeat)
+                           .count();
 
-      if (elapsed > heartbeat_timeout_) {
-        health.missed_heartbeats++;
-        if (health.is_healthy &&
-            health.missed_heartbeats >= max_missed_heartbeats_) {
-          health.is_healthy = false;
-          std::cerr << "Server " << sid << " (" << health.ip
-                    << ") marked UNHEALTHY after " << health.missed_heartbeats
-                    << " missed heartbeats" << std::endl;
-          if (unhealthy_cb_) {
-            unhealthy_cb_(sid, health);
+        if (elapsed > heartbeat_timeout_) {
+          health.missed_heartbeats++;
+          if (health.is_healthy &&
+              health.missed_heartbeats >= max_missed_heartbeats_) {
+            health.is_healthy = false;
+            std::cerr << "Server " << sid << " (" << health.ip
+                      << ") marked UNHEALTHY after " << health.missed_heartbeats
+                      << " missed heartbeats" << std::endl;
+            if (unhealthy_cb_) {
+              newly_unhealthy.emplace_back(sid, health);
+              cb = unhealthy_cb_;
+            }
           }
         }
+      }
+    }
+
+    if (cb) {
+      for (const auto &[sid, health] : newly_unhealthy) {
+        cb(sid, health);
       }
     }
   }

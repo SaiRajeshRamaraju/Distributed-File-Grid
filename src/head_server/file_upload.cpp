@@ -5,9 +5,13 @@
 #include "file_transfer.pb.h"
 #include "redis_handler.hpp"
 #include <dfg/config_loader.hpp>
-#include <dfg/heart_beat_signal.hpp>
+#include <dfg/async_net.hpp>
 #include <dfg/net_utils.hpp>
+#include <dfg/sha256.hpp>
 #include <dfg/thread_pool.hpp>
+#include <dfg/health_monitor.hpp>
+
+extern std::unique_ptr<dfg::HealthMonitor> g_health_monitor;
 
 #include <algorithm>
 #include <atomic>
@@ -77,23 +81,54 @@ private:
   }
 
   std::string calculate_checksum(const std::vector<char> &data) {
-    // Simple checksum - in production use SHA256
-    size_t hash = 0;
-    for (char c : data) {
-      hash = hash * 31 + static_cast<size_t>(c);
-    }
-    std::stringstream ss;
-    ss << std::hex << hash;
-    return ss.str();
+    return dfg::hash::sha256(data);
   }
 
   std::vector<std::string> select_servers_for_chunk(int replication_factor) {
     std::vector<std::string> selected;
-    std::random_device rd;
-    std::mt19937 gen(rd());
 
     auto servers_copy = cluster_servers;
-    std::shuffle(servers_copy.begin(), servers_copy.end(), gen);
+    
+    // Sort by lowest disk usage and filter healthy servers
+    if (g_health_monitor) {
+        auto health_map = g_health_monitor->get_all_health();
+        std::vector<std::string> healthy_servers;
+        for (const auto &srv : servers_copy) {
+            std::string ip;
+            int port;
+            dfg::net::parse_address(srv, ip, port);
+            bool found = false;
+            bool is_healthy = false;
+            for (const auto& [id, health] : health_map) {
+                if (health.ip == ip || health.ip == srv) {
+                    found = true;
+                    is_healthy = health.is_healthy;
+                    break;
+                }
+            }
+            if (!found || is_healthy) {
+                healthy_servers.push_back(srv);
+            }
+        }
+        
+        std::vector<std::string> candidate_servers = !healthy_servers.empty() ? healthy_servers : servers_copy;
+        
+        std::sort(candidate_servers.begin(), candidate_servers.end(), [&health_map](const std::string& a, const std::string& b) {
+            std::string ip_a, ip_b;
+            int port_a, port_b;
+            dfg::net::parse_address(a, ip_a, port_a);
+            dfg::net::parse_address(b, ip_b, port_b);
+            float disk_a = 100.0f;
+            float disk_b = 100.0f;
+            
+            for (const auto& [id, health] : health_map) {
+                if (health.ip == ip_a || health.ip == a) disk_a = health.disk_usage;
+                if (health.ip == ip_b || health.ip == b) disk_b = health.disk_usage;
+            }
+            return disk_a < disk_b;
+        });
+        servers_copy = candidate_servers;
+    }
 
     int count =
         std::min(replication_factor, static_cast<int>(servers_copy.size()));
@@ -230,10 +265,11 @@ private:
   }
 
 public:
-  std::vector<ChunkInfo> split_and_store_file(const std::string &filepath,
+  std::pair<std::vector<ChunkInfo>, std::string> split_and_store_file(const std::string &filepath,
                                               const std::string &filename) {
     load_cluster_servers();
     std::vector<ChunkInfo> chunks;
+    std::string file_hash_str;
 
     const size_t CHUNK_SIZE = config_chunk_size();
     const int replication_factor = config_replication_factor();
@@ -241,7 +277,7 @@ public:
     int fd = ::open(filepath.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
       std::cerr << "Failed to open file: " << filepath << std::endl;
-      return chunks;
+      return {chunks, ""};
     }
 
     off_t file_size = ::lseek(fd, 0, SEEK_END);
@@ -264,6 +300,8 @@ public:
       size_t size;
     };
     std::vector<PendingTransfer> pending;
+    
+    dfg::hash::SHA256 full_file_hash;
 
     while (bytes_read < static_cast<size_t>(file_size)) {
       size_t current_chunk_size =
@@ -279,13 +317,15 @@ public:
             continue;
           std::cerr << "Read error: " << strerror(errno) << std::endl;
           ::close(fd);
-          return chunks;
+          return {chunks, ""};
         }
         if (n == 0)
           break;
         total_read += static_cast<size_t>(n);
       }
       bytes_read += total_read;
+      
+      full_file_hash.update(*chunk_data);
 
       std::string checksum = calculate_checksum(*chunk_data);
       auto selected_servers = select_servers_for_chunk(replication_factor);
@@ -309,6 +349,8 @@ public:
     }
 
     ::close(fd);
+    
+    file_hash_str = full_file_hash.digest();
 
     // Wait for all concurrent transfers and collect results
     std::cout << "Waiting for " << pending.size()
@@ -334,18 +376,19 @@ public:
     // Print chunk distribution status table
     print_chunk_distribution(filename, all_results, chunk_id);
 
-    return chunks;
+    return {chunks, file_hash_str};
   }
 
   void store_metadata(const std::string &filename,
-                      const std::vector<ChunkInfo> &chunks) {
+                      const std::vector<ChunkInfo> &chunks, const std::string& file_hash) {
     std::stringstream request;
     request << filename << "\n";
     request << "TTL=3600\n";
+    request << "HASH=" << file_hash << "\n";
 
     for (const auto &chunk : chunks) {
       request << chunk.chunk_id << " " << chunk.server_ip << " "
-              << chunk.file_path << "\n";
+              << chunk.file_path << " " << chunk.checksum << "\n";
     }
 
     create_entry(request.str());
@@ -358,12 +401,17 @@ static FileChunker g_file_chunker;
 
 int process_file_upload(const char *filepath, const char *filename) {
   try {
-    auto chunks = g_file_chunker.split_and_store_file(filepath, filename);
-    if (chunks.empty()) {
+    struct stat st;
+    if (stat(filepath, &st) != 0) {
+      std::cerr << "File not found: " << filepath << std::endl;
+      return -1;
+    }
+    auto [chunks, file_hash] = g_file_chunker.split_and_store_file(filepath, filename);
+    if (st.st_size > 0 && chunks.empty()) {
       return -1;
     }
 
-    g_file_chunker.store_metadata(filename, chunks);
+    g_file_chunker.store_metadata(filename, chunks, file_hash);
     return 0;
   } catch (const std::exception &e) {
     std::cerr << "Error processing file upload: " << e.what() << std::endl;

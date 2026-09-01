@@ -67,7 +67,9 @@ MetricsExporter::MetricsExporter(const std::string &bind_address)
 void MetricsExporter::update_connections(int count) {
   active_connections_.Set(count);
 }
-// TODO: Add network for this ass well
+
+// NOTE: No need for network logs as part of heartbeat
+// this is idiocy on it's highest level if I evern thing I need it.
 void MetricsExporter::update_system_metrics(float cpu, float ram, float disk) {
   cpu_usage_.Set(cpu);
   ram_usage_.Set(ram);

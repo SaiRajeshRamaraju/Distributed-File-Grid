@@ -1,4 +1,5 @@
-#include <dfg/heart_beat_signal.hpp>
+#include <dfg/async_net.hpp>
+#include <dfg/zookeeper_client.hpp>
 #include <dfg/system_info.hpp>
 #include <dfg/version.hpp>
 #include "../head_server/redis_handler.hpp"
@@ -48,6 +49,7 @@ private:
     prometheus::Counter& heartbeats_received_;
     prometheus::Counter& servers_marked_unhealthy_;
     prometheus::Counter& servers_recovered_;
+    ZooKeeperClient zk_client_;
     prometheus::Counter& replications_triggered_;
     prometheus::Gauge& healthy_server_count_;
     
@@ -129,13 +131,25 @@ private:
                 health.missed_heartbeats++;
                 
                 if (health.missed_heartbeats >= max_missed_heartbeats_ && health.is_healthy) {
-                    health.is_healthy = false;
-                    servers_marked_unhealthy_.Increment();
-                    std::cout << "Server " << server_id << " marked as unhealthy (missed " 
-                             << health.missed_heartbeats << " heartbeats)" << std::endl;
-                    
-                    // Trigger re-replication for failed server
-                    trigger_replication(server_id);
+                    // Check Zookeeper before marking dead!
+                    if (!zk_client_.is_connected()) {
+                        zk_client_.connect();
+                    }
+                    std::string znode = "/dfg/cluster_servers/server_" + std::to_string(server_id);
+                    if (!zk_client_.node_exists(znode)) {
+                        health.is_healthy = false;
+                        servers_marked_unhealthy_.Increment();
+                        std::cout << "Server " << server_id << " marked as DEAD (missed " 
+                                 << health.missed_heartbeats << " heartbeats and ZNode absent)" << std::endl;
+                        
+                        // "give permission to create a new cluster server that register with headserver."
+                        std::cout << "Granted permission to create new cluster server replacement for " << server_id << std::endl;
+                        
+                        // Trigger re-replication for failed server
+                        trigger_replication(server_id);
+                    } else {
+                        std::cout << "Server " << server_id << " missed heartbeats but ZNode still exists, waiting..." << std::endl;
+                    }
                 }
             } else {
                 if (!health.is_healthy && health.missed_heartbeats > 0) {
@@ -184,35 +198,12 @@ private:
         int chunks_queued = 0;
 
         for (const auto& filename : all_files) {
-            // Redirect read_entry output to capture chunk listing
-            std::streambuf* orig = std::cout.rdbuf();
-            std::ostringstream captured;
-            std::cout.rdbuf(captured.rdbuf());
-            read_entry(filename);
-            std::cout.rdbuf(orig);
-
-            std::string output = captured.str();
-            // Parse for chunks on the failed server
-            std::istringstream iss(output);
-            std::string line;
-            while (std::getline(iss, line)) {
-                if (line.find("server=" + failed_prefix) != std::string::npos) {
-                    // This chunk was on the failed server — extract chunk_id
-                    size_t cpos = line.find("chunk:");
-                    if (cpos != std::string::npos) {
-                        std::string chunk_str = line.substr(cpos + 6);
-                        size_t space = chunk_str.find(' ');
-                        if (space != std::string::npos) {
-                            int chunk_id = std::stoi(chunk_str.substr(0, space));
-                            std::cout << "  -> Chunk " << chunk_id << " of file '"
-                                     << filename << "' needs re-replication" << std::endl;
-                            chunks_queued++;
-                            // Production workflow:
-                            //   a) Fetch this chunk from another healthy replica
-                            //   b) Send it to a target in healthy_targets
-                            //   c) Update metadata with the new location
-                        }
-                    }
+            auto rec = query_metadata(filename);
+            for (const auto& chunk : rec.chunks) {
+                if (chunk.server.find(failed_prefix) != std::string::npos) {
+                    std::cout << "  -> Chunk " << chunk.chunk_id << " of file '"
+                             << filename << "' needs re-replication" << std::endl;
+                    chunks_queued++;
                 }
             }
         }
@@ -280,6 +271,7 @@ public:
               .Name("hc_servers_marked_unhealthy_total")
               .Help("Total times a server was marked unhealthy")
               .Register(*registry_).Add({})),
+          zk_client_("127.0.0.1:2181"),
           servers_recovered_(prometheus::BuildCounter()
               .Name("hc_servers_recovered_total")
               .Help("Total times a server recovered")
@@ -319,6 +311,63 @@ public:
     {
         exposer_->RegisterCollectable(registry_);
     }
+    void ui_server() {
+        int lfd = socket(AF_INET, SOCK_STREAM, 0);
+        int opt = 1;
+        setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(9098);
+        addr.sin_addr.s_addr = INADDR_ANY;
+        
+        if (bind(lfd, (sockaddr*)&addr, sizeof(addr)) < 0) {
+            std::cerr << "Failed to bind UI server on port 9098" << std::endl;
+            close(lfd);
+            return;
+        }
+        listen(lfd, 10);
+        
+        while (running) {
+            // Use select to make accept interruptible
+            fd_set fds;
+            FD_ZERO(&fds);
+            FD_SET(lfd, &fds);
+            timeval tv{1, 0}; // 1 second timeout
+            
+            if (select(lfd + 1, &fds, nullptr, nullptr, &tv) > 0) {
+                int cfd = accept(lfd, nullptr, nullptr);
+                if (cfd < 0) continue;
+                
+                std::string response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n";
+                response += "<html><head><title>Health Checker UI</title><meta http-equiv=\"refresh\" content=\"5\"><style>body{font-family:sans-serif;} table{border-collapse:collapse;width:100%;} th,td{border:1px solid #ddd;padding:8px;text-align:left;} th{background-color:#f2f2f2;}</style></head><body>";
+                response += "<h1>Cluster Server Health Status</h1>";
+                response += "<table><tr><th>Server ID</th><th>IP</th><th>CPU (%)</th><th>RAM (%)</th><th>Disk (%)</th><th>Net In</th><th>Net Out</th><th>Status</th></tr>";
+                
+                auto servers_status = get_server_status();
+                for (const auto& s : servers_status) {
+                    std::string status_color = s.is_healthy ? "green" : "red";
+                    std::string status_text = s.is_healthy ? "Healthy" : "Unhealthy";
+                    response += "<tr><td>" + std::to_string(s.server_id) + "</td>"
+                             + "<td>" + s.ip + "</td>"
+                             + "<td>" + std::to_string(s.cpu_usage) + "</td>"
+                             + "<td>" + std::to_string(s.ram_usage) + "</td>"
+                             + "<td>" + std::to_string(s.disk_usage) + "</td>"
+                             + "<td>" + s.network_in + "</td>"
+                             + "<td>" + s.network_out + "</td>"
+                             + "<td style=\"color:" + status_color + ";font-weight:bold;\">" + status_text + "</td></tr>";
+                }
+                
+                response += "</table></body></html>";
+                
+                send(cfd, response.c_str(), response.size(), 0);
+                close(cfd);
+            }
+        }
+        close(lfd);
+    }
+    
+    std::thread ui_thread;
+
     void start() {
         running = true;
 
@@ -338,8 +387,11 @@ public:
         std::cout << "  Heartbeat Timeout:      " << heartbeat_timeout_.count() << "s" << std::endl;
         std::cout << "  Max Missed Heartbeats:  " << max_missed_heartbeats_ << std::endl;
         std::cout << "  Prometheus Metrics:     0.0.0.0:9096/metrics" << std::endl;
+        std::cout << "  Web UI:                 http://0.0.0.0:9098" << std::endl;
         std::cout << std::endl;
         
+        ui_thread = std::thread(&HealthChecker::ui_server, this);
+
         async_hb::Reactor reactor;
         
         // Start heartbeat receiver
@@ -354,6 +406,7 @@ public:
     
     void stop() {
         running = false;
+        if (ui_thread.joinable()) ui_thread.join();
         std::cout << "Stopping Health Checker service" << std::endl;
     }
     

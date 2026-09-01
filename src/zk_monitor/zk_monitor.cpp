@@ -160,7 +160,7 @@ public:
   }
 
   void cleanup_ephemeral_nodes() {
-    // WARNING: In a real implementation, ephemeral nodes are automatically
+    // NOTE: In a real implementation, ephemeral nodes are automatically
     // removed by ZooKeeper when the session ends, so we don't need to do
     // anything here.
   }
@@ -766,6 +766,107 @@ public:
     std::cout << "Prometheus metrics available on 0.0.0.0:9097/metrics"
               << std::endl;
   }
+  void master_api_server() {
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1;
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(9680);
+    addr.sin_addr.s_addr = INADDR_ANY;
+    if (bind(lfd, (sockaddr*)&addr, sizeof(addr)) < 0) {
+        std::cerr << "Failed to bind master API server on port 9680" << std::endl;
+        close(lfd);
+        return;
+    }
+    listen(lfd, 10);
+    std::cout << "Master Plane API listening on port 9680" << std::endl;
+    
+    while (running) {
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(lfd, &fds);
+        timeval tv{1, 0};
+        if (select(lfd + 1, &fds, nullptr, nullptr, &tv) > 0) {
+            int cfd = accept(lfd, nullptr, nullptr);
+            if (cfd < 0) continue;
+            
+            char buf[4096] = {0};
+            recv(cfd, buf, sizeof(buf)-1, 0);
+            std::string req(buf);
+            std::istringstream iss(req);
+            std::string method, path;
+            iss >> method >> path;
+            
+            std::string response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n";
+            if (path == "/api/v1/master/head_servers") {
+                std::lock_guard<std::mutex> lock(servers_mutex);
+                std::string json = "{\"head_servers\":[";
+                bool first = true;
+                for (const auto& [id, info] : head_servers) {
+                    if (!first) json += ",";
+                    first = false;
+                    json += "{\"id\":\"" + id + "\",\"ip\":\"" + info.ip_address + "\",\"port\":" + std::to_string(info.port) + ",\"status\":\"" + info.status + "\",\"is_leader\":" + (info.is_leader ? "true" : "false") + "}";
+                }
+                json += "]}";
+                response += json;
+            } else if (path.find("/api/v1/master/znode") == 0) {
+                std::string query = "";
+                auto qpos = path.find('?');
+                if (qpos != std::string::npos) {
+                    query = path.substr(qpos + 1);
+                    path = path.substr(0, qpos);
+                }
+                std::string zpath = "";
+                if (query.find("path=") == 0) {
+                    zpath = query.substr(5);
+                }
+                if (zpath.empty()) {
+                    response = "HTTP/1.1 400 Bad Request\r\n\r\n{\"error\":\"Missing path parameter\"}";
+                } else {
+                    if (method == "GET") {
+                        std::string data = zk_client->get_node_data(zpath);
+                        response += "{\"path\":\"" + zpath + "\",\"data\":\"" + data + "\"}";
+                    } else if (method == "DELETE") {
+                        bool success = zk_client->delete_node(zpath);
+                        response += "{\"success\":" + std::string(success ? "true" : "false") + "}";
+                    } else if (method == "POST") {
+                        // Very simple JSON parse for {"data":"..."}
+                        std::string body;
+                        auto body_start = req.find("\r\n\r\n");
+                        if (body_start != std::string::npos) {
+                            body = req.substr(body_start + 4);
+                        }
+                        std::string zdata = "";
+                        auto data_pos = body.find("\"data\":\"");
+                        if (data_pos != std::string::npos) {
+                            auto end_pos = body.find("\"", data_pos + 8);
+                            if (end_pos != std::string::npos) {
+                                zdata = body.substr(data_pos + 8, end_pos - (data_pos + 8));
+                            }
+                        }
+                        bool success = false;
+                        if (zk_client->node_exists(zpath)) {
+                            success = zk_client->update_node(zpath, zdata);
+                        } else {
+                            success = zk_client->create_node(zpath, zdata, false);
+                        }
+                        response += "{\"success\":" + std::string(success ? "true" : "false") + "}";
+                    }
+                }
+            } else {
+                response = "HTTP/1.1 404 Not Found\r\n\r\n{\"error\":\"Not Found\"}";
+            }
+            
+            send(cfd, response.c_str(), response.size(), 0);
+            close(cfd);
+        }
+    }
+    close(lfd);
+  }
+
+  std::thread master_api_thread;
+
   void start() {
     running = true;
     std::cout << "Starting ZooKeeper Head Server Monitor..." << std::endl;
@@ -776,6 +877,8 @@ public:
     std::thread monitor_thread(&ZooKeeperHeadServerMonitor::monitor_loop, this);
     monitor_thread.detach();
 
+    master_api_thread = std::thread(&ZooKeeperHeadServerMonitor::master_api_server, this);
+
     std::cout << "ZooKeeper Head Server Monitor started with ID: " << monitor_id
               << std::endl;
   }
@@ -783,6 +886,9 @@ public:
   void stop() {
     running = false;
     std::cout << "Stopping ZooKeeper Head Server Monitor..." << std::endl;
+    if (master_api_thread.joinable()) {
+        master_api_thread.join();
+    }
   }
 
   void simulate_head_server_registration(const std::string &server_id,

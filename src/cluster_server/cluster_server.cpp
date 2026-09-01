@@ -3,7 +3,7 @@
 // On startup, self-registers with the head server's control API.
 
 #include <dfg/config_loader.hpp>
-#include <dfg/heart_beat_signal.hpp>
+#include <dfg/async_net.hpp>
 #include <dfg/net_utils.hpp>
 #include <dfg/version.hpp>
 
@@ -18,8 +18,51 @@
 #include <sstream>
 #include <thread>
 #include <unistd.h>
+#include <dfg/zookeeper_client.hpp>
+#include <atomic>
+#include <signal.h>
 
-// Forward declaration from async_file_recv.cpp
+// Forward declaration from chunk_service.cpp
+
+static bool self_register_with_head(const std::string &head_host, int head_control_port, int server_id, const std::string &ip, int port);
+
+std::atomic<bool> g_is_dead_process(false);
+
+void liveness_monitor(const std::string& zk_hosts, const std::string& head_host, int head_port, int server_id, const std::string& ip, int port) {
+    ZooKeeperClient zk(zk_hosts);
+    bool zk_init = zk.connect();
+    std::string znode = "/dfg/cluster_servers/server_" + std::to_string(server_id);
+    if (zk_init) {
+        if (!zk.node_exists("/dfg/cluster_servers")) {
+            zk.create_node("/dfg/cluster_servers", "");
+        }
+        zk.create_node(znode, ip + ":" + std::to_string(port), true, false); // Ephemeral
+    }
+    
+    int consecutive_failures = 0;
+    while (!g_is_dead_process) {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        
+        bool zk_ok = zk.is_connected() && zk.node_exists(znode);
+        if (!zk_ok && zk.connect()) {
+            zk.create_node(znode, ip + ":" + std::to_string(port), true, false);
+            zk_ok = zk.is_connected() && zk.node_exists(znode);
+        }
+        
+        // ping head server
+        bool head_ok = self_register_with_head(head_host, head_port, server_id, ip, port);
+        
+        if (!zk_ok && !head_ok) {
+            consecutive_failures++;
+            if (consecutive_failures >= 6) {
+                std::cerr << "\n[WARN] Lost connection to ZooKeeper and Head Server for 30s. Retrying..." << std::endl;
+            }
+        } else {
+            consecutive_failures = 0;
+        }
+    }
+}
+
 int start_cluster_server(int server_id, const char *ip, int port);
 
 static std::string chooseLanAddress() {
@@ -100,8 +143,8 @@ static bool self_register_with_head(const std::string &head_host,
       << "Host: " << head_host << "\r\n"
       << "Content-Type: application/json\r\n"
       << "Content-Length: " << body_str.size() << "\r\n"
-      << "Connection: close\r\n"
-      << "\r\n// what about head server or zk server" << body_str;
+      << "Connection: close\r\n\r\n"
+      << body_str;
 
   std::string request = req.str();
   if (!dfg::net::send_all(sock, request.data(), request.size())) {
@@ -110,11 +153,24 @@ static bool self_register_with_head(const std::string &head_host,
     return false;
   }
 
-  char resp[1024] = {};
-  ::recv(sock, resp, sizeof(resp) - 1, 0);
-  ::close(sock);
+  fd_set rfds;
+  FD_ZERO(&rfds);
+  FD_SET(sock, &rfds);
+  struct timeval tv = {5, 0};
+  int sel = ::select(sock + 1, &rfds, nullptr, nullptr, &tv);
+  if (sel <= 0) {
+    ::close(sock);
+    return false;
+  }
 
-  std::string response(resp);
+  char resp[1024] = {};
+  ssize_t n = ::recv(sock, resp, sizeof(resp) - 1, 0);
+  ::close(sock);
+  if (n <= 0) {
+    return false;
+  }
+
+  std::string response(resp, n);
   if (response.find("200") != std::string::npos ||
       response.find("201") != std::string::npos) {
     std::cout << "✅ Self-registered with head server at " << head_host << ":"
@@ -155,6 +211,7 @@ int main(int argc, char **argv) {
   std::string ip = cfg.get_string("server.host", "");
   int port = cfg.get_int("server.port", 8080);
   bool should_register = true;
+  std::string zk_hosts_arg = "";
 
   for (int i = 1; i < argc; i++) {
     std::string current_arg = argv[i];
@@ -166,6 +223,8 @@ int main(int argc, char **argv) {
       ip = argv[++i];
     else if (current_arg == "--no-register")
       should_register = false;
+    else if (current_arg == "--zk-hosts" && i + 1 < argc)
+      zk_hosts_arg = argv[++i];
   }
 
   if (ip.empty() || ip == "0.0.0.0") {
@@ -200,11 +259,12 @@ int main(int argc, char **argv) {
             << cfg.get_int("heartbeat.target_port", 9000) << std::endl;
   std::cout << std::endl;
 
+  std::string head_host = cfg.get_string("head_server.host", "127.0.0.1");
+  int head_control_port = cfg.get_int("head_server.control_port", 9670);
+  std::string zk_hosts = zk_hosts_arg.empty() ? cfg.get_string("zookeeper.hosts", "127.0.0.1:2181") : zk_hosts_arg;
+
   // Self-register with head server
   if (should_register) {
-    std::string head_host = cfg.get_string("head_server.host", "127.0.0.1");
-    int head_control_port = cfg.get_int("head_server.control_port", 9670);
-
     // Try registration in background (don't block startup)
     std::thread reg_thread(
         [head_host, head_control_port, server_id, ip, port]() {
@@ -224,5 +284,10 @@ int main(int argc, char **argv) {
         });
     reg_thread.detach();
   }
+
+  // Start liveness monitor for Zookeeper and Head Server
+  std::thread monitor_thread(liveness_monitor, zk_hosts, head_host, head_control_port, server_id, ip, port);
+  monitor_thread.detach();
+
   return start_cluster_server(server_id, ip.c_str(), port);
 }
