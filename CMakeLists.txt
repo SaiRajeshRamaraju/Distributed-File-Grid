@@ -74,4 +74,5 @@ add_subdirectory(src)
 # ── Tests ──
 if(BUILD_TESTS)
     add_subdirectory(tests)
+    add_subdirectory(e2e)
 endif()

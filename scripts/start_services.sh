@@ -132,9 +132,9 @@ start_service "head_server" "$BUILD_DIR/head_server" "" || exit 1
 echo ""
 
 # Start Cluster Servers
-start_service "cluster_server_1" "$BUILD_DIR/cluster_server" "--server-id 1 --port 8080" || exit 1
-start_service "cluster_server_2" "$BUILD_DIR/cluster_server" "--server-id 2 --port 8081" || exit 1
-start_service "cluster_server_3" "$BUILD_DIR/cluster_server" "--server-id 3 --port 8082" || exit 1
+start_service "cluster_server_1" "$BUILD_DIR/cluster_server" "--server-id 1 --ip 127.0.0.1 --port 8080" || exit 1
+start_service "cluster_server_2" "$BUILD_DIR/cluster_server" "--server-id 2 --ip 127.0.0.1 --port 8081" || exit 1
+start_service "cluster_server_3" "$BUILD_DIR/cluster_server" "--server-id 3 --ip 127.0.0.1 --port 8082" || exit 1
 echo ""
 
 echo -e "${GREEN}=== All services started successfully! ===${NC}"

@@ -22,7 +22,17 @@ int main(int argc, char* argv[]) {
     }
 
     std::string ip = argv[1];
-    int port = std::stoi(argv[2]);
+    int port = 0;
+    try {
+        port = std::stoi(argv[2]);
+        if (port <= 0 || port > 65535) {
+            std::cerr << "Invalid port number: " << argv[2] << " (must be 1-65535)" << std::endl;
+            return 1;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Invalid port number '" << argv[2] << "': " << e.what() << std::endl;
+        return 1;
+    }
     std::string filename = argv[3];
     std::string output_path = argv[4];
 

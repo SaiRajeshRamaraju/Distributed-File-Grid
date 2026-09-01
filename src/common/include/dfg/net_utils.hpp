@@ -93,25 +93,33 @@ inline int connect_with_timeout(const std::string &ip, int port,
 
   int rc = ::connect(sock, reinterpret_cast<sockaddr *>(&serv_addr),
                      sizeof(serv_addr));
-  if (rc < 0 && errno == EINPROGRESS) {
-    fd_set wfds;
-    FD_ZERO(&wfds);
-    FD_SET(sock, &wfds);
-    struct timeval tv = {timeout_sec, 0};
-    rc = ::select(sock + 1, nullptr, &wfds, nullptr, &tv);
-    if (rc <= 0) {
+  if (rc < 0) {
+    if (errno == EINPROGRESS) {
+      fd_set wfds;
+      FD_ZERO(&wfds);
+      FD_SET(sock, &wfds);
+      struct timeval tv = {timeout_sec, 0};
+      rc = ::select(sock + 1, nullptr, &wfds, nullptr, &tv);
+      if (rc <= 0) {
+        ::close(sock);
+        return -1;
+      }
+      int err = 0;
+      socklen_t len = sizeof(err);
+      if (::getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
+        ::close(sock);
+        return -1;
+      }
+    } else {
       ::close(sock);
       return -1;
     }
-    int err = 0;
-    socklen_t len = sizeof(err);
-    if (::getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
-      ::close(sock);
-      return -1;
-    }
-  } else if (rc < 0) {
-    ::close(sock);
-    return -1;
+  }
+
+  // Restore blocking mode so callers have a standard connected stream socket
+  int flags = ::fcntl(sock, F_GETFL, 0);
+  if (flags >= 0) {
+    ::fcntl(sock, F_SETFL, flags & ~O_NONBLOCK);
   }
 
   return sock;

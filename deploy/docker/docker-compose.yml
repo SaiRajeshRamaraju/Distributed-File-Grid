@@ -115,6 +115,7 @@ services:
     container_name: dfg-cluster-server-1
     ports:
       - "8080:8080"
+      - "8180:8180"  # Chunk transfer port
       - "9091:9091"  # Prometheus metrics
     environment:
       - SERVER_ID=1
@@ -145,7 +146,8 @@ services:
     hostname: cluster-server-2
     container_name: dfg-cluster-server-2
     ports:
-      - "8083:8081"
+      - "8081:8081"
+      - "8181:8181"  # Chunk transfer port
       - "9092:9091"  # Prometheus metrics
     environment:
       - SERVER_ID=2
@@ -177,6 +179,7 @@ services:
     container_name: dfg-cluster-server-3
     ports:
       - "8082:8082"
+      - "8182:8182"  # Chunk transfer port
       - "9093:9091"  # Prometheus metrics
     environment:
       - SERVER_ID=3

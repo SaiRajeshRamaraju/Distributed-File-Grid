@@ -213,6 +213,17 @@ public:
         
         auto [chunk_locations, file_hash] = get_chunk_locations_from_metadata(filename);
         if (chunk_locations.empty()) {
+            if (!file_hash.empty()) {
+                // 0-byte empty file: create empty target file and exit successfully
+                int out_fd = ::open(output_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+                if (out_fd < 0) {
+                    std::cerr << "Failed to create output file: " << output_path << std::endl;
+                    return false;
+                }
+                ::close(out_fd);
+                std::cout << "0-byte file reconstructed successfully: " << output_path << std::endl;
+                return true;
+            }
             std::cerr << "No chunks found for file: " << filename << std::endl;
             return false;
         }
@@ -395,6 +406,11 @@ public:
     bool stream_file_to_client(const std::string& filename, int fd) {
         auto [chunk_locations, file_hash] = get_chunk_locations_from_metadata(filename);
         if (chunk_locations.empty()) {
+            if (!file_hash.empty()) {
+                std::string header = "FILE_HASH " + file_hash + "\nEOF\n";
+                ::send(fd, header.data(), header.size(), 0);
+                return true;
+            }
             std::string err = "ERROR: No chunks found for file\n";
             ::send(fd, err.data(), err.size(), 0);
             return false;
@@ -526,7 +542,7 @@ public:
 
     bool file_exists(const std::string& filename) {
         auto [chunk_locations, file_hash] = get_chunk_locations_from_metadata(filename);
-        return !chunk_locations.empty();
+        return !chunk_locations.empty() || !file_hash.empty();
     }
 };
 

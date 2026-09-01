@@ -30,6 +30,19 @@
 // Suspends the coroutine, polls the future on reactor ticks via a timerfd,
 // and resumes once the result is ready.
 template <typename T>
+static async_hb::task poll_future_awaiter(async_hb::Reactor* rx,
+                                          std::shared_future<T> f,
+                                          std::coroutine_handle<> target_h) {
+    while (f.wait_for(std::chrono::microseconds(0)) != std::future_status::ready) {
+        co_await rx->sleep_for(std::chrono::milliseconds(1));
+    }
+    if (target_h && !target_h.done()) {
+        target_h.resume();
+    }
+    co_return;
+}
+
+template <typename T>
 struct FutureAwaiter {
     std::shared_future<T> fut;
     async_hb::Reactor* reactor;
@@ -39,20 +52,7 @@ struct FutureAwaiter {
     }
 
     void await_suspend(std::coroutine_handle<> h) {
-        auto r = reactor;
-        auto shared_h = std::make_shared<std::coroutine_handle<>>(h);
-        
-        auto poll = [r, f = fut, shared_h](async_hb::Reactor& rx) -> async_hb::task {
-            while (f.wait_for(std::chrono::microseconds(0)) != std::future_status::ready) {
-                co_await rx.sleep_for(std::chrono::milliseconds(1));
-            }
-            if (*shared_h && !shared_h->done()) {
-                shared_h->resume();
-            }
-            co_return;
-        };
-
-        reactor->spawn(poll(*reactor));
+        reactor->spawn(poll_future_awaiter(reactor, fut, h));
     }
 
     T await_resume() {
@@ -84,30 +84,17 @@ private:
   std::mutex registry_mutex;
 
   int ensure_storage_directory() {
-    // Resolve script path relative to the executable (build/../scripts/)
-    fs::path exe_dir = fs::read_symlink("/proc/self/exe").parent_path();
-    fs::path script = (exe_dir / "../scripts/make_directory.sh").lexically_normal();
-    std::string cmd = "bash " + script.string() + " 2>&1";
-    FILE *pipe = popen(cmd.c_str(), "r");
-    if (!pipe) {
-      std::cerr << "popen failed to create pipe and run bash script"
-                << std::endl;
-      return -1;
-    }
-    std::array<char, 128> buffer;
-    std::string output;
-    while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
-      output += buffer.data();
-    }
-    int returnCode = pclose(pipe);
-    int exitStatus = WEXITSTATUS(returnCode);
-    if (exitStatus != 0) {
-      std::cerr << std::format("BASH script error (EXIT code \"{}\")\n {}",
-                               exitStatus, output)
-                << std::endl;
-      return -1;
-    } else {
-      std::cout << output << std::endl;
+    std::error_code ec;
+    fs::create_directories(storage_path, ec);
+    if (ec || ::access(storage_path.c_str(), W_OK) != 0) {
+      // Fallback to writable temporary storage path
+      storage_path = "/tmp/cluster_storage/";
+      fs::create_directories(storage_path, ec);
+      if (ec || ::access(storage_path.c_str(), W_OK) != 0) {
+        std::cerr << "Failed to create or access storage directory: "
+                  << storage_path << std::endl;
+        return -1;
+      }
     }
     return 0;
   }
