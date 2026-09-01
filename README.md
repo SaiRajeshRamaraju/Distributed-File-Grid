@@ -1,19 +1,101 @@
 # Distributed File Grid
 
-A distributed file storage system that splits files into chunks, each chunk is replicated across a cluster of servers, and reassembles them on demand.
+A high-performance, fault-tolerant distributed file storage grid in modern **C++20**. Files are chunked into 64 MB blocks, replicated across storage nodes, and reassembled on demand with cryptographic integrity verification, consensus voting, and read-repair.
+
 ---
+
 ## What It Does
 
-You give it a file. It breaks it into 64 MB chunks, spreads those chunks across multiple storage nodes with configurable replication, and stitches them back together when you ask for the file again.
+- **Chunking & Replication**: Splits files into configurable chunks (default: 64 MB), replicates each chunk across $N$ storage nodes (default: 3), and computes SHA-256 digests for end-to-end data integrity.
+- **Consensus & Read Repair**: File downloads query chunk hashes across replicas, vote on consensus hashes, and automatically trigger background read-repairs if an out-of-sync or corrupted chunk is detected.
+- **Dynamic Cluster Membership**: Cluster storage servers self-register dynamically with the Head Server's Control API (`:9670`).
+- **Heartbeat & System Monitoring**: Storage nodes emit real-time system metrics (CPU, RAM, Disk, Network) to the Health Checker.
+- **High Availability & Leader Election**: Integrated in-memory ZooKeeper client enables leader election and head server failover.
+- **Observability**: Exposes native Prometheus metrics across all nodes and provides pre-configured Grafana dashboards with Loki log aggregation.
 
-Behind the scenes:
+---
 
-- A **head server** manages metadata and orchestrates uploads/downloads
-- **Cluster servers** store the actual chunks and report their health via heartbeats
-- A **health checker** watches over the cluster and flags unhealthy nodes
-- An optional **ZooKeeper monitor** handles leader election when running multiple head servers
+## Architecture
 
-Everything talks over Protocol Buffers. Metrics are exported to Prometheus. Dashboards are pre-configured for Grafana.
+```
+                                  ┌───────────────────────────┐
+                                  │      dfg Unified CLI      │
+                                  └─────────────┬─────────────┘
+                                                │
+                                   TCP Commands / Operations
+                                                │
+                                  ┌─────────────▼─────────────┐
+                                  │        Head Server        │
+                                  │  - Metadata Store         │
+                                  │  - Chunk Placement Engine │
+                                  │  - Control API (:9670)    │
+                                  │  - Metrics (:9095)        │
+                                  └──────┬──────────┬────────┬┘
+                                         │          │        │
+                     ┌───────────────────┘          │        └───────────────────┐
+             TCP Chunk Transfers            TCP Chunk Transfers          TCP Chunk Transfers
+             (:8180)                        (:8181)                      (:8182)
+                     │                              │                            │
+         ┌───────────▼───────────┐      ┌───────────▼───────────┐    ┌───────────▼───────────┐
+         │   Cluster Server 1    │      │   Cluster Server 2    │    │   Cluster Server 3    │
+         │   - Storage Engine    │      │   - Storage Engine    │    │   - Storage Engine    │
+         │   - TCP Server :8080  │      │   - TCP Server :8081  │    │   - TCP Server :8082  │
+         │   - Metrics :9091     │      │   - Metrics :9092     │    │   - Metrics :9093     │
+         └───────────┬───────────┘      └───────────┬───────────┘    └───────────┬───────────┘
+                     │                              │                            │
+                     └──────────────────────┬───────┴────────────────────────────┘
+                                     UDP Heartbeats
+                                            │
+                                 ┌──────────▼──────────┐
+                                 │   Health Checker    │
+                                 │   - UDP Receiver    │
+                                 │   - Auto-Failover   │
+                                 │   - Web UI :9098    │
+                                 │   - Metrics :9096   │
+                                 └──────────┬──────────┘
+                                            │
+                                 ┌──────────▼──────────┐
+                                 │  ZooKeeper Monitor  │
+                                 │  - Leader Election  │
+                                 │  - Coordination     │
+                                 └─────────────────────┘
+```
+
+---
+
+## Binaries & Components
+
+| Binary | Description |
+|---|---|
+| `dfg` | Unified CLI binary — handles file upload/download/list, cluster management, and starting embedded daemons. |
+| `head_server` | Standalone metadata and coordination master. |
+| `cluster_server` | Standalone storage node daemon for receiving and serving chunk data. |
+| `health_checker` | Standalone health monitoring daemon with web dashboard and Prometheus metrics. |
+| `zk_head_server_monitor` | ZooKeeper-based leader election and head server failover monitor. |
+| `dfg_client` | Standalone dedicated client utility for file downloads. |
+
+---
+
+## Default Network Ports
+
+| Service | Port | Protocol | Purpose |
+|---|---|---|---|
+| Head Server | `9669` | TCP | File download client socket |
+| Head Server Control API | `9670` | HTTP / TCP | Dynamic cluster registration & management |
+| Head Server Metrics | `9095` | HTTP / TCP | Prometheus exporter |
+| Cluster Server 1 | `8080` / `8180` | TCP | Server socket / Chunk transfer socket |
+| Cluster Server 1 Metrics | `9091` | HTTP / TCP | Prometheus exporter |
+| Cluster Server 2 | `8081` / `8181` | TCP | Server socket / Chunk transfer socket |
+| Cluster Server 2 Metrics | `9092` | HTTP / TCP | Prometheus exporter |
+| Cluster Server 3 | `8082` / `8182` | TCP | Server socket / Chunk transfer socket |
+| Cluster Server 3 Metrics | `9093` | HTTP / TCP | Prometheus exporter |
+| Health Checker Heartbeat | `9000` | UDP / TCP | Heartbeat telemetry receiver |
+| Health Checker Web UI | `9098` | HTTP / TCP | Live HTML status dashboard |
+| Health Checker Metrics | `9096` | HTTP / TCP | Prometheus exporter |
+| ZooKeeper Ensemble | `2181` | TCP | Coordination & leader election |
+| Redis Metadata Backend | `6379` | TCP | Persistent metadata store (optional) |
+| Prometheus | `9090` | HTTP / TCP | Metrics aggregator |
+| Grafana | `3000` | HTTP / TCP | Visualization dashboards (admin / admin) |
 
 ---
 
@@ -21,17 +103,31 @@ Everything talks over Protocol Buffers. Metrics are exported to Prometheus. Dash
 
 ### Prerequisites
 
-| Dependency | Why |
-|---|---|
-| GCC 13+ or Clang 16+ | C++20 with coroutine support |
-| CMake 3.16+ | Build system |
-| protobuf + protoc | Serialization (fetched at build time if missing) |
-| zlib | Compression |
+- **C++ Compiler**: GCC 13+ or Clang 16+ (supporting C++20 and coroutines)
+- **Build System**: CMake 3.16+, Make
+- **Libraries**: Protocol Buffers (`protobuf`, `protoc`), `zlib`
+- **Optional**: `redis-server`, `redis-tools` (for Redis metadata persistence)
 
-Abseil and Prometheus-cpp are fetched automatically via CMake's `FetchContent`. You don't need to install them.
+### System Dependencies
 
-### Build
+**Ubuntu / Debian**:
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential cmake pkg-config \
+    libprotobuf-dev protobuf-compiler \
+    zlib1g-dev libfmt-dev redis-server redis-tools
+```
 
+**Arch Linux**:
+```bash
+sudo pacman -S --needed base-devel cmake pkg-config protobuf zlib fmt redis
+```
+
+---
+
+## Build & Test
+
+### Standard Build
 ```bash
 git clone https://github.com/SaiRajeshRamaraju/Distributed-File-Grid.git
 cd Distributed-File-Grid
@@ -41,213 +137,112 @@ cmake ..
 make -j$(nproc)
 ```
 
-This produces five binaries in `build/`:
+### Build with Redis Metadata Backend
+```bash
+cmake -DWITH_REDIS=ON ..
+make -j$(nproc)
+```
 
-| Binary | Purpose |
-|---|---|
-| `dfg` | Unified CLI — the primary way to interact with everything |
-| `head_server` | Standalone head server (if you prefer separate processes) |
-| `cluster_server` | Standalone cluster server |
-| `health_checker` | Heartbeat-based health monitor |
-| `zk_head_server_monitor` | ZooKeeper-based leader election monitor |
+### Build and Run Unit Tests
+```bash
+cmake -DBUILD_TESTS=ON ..
+make -j$(nproc)
+ctest --output-on-failure
+```
 
-### Run
+---
 
-Open three terminals:
+## Running the Grid
+
+### Quick Local Start
+You can launch the entire grid locally using the provided automation scripts:
 
 ```bash
-# Terminal 1 — start the head server
+# Start all daemons in background
+./scripts/start_services.sh
+
+# Check running daemon status
+./scripts/status.sh
+
+# Stop all services
+./scripts/stop_services.sh
+```
+
+### Manual Service Startup
+
+Open multiple terminals:
+
+```bash
+# Terminal 1: Start Head Server
 ./build/dfg head-server
 
-# Terminal 2 — start a storage node
-./build/dfg cluster-server --server-id 1 --ip 127.0.0.1 --port 8080
+# Terminal 2: Start Storage Nodes
+./build/dfg cluster-server --server-id 1 --port 8080
+./build/dfg cluster-server --server-id 2 --port 8081
+./build/dfg cluster-server --server-id 3 --port 8082
 
-# Terminal 3 — upload and download a file
-./build/dfg upload photo.jpg
-./build/dfg download photo.jpg /tmp/restored.jpg
+# Terminal 3: Start Health Checker
+./build/health_checker
 ```
-
-That's it. No containers, no config files, no ceremony.
 
 ---
 
-## Usage
+## CLI Usage
 
-All commands go through the `dfg` binary:
+All grid operations are available through the unified `dfg` executable:
 
 ```bash
-# File operations
-dfg upload <localfile-name>        # Upload a file to the grid
-dfg download <name> <savingfile-path>      # Download a file from the grid
-dfg list                              # List all stored files
+# Upload a file to the grid
+dfg upload <local-file-path> <remote-grid-name>
 
-# Server management (talks to head server's control API)
-dfg add-server --host 10.0.0.5 --port 8081
-dfg remove-server --id 3
+# Download and verify a file from the grid
+dfg download <remote-grid-name> <output-file-path>
+
+# List all stored files
+dfg list
+
+# Server management (Control API)
 dfg list-servers
+dfg add-server --host 127.0.0.1 --port 8084
+dfg remove-server --id 4
 
-# Start services
-dfg head-server                       # Start head server
-dfg cluster-server --server-id 2      # Start cluster server
-
-# Diagnostics
-dfg test                              # Run a built-in upload/download round-trip
-dfg --version
+# Run built-in diagnostic test
+dfg test
 ```
-
-### Configuration
-
-Config files live in `config/` and use plain JSON:
-
-| File | Controls |
-|---|---|
-| `head_server.json` | Ports, replication factor, chunk size, control API |
-| `cluster_server.json` | Server ID, bind address, heartbeat target |
-| `health_checker.json` | Heartbeat timeout, max missed beats |
-| `zookeeper.json` | ZK ensemble hosts, session timeout |
-
-Every setting can be overridden with an environment variable prefixed with `DFG_`. For example, `DFG_SERVER_PORT=9669` overrides `server.port` in the JSON.
-
-### Metadata Storage
-
-- **Default**: An embedded on-disk store at `/tmp/dfg_metadata.db` (override with `DFG_METADATA_DB`)
-- **Redis** (optional): Build with `cmake -DWITH_REDIS=ON ..` for production-grade metadata persistence
 
 ---
 
-## Architecture
+## Configuration
 
-```
-                        ┌─────────────────┐
-                        │    dfg CLI      │
-                        └────────┬────────┘
-                                 │
-                    ┌────────────▼────────────┐
-                    │      Head Server        │
-                    │  - metadata management  │
-                    │  - upload/download      │
-                    │  - control API (:9670)  │
-                    │  - heartbeat receiver   │
-                    └────┬──────┬──────┬─────┘
-                         │      │      │
-              ┌──────────▼──┐ ┌─▼────┐ ┌▼──────────┐
-              │  Cluster 1  │ │  C2  │ │  Cluster 3 │
-              │  :8080      │ │:8081 │ │  :8082     │
-              │  chunks/    │ │      │ │  chunks/   │
-              └─────────────┘ └──────┘ └────────────┘
-                    ▲              ▲             ▲
-                    │   heartbeats (UDP)         │
-                    └──────────┬────────────────┘
-                               │
-                    ┌──────────▼──────────┐
-                    │   Health Checker     │
-                    │   + ZK Monitor       │
-                    └─────────────────────┘
-```
+Configuration files are located in `config/` in JSON format:
 
-### How Upload Works
+| Config File | Target Component | Key Properties |
+|---|---|---|
+| [`head_server.json`](config/head_server.json) | Head Server | `server.port`, `storage.chunk_size`, `storage.replication_factor`, `redis.host`, `redis.port` |
+| [`cluster_server.json`](config/cluster_server.json) | Cluster Storage | `server.host`, `server.port`, `heartbeat.target_host`, `heartbeat.target_port` |
+| [`health_checker.json`](config/health_checker.json) | Health Monitor | `monitoring.heartbeat_timeout`, `monitoring.max_missed_heartbeats`, `failover.enable_auto_failover` |
+| [`zookeeper.json`](config/zookeeper.json) | ZK Coordination | `zookeeper.hosts`, `monitor.interval_seconds` |
 
-1. The CLI sends the file to the head server
-2. The head server splits it into 64 MB chunks
-3. Each chunk is replicated to *N* cluster servers (default: 3)
-4. Metadata (chunk→server mappings) is stored in the metadata backend
-5. The cluster servers send heartbeats back to confirm they're alive
-
-### How Download Works
-
-1. The CLI asks the head server for the file
-2. The head server looks up which cluster servers hold each chunk
-3. Chunks are fetched in parallel and reassembled
-4. The reconstructed file is written to the output path
-
-### Health Monitoring
-
-Cluster servers send UDP heartbeats every second containing system metrics (CPU, RAM, disk, network). The head server tracks these and marks a server as unhealthy after configurable missed beats. The health checker provides an additional monitoring layer with Prometheus-compatible metrics.
+Environment variables prefixed with `DFG_` override configuration keys (e.g. `DFG_SERVER_PORT=9669`).
 
 ---
 
 ## Docker Deployment
 
-For a full setup with monitoring, use Docker Compose:
+To launch the distributed grid with Prometheus, Grafana, Loki, and Promtail:
 
 ```bash
 cd deploy/docker
 docker-compose up -d
 ```
 
-This spins up:
-
-| Service | Port | Description |
-|---|---|---|
-| Head Server | 9669 | Metadata + file operations |
-| Cluster Servers ×3 | 8080–8082 | Chunk storage |
-| Health Checker | 9091 | Heartbeat monitor |
-| ZK Monitor | — | Leader election |
-| Prometheus | 9090 | Metrics collection |
-| Grafana | 3000 | Dashboards (admin/admin) |
-
-Pre-built Grafana dashboards are included for cluster overview, per-server metrics, and log aggregation.
+- **Health Checker UI**: `http://localhost:9098`
+- **Prometheus Metrics**: `http://localhost:9090`
+- **Grafana Dashboards**: `http://localhost:3000` (Login: `admin` / `admin`)
 
 ---
-
-## Building with Options
-
-```bash
-# Default build (no Redis, no tests)
-cmake ..
-
-# With Redis metadata backend
-cmake -DWITH_REDIS=ON ..
-
-# With tests
-cmake -DBUILD_TESTS=ON ..
-
-# Release build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-```
-
-### Makefile Shortcuts
-
-```bash
-make build          # Build everything
-make clean          # Remove build artifacts
-make test           # Run the built-in test suite
-make start          # Start all services via scripts/
-make stop           # Stop all services
-make install-deps   # Install system deps (Ubuntu/Debian)
-```
-
----
-
-## Troubleshooting
-
-**Build fails with protobuf errors**
-Make sure `protoc` is installed and matches the version of `libprotobuf-dev`. On Arch, `pacman -S protobuf` gets you both.
-
-**Services won't start — port in use**
-Default ports: head server on 9669, control API on 9670, cluster servers on 8080+, heartbeat on 9000. Check with `ss -tlnp | grep 9669`.
-
-**Uploads fail immediately**
-Make sure at least one cluster server is running and has registered with the head server. Check the head server's console output for registration messages.
-
-**Zero metrics in Prometheus/Grafana**
-Verify the cluster server's metrics exporter is bound — look for the `Prometheus metrics on 0.0.0.0:9091/metrics` log line at startup.
-
----
-
-## Tech Stack
-
-| Component | Technology |
-|---|---|
-| Language | C++20 |
-| Serialization | Protocol Buffers v3 |
-| Build | CMake 3.16+ |
-| Metrics | Prometheus-cpp |
-| Logging | Abseil |
-| Coordination | Built-in ZooKeeper client (no external C deps) |
-| Deployment | Docker, Docker Compose |
-| Monitoring | Grafana + Loki + Promtail |
 
 ## License
 
 This project is licensed under the [GNU General Public License v2.0](LICENSE).
+
