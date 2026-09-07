@@ -222,24 +222,58 @@ The primary client interface supporting complete file lifecycle management and d
 ./build/dfg remove-server --id 4
 ```
 
-### 2. Standalone Download Client (`dfg_client`)
+### 2. Standalone Client Utility (`dfg_client`)
 
-A lightweight, dedicated network client binary that communicates directly with the Head Server TCP streaming port (`:9669`):
+A dedicated network client utility supporting both streaming file downloads and direct file uploads to the Head Server (`:9669`) with cryptographic SHA-256 validation:
 
+#### Download File:
 ```bash
-# Usage: dfg_client <head_ip> <head_port> <filename> <output_path>
+# Named flags:
+./build/dfg_client --server_ip 127.0.0.1 --server_port 9669 --download my_doc.pdf -o /tmp/downloaded_doc.pdf
+
+# Or legacy positional arguments:
+# Usage: dfg_client <head_ip> <head_port> <filename> [output_path]
 ./build/dfg_client 127.0.0.1 9669 my_doc.pdf /tmp/downloaded_doc.pdf
+```
+
+#### Upload File:
+```bash
+# Calculate SHA-256 digest locally, stream chunks to Head Server, and replicate:
+./build/dfg_client --server_ip 127.0.0.1 --server_port 9669 --upload /path/to/local_file.iso
 ```
 
 #### Client Protocol & Integrity Guarantees
 
 The client and head server communicate over a deterministic line-delimited and binary stream protocol:
 
-1. **Download Request**: Client initiates connection to TCP `:9669` and issues `DOWNLOAD <filename>\n`.
-2. **File Hash Handshake**: Server responds with `FILE_HASH <sha256_digest>\n`.
-3. **Chunk Streaming**: Server streams each chunk with header `CHUNK <order_id> <chunk_size> <chunk_sha256>\n` followed by raw binary payload.
-4. **Per-Chunk Verification**: The client calculates SHA-256 in real-time as each chunk arrives. If corrupted, it aborts and deletes partial data.
-5. **End-of-Stream & File Hash Check**: Upon receiving `EOF\n`, the client verifies the full aggregated SHA-256 digest against the expected server hash.
+1. **Upload Protocol**:
+   - Client connects to TCP `:9669` and computes the local full-file SHA-256 hash.
+   - Sends upload header: `UPLOAD <filename> <filesize> <sha256_hash>\n`.
+   - Streams file chunks: `CHUNK <order_id> <chunk_size> <chunk_sha256>\n` followed by raw chunk bytes.
+   - Head Server verifies chunk checksums on receipt, stores chunks across cluster nodes, commits metadata (including SHA-256 hash) to Redis or disk, and returns `SUCCESS\n`.
+2. **Download Protocol**:
+   - Client sends `DOWNLOAD <filename>\n`.
+   - Server queries metadata and returns `FILE_HASH <sha256_digest>\n`.
+   - Server streams each chunk with header `CHUNK <order_id> <chunk_size> <chunk_sha256>\n` followed by raw binary payload.
+   - **Per-Chunk Verification**: Client verifies the SHA-256 checksum of each chunk as it arrives.
+   - **Full-File Verification**: Upon receiving `EOF\n`, the client verifies the reconstructed file's SHA-256 digest matches the original server digest.
+
+---
+
+## High-Availability & Self-Healing
+
+### ZooKeeper + Head Server Health Consensus
+The Head Server and ZooKeeper collaborate to verify cluster server liveness:
+1. **Heartbeat Monitoring**: Cluster nodes send UDP heartbeats to the Health Checker. If heartbeats stop for $T > 10\text{s}$, the Head Server initiates a health vote.
+2. **ZooKeeper Verification**: Before declaring a node dead, the Head Server queries the ZooKeeper ensemble (`/dfg/cluster_servers`) to verify whether the node's ephemeral registration has expired.
+3. **Consensus Trigger**: Only when both UDP monitoring and ZooKeeper confirm the failure is the node marked as `DEAD`.
+4. **Auto-Replication**: The Head Server locates all chunks hosted on the dead server and initiates automated re-replication to surviving healthy storage servers to maintain replication factor $N$.
+
+### Redis Metadata Backend Improvements
+- **Connection Pooling**: `sw::redis::Redis` connection pool is reused across calls, avoiding socket churn.
+- **Multi-Replica Chunk Keys**: Replicas use unique keys (`chunk:<id>:<server>`), preventing replica overwrites.
+- **Non-blocking Iteration**: Key scans use cursor-based `redis.scan` instead of blocking `redis.keys`.
+- **Robust Discovery**: Automatic detection of `redis++` and `hiredis` in `CMakeLists.txt` via `find_package` and include/library fallbacks.
 
 ---
 
@@ -258,18 +292,37 @@ Environment variables prefixed with `DFG_` override configuration keys (e.g. `DF
 
 ---
 
-## Docker Deployment
+## Docker Deployment & E2E Environment Emulation
 
-To launch the distributed grid with Prometheus, Grafana, Loki, and Promtail:
+### Launching the Full Containerized Stack
+To launch the complete distributed grid topology (Head Servers, 3 Cluster Nodes, Health Checker, ZooKeeper Monitor, Redis, ZooKeeper, Prometheus, Grafana, Loki, and Promtail):
 
 ```bash
 cd deploy/docker
-docker-compose up -d
+docker compose up -d
 ```
 
+- **Head Server API**: `http://localhost:9670/api/v1/status`
 - **Health Checker UI**: `http://localhost:9098`
 - **Prometheus Metrics**: `http://localhost:9090`
 - **Grafana Dashboards**: `http://localhost:3000` (Login: `admin` / `admin`)
+
+### Containerized E2E System Emulation (Work in Progress 🚧)
+
+The project includes an end-to-end integration test runner [`e2e/e2e_test.sh`](e2e/e2e_test.sh) supporting both local background services and full Docker container emulation:
+
+- **Local E2E Tests**:
+  ```bash
+  ./e2e/e2e_test.sh
+  ```
+  Runs 8 end-to-end verification tests covering small and multi-MB file upload/download, SHA-256 validation, client streaming, HTTP Control API, Prometheus metrics, and replica fault tolerance with read repair.
+
+- **Full Containerized Grid Emulation (`--system-test`)** *(Work in Progress)*:
+  ```bash
+  ./e2e/e2e_test.sh --system-test
+  ```
+  > [!NOTE]
+  > **WIP Notice**: Complete cluster emulation under Docker builds the multi-stage images, orchestrates container initialization across all 14 services, and executes client operations against live containers. Automated container health timing, multi-stage build caching, and network bridging optimizations are currently under active development.
 
 ---
 
