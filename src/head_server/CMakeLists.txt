@@ -5,6 +5,7 @@ add_executable(head_server
     head_server.cpp
     file_upload.cpp
     file_download.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/src/zookeeper_client.cpp
 )
 
 target_include_directories(head_server PRIVATE

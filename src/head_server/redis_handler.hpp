@@ -164,9 +164,14 @@ inline std::string get_redis_connection_string() {
   return "tcp://" + host_str + ":" + port_str;
 }
 
+inline Redis& get_redis() {
+  static Redis redis(get_redis_connection_string());
+  return redis;
+}
+
 inline void create_entry(const std::string &request) {
   try {
-    Redis redis(get_redis_connection_string()); // primary for writes [1]
+    Redis &redis = get_redis(); // reused connection pool
 
     std::istringstream in(request);
     std::string file_name;
@@ -190,7 +195,7 @@ inline void create_entry(const std::string &request) {
       }
     }
 
-    // Batch fields for HSET key field value [5][1]
+    // Batch fields for HSET key field value
     std::vector<std::pair<std::string, std::string>> fields;
     
     // Process the line that broke the loop (if not empty)
@@ -201,7 +206,8 @@ inline void create_entry(const std::string &request) {
       std::string server, path, checksum;
       if (ls >> chunk_id >> server >> path) {
         ls >> checksum; // Optional checksum
-        std::string field = "chunk:" + std::to_string(chunk_id);
+        // Include server in field to avoid overwriting replicas of the same chunk
+        std::string field = "chunk:" + std::to_string(chunk_id) + ":" + server;
         std::string value = encode_loc(server, path);
         if (!checksum.empty()) {
            value += "|" + checksum;
@@ -217,10 +223,7 @@ inline void create_entry(const std::string &request) {
     }
 
     if (!fields.empty()) {
-      redis.hset(key, fields.begin(), fields.end()); // bulk HSET [1][5]
-    } else {
-      // Optionally create a marker so the hash exists:
-      // redis.hset(key, "meta", "created");
+      redis.hset(key, fields.begin(), fields.end());
     }
     
     if (!file_hash.empty()) {
@@ -228,7 +231,7 @@ inline void create_entry(const std::string &request) {
     }
 
     if (ttl > 0) {
-      redis.expire(key, std::chrono::seconds{ttl}); // set TTL on hash key [1]
+      redis.expire(key, std::chrono::seconds{ttl});
     }
 
     std::cout << "Created file entry: " << file_name << "\n";
@@ -280,7 +283,7 @@ inline metadata_store::FileRecord query_metadata(const std::string &file_name) {
   if (file_name.empty()) return rec;
   try {
     const std::string key = file_key(file_name);
-    Redis redis(get_redis_connection_string());
+    Redis &redis = get_redis();
     std::unordered_map<std::string, std::string> all;
     redis.hgetall(key, std::inserter(all, all.end()));
     if (all.empty()) return rec;
@@ -292,7 +295,9 @@ inline metadata_store::FileRecord query_metadata(const std::string &file_name) {
       if (kv.first.rfind("chunk:", 0) == 0) {
         metadata_store::ChunkRecord cr;
         try {
-          cr.chunk_id = std::stoll(kv.first.substr(6));
+          std::string rest = kv.first.substr(6);
+          size_t colon = rest.find(':');
+          cr.chunk_id = std::stoll(colon == std::string::npos ? rest : rest.substr(0, colon));
         } catch (...) { continue; }
         std::string v = kv.second;
         auto p1 = v.find('|');
@@ -430,7 +435,7 @@ inline void delete_entry(const std::string &file_name) {
     }
 
     const std::string key = file_key(base);
-    Redis redis(get_redis_connection_string());
+    Redis &redis = get_redis();
 
     if (!field.empty()) {
       long long n = redis.hdel(key, field); // [1][15]
@@ -468,8 +473,7 @@ inline int create_replication(const std::string &ip_address) {
                    ? 6379
                    : std::stoi(ip_address.substr(pos + 1));
 
-    Redis redis(
-        get_redis_connection_string()); // local node to become a replica [1]
+    Redis &redis = get_redis();
     redis.command("REPLICAOF", host,
                   std::to_string(port)); // server-side replication [19]
     return 0;
@@ -491,8 +495,7 @@ inline int create_replication(const std::string &ip_address) {
 inline bool is_redis_running(const std::string &host = "127.0.0.1",
                              int port = 6379) {
   try {
-    // Use the provided host/port for checking, not the default connection
-    // string
+    // Use the provided host/port for checking
     Redis redis("tcp://" + host + ":" + std::to_string(port));
     redis.ping();
     return true;
@@ -529,23 +532,28 @@ inline int start_server() {
   if (pid > 0)
     _exit(0); // intermediate exits
 
-  // Detach
-  // chdir("/");
   umask(027);
 
-  // Detach stdio
+  // Detach stdio and route log to safe location
   for (int fd = 0; fd < 3; ++fd)
     close(fd);
-  open("/dev/null", O_RDONLY);                   // stdin
-  open("../../logs/current_logs.txt", O_WRONLY); // stdout
-  open("/dev/null", O_WRONLY);                   // stderr
+  open("/dev/null", O_RDONLY);                          // stdin
+  open("/tmp/dfg_redis_server.log", O_WRONLY | O_CREAT | O_APPEND, 0644); // stdout
+  open("/tmp/dfg_redis_server.log", O_WRONLY | O_CREAT | O_APPEND, 0644); // stderr
 
-  // IMPORTANT: Start Redis with NO arguments (no config file)
-  // This uses Redis built-in defaults. Suitable for testing/dev.
-  // For production, prefer a config file.
-  execl("/usr/bin/redis-server", "redis-server", (char *)nullptr);
+  // Find redis-server executable in PATH or standard paths
+  const char *server_paths[] = {
+      "redis-server",
+      "/usr/bin/redis-server",
+      "/usr/local/bin/redis-server",
+      "/opt/homebrew/bin/redis-server"
+  };
 
-  // If execl fails
+  for (const char *path : server_paths) {
+      execlp(path, "redis-server", (char *)nullptr);
+  }
+
+  // If all exec attempts fail
   _exit(1);
 }
 #else
@@ -567,17 +575,21 @@ inline int start_server() {
 #ifdef WITH_REDIS
 inline std::vector<std::string> list_all_files() {
   try {
-    Redis redis(get_redis_connection_string());
+    Redis &redis = get_redis();
     std::vector<std::string> files;
-    std::vector<std::string> keys;
-    redis.keys("file:*", std::back_inserter(keys));
-    files.reserve(keys.size());
-    for (const auto &key : keys) {
-      if (key.rfind("file:", 0) == 0) {
-        files.push_back(key.substr(5));
+    long long cursor = 0;
+    do {
+      std::vector<std::string> batch;
+      cursor = redis.scan(cursor, "file:*", 100, std::back_inserter(batch));
+      for (const auto &key : batch) {
+        if (key.rfind("file:", 0) == 0) {
+          files.push_back(key.substr(5));
+        }
       }
-    }
+    } while (cursor != 0);
+
     std::sort(files.begin(), files.end());
+    files.erase(std::unique(files.begin(), files.end()), files.end());
     return files;
   } catch (const std::exception &e) {
     std::cerr << "list_all_files error: " << e.what() << std::endl;

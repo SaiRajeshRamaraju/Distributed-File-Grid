@@ -11,6 +11,7 @@
 #include <dfg/async_net.hpp>
 #include <dfg/server_registry.hpp>
 #include <dfg/version.hpp>
+#include <dfg/zookeeper_client.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -20,11 +21,14 @@
 #include <string>
 #include <sys/statvfs.h>
 #include <thread>
+#include <algorithm>
 
 // Forward declarations
 int process_file_upload(const char *filepath, const char *filename);
 int process_file_download(const char *filename, const char *output_path);
 int check_file_exists(const char *filename);
+bool replicate_chunk_to_server(const std::string& source_server, int chunk_id, const std::string& target_server, const std::string& filename);
+
 
 // Global metrics instance for the head server
 static std::unique_ptr<HeadServerMetrics> g_head_metrics;
@@ -117,14 +121,209 @@ static void heartbeat_receiver_thread(dfg::HealthMonitor &monitor,
   ::close(sfd);
 }
 
-// ── Health check thread ──
-// Periodically checks for stale heartbeats
-static void health_check_thread(dfg::HealthMonitor &monitor) {
+// ── Re-replicate chunks on cluster server failure ──
+static void rereplicate_dead_server_chunks(const std::string &dead_server_ip) {
+  std::cout << "[Failover] Starting chunk re-replication for failed cluster server: "
+            << dead_server_ip << std::endl;
+
+  auto all_files = list_all_files();
+  if (all_files.empty()) {
+    std::cout << "[Failover] No files found in metadata store." << std::endl;
+    return;
+  }
+
+  // Find candidate healthy cluster servers
+  auto all_servers = g_cluster_registry->get_addresses();
+  std::vector<std::string> healthy_servers;
+  auto health_map = g_health_monitor->get_all_health();
+  for (const auto &srv : all_servers) {
+    if (srv == dead_server_ip) continue;
+    std::string h_ip;
+    int h_port;
+    dfg::net::parse_address(srv, h_ip, h_port);
+    bool ok = true;
+    for (const auto &[_, h] : health_map) {
+      if ((h.ip == srv || h.ip == h_ip) && !h.is_healthy) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) {
+      healthy_servers.push_back(srv);
+    }
+  }
+
+  if (healthy_servers.empty()) {
+    std::cerr << "[Failover] No healthy cluster servers available to host chunk replicas!" << std::endl;
+    return;
+  }
+
+  int total_replicated = 0;
+  for (const auto &filename : all_files) {
+    auto file_rec = query_metadata(filename);
+    if (file_rec.chunks.empty()) continue;
+
+    bool file_updated = false;
+    // Map chunk_id -> list of chunk records (to inspect replicas)
+    std::map<long long, std::vector<metadata_store::ChunkRecord>> chunk_map;
+    for (const auto &cr : file_rec.chunks) {
+      chunk_map[cr.chunk_id].push_back(cr);
+    }
+
+    std::vector<metadata_store::ChunkRecord> updated_chunks;
+
+    for (auto &[cid, records] : chunk_map) {
+      bool has_dead_replica = false;
+      std::string surviving_source_server;
+      std::string dead_checksum;
+
+      for (const auto &r : records) {
+        if (r.server == dead_server_ip) {
+          has_dead_replica = true;
+          dead_checksum = r.checksum;
+        } else if (surviving_source_server.empty()) {
+          surviving_source_server = r.server;
+        }
+      }
+
+      if (!has_dead_replica) {
+        for (const auto &r : records) {
+          updated_chunks.push_back(r);
+        }
+        continue;
+      }
+
+      if (surviving_source_server.empty()) {
+        std::cerr << "[Failover] Chunk " << cid << " of " << filename
+                  << " had only dead server replica! Cannot recover chunk data." << std::endl;
+        for (const auto &r : records) {
+          updated_chunks.push_back(r);
+        }
+        continue;
+      }
+
+      // Pick a target healthy server that does not already host this chunk
+      std::string target_server;
+      for (const auto &cand : healthy_servers) {
+        bool already_hosts = false;
+        for (const auto &r : records) {
+          if (r.server == cand) {
+            already_hosts = true;
+            break;
+          }
+        }
+        if (!already_hosts) {
+          target_server = cand;
+          break;
+        }
+      }
+
+      if (target_server.empty()) {
+        std::cerr << "[Failover] No distinct healthy server available for chunk " << cid << std::endl;
+        for (const auto &r : records) updated_chunks.push_back(r);
+        continue;
+      }
+
+      // Perform re-replication of chunk
+      std::cout << "[Failover] Duplicating chunk " << cid << " of " << filename
+                << " from " << surviving_source_server << " -> " << target_server << std::endl;
+
+      bool ok = replicate_chunk_to_server(surviving_source_server, cid, target_server, filename);
+      if (ok) {
+        total_replicated++;
+        file_updated = true;
+        for (const auto &r : records) {
+          if (r.server == dead_server_ip) {
+            metadata_store::ChunkRecord rep_record;
+            rep_record.chunk_id = cid;
+            rep_record.server = target_server;
+            rep_record.path = "/tmp/chunks/" + target_server + "_" + filename + "_chunk_" + std::to_string(cid);
+            rep_record.checksum = dead_checksum;
+            updated_chunks.push_back(rep_record);
+          } else {
+            updated_chunks.push_back(r);
+          }
+        }
+      } else {
+        for (const auto &r : records) updated_chunks.push_back(r);
+      }
+    }
+
+    if (file_updated) {
+#ifdef WITH_REDIS
+      std::stringstream req;
+      req << filename << "\n";
+      req << "TTL=3600\n";
+      if (!file_rec.file_hash.empty()) {
+        req << "HASH=" << file_rec.file_hash << "\n";
+      }
+      for (const auto &c : updated_chunks) {
+        req << c.chunk_id << " " << c.server << " " << c.path << " " << c.checksum << "\n";
+      }
+      create_entry(req.str());
+#else
+      metadata_store::replace_file_chunks(filename, file_rec.file_hash, std::move(updated_chunks));
+#endif
+      std::cout << "[Failover] Updated metadata for " << filename << " after re-replication." << std::endl;
+    }
+  }
+
+  std::cout << "[Failover] Completed re-replication for " << dead_server_ip
+            << ": " << total_replicated << " chunks duplicated." << std::endl;
+}
+
+// ── Health check thread with ZooKeeper Voting ──
+// Periodically checks for stale heartbeats, verifies with ZooKeeper cluster,
+// and triggers self-healing duplication if cluster server is dead.
+static void health_check_thread(dfg::HealthMonitor &monitor, const std::string &zk_hosts) {
+  ZooKeeperClient zk(zk_hosts);
+  bool zk_connected = zk.connect();
+  if (zk_connected) {
+    std::cout << "[ZK Consensus] Head server connected to ZooKeeper at " << zk_hosts << std::endl;
+  } else {
+    std::cout << "[ZK Consensus] Could not connect to ZooKeeper at " << zk_hosts
+              << ", will retry on demand." << std::endl;
+  }
+
   while (g_head_running) {
-    std::this_thread::sleep_for(std::chrono::seconds(15));
+    std::this_thread::sleep_for(std::chrono::seconds(10));
     monitor.check_health();
   }
 }
+
+static void on_server_unhealthy_callback(int server_id, const dfg::ServerHealth &health, const std::string &zk_hosts) {
+  std::cout << "\n[Consensus Voting] Health monitor flagged server " << server_id
+            << " (" << health.ip << ") as UNHEALTHY. Consulting ZooKeeper cluster..."
+            << std::endl;
+
+  ZooKeeperClient zk(zk_hosts);
+  if (!zk.is_connected()) {
+    zk.connect();
+  }
+
+  // Check ephemeral znode in ZooKeeper: /dfg/cluster_servers/server_<id>
+  std::string znode = "/dfg/cluster_servers/server_" + std::to_string(server_id);
+  bool zk_node_exists = zk.node_exists(znode);
+
+  if (zk_node_exists) {
+    std::cout << "[Consensus Voting] ⚠️ ZooKeeper reports node " << znode
+              << " STILL EXISTS. Cluster server is likely alive or partitioned from Head Server."
+              << " Deferring re-replication." << std::endl;
+  } else {
+    std::cout << "[Consensus Voting] ❌ ZooKeeper confirms node " << znode
+              << " DOES NOT EXIST (Session Expired/Dead). Consensus reached: SERVER IS DEAD."
+              << std::endl;
+
+    // Deregister server from registry
+    g_cluster_registry->remove_server(server_id);
+
+    // Trigger re-replication of all chunks from this dead server to a different cluster server
+    std::thread([ip = health.ip]() {
+      rereplicate_dead_server_chunks(ip);
+    }).detach();
+  }
+}
+
 
 int run_head_server(int argc, char **argv) {
   signal(SIGINT, head_signal_handler);
@@ -239,14 +438,28 @@ int run_head_server(int argc, char **argv) {
       *g_cluster_registry, *g_health_monitor, control_port);
   g_control_api->start();
 
+  std::string zk_hosts = cfg.get_string("zookeeper.hosts", "127.0.0.1:2181");
+  for (int i = 1; i < argc - 1; ++i) {
+    std::string a = argv[i];
+    if (a == "--zk-hosts" && i + 1 < argc) {
+      zk_hosts = argv[i + 1];
+    }
+  }
+
+  // Set callback on health monitor when a server misses maximum heartbeats
+  g_health_monitor->set_unhealthy_callback([zk_hosts](int server_id, const dfg::ServerHealth &health) {
+    on_server_unhealthy_callback(server_id, health, zk_hosts);
+  });
+
   // Start heartbeat receiver thread
   std::thread hb_thread(heartbeat_receiver_thread, std::ref(*g_health_monitor),
                         g_head_metrics.get());
   hb_thread.detach();
 
-  // Start health check thread
-  std::thread hc_thread(health_check_thread, std::ref(*g_health_monitor));
+  // Start health check thread with ZooKeeper voting support
+  std::thread hc_thread(health_check_thread, std::ref(*g_health_monitor), zk_hosts);
   hc_thread.detach();
+
 
   // Start the head server daemon (initializes metadata backend)
   start_daemon();
@@ -293,6 +506,13 @@ int run_head_server(int argc, char **argv) {
                       }
                       extern void handle_client_download(int fd, const std::string& filename);
                       handle_client_download(cfd, filename);
+                  } else if (req.rfind("UPLOAD ", 0) == 0) {
+                      // trim trailing newline
+                      while (!req.empty() && (req.back() == '\n' || req.back() == '\r')) {
+                          req.pop_back();
+                      }
+                      extern void handle_client_upload(int fd, const std::string& initial_req);
+                      handle_client_upload(cfd, req);
                   }
               }
               ::close(cfd);

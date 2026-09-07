@@ -108,6 +108,7 @@ private:
         return resp;
     }
 
+public:
     bool repair_chunk_on_server(const ChunkLocation& location, const std::string& filename, const std::vector<char>& chunk_data) {
         std::string ip;
         int port;
@@ -207,7 +208,6 @@ private:
         return chunk_data;
     }
 
-public:
     bool reconstruct_file(const std::string& filename, const std::string& output_path) {
         std::cout << "Reconstructing file: " << filename << std::endl;
         
@@ -569,3 +569,34 @@ int check_file_exists(const char* filename) {
 void handle_client_download(int fd, const std::string& filename) {
     g_file_reconstructor.stream_file_to_client(filename, fd);
 }
+
+bool replicate_chunk_to_server(const std::string& source_server, int chunk_id, const std::string& target_server, const std::string& filename) {
+    ChunkLocation source_loc;
+    source_loc.chunk_id = chunk_id;
+    source_loc.server_ip = source_server;
+    source_loc.file_path = "";
+
+    auto chunk_data = g_file_reconstructor.read_chunk_from_server(source_loc, filename);
+    if (chunk_data.empty()) {
+        std::cerr << "[Replication] Failed to read chunk " << chunk_id
+                  << " from surviving server " << source_server << std::endl;
+        return false;
+    }
+
+    ChunkLocation target_loc;
+    target_loc.chunk_id = chunk_id;
+    target_loc.server_ip = target_server;
+    target_loc.file_path = "/tmp/chunks/" + target_server + "_" + filename + "_chunk_" + std::to_string(chunk_id);
+
+    bool ok = g_file_reconstructor.repair_chunk_on_server(target_loc, filename, chunk_data);
+    if (ok) {
+        std::cout << "[Replication] Successfully duplicated chunk " << chunk_id
+                  << " of file " << filename << " to new server " << target_server << std::endl;
+    } else {
+        std::cerr << "[Replication] Failed to write chunk " << chunk_id
+                  << " to new server " << target_server << std::endl;
+    }
+    return ok;
+}
+
+

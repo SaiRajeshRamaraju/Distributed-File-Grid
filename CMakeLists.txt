@@ -51,7 +51,27 @@ include_directories(${Protobuf_INCLUDE_DIRS})
 # ── Optional Redis ──
 option(WITH_REDIS "Build with Redis++ support" OFF)
 if(WITH_REDIS)
-    find_package(redis++ REQUIRED)
+    find_package(redis++ QUIET)
+    find_package(hiredis QUIET)
+    if(NOT redis++_FOUND)
+        find_path(REDIS_PLUS_PLUS_INCLUDE_DIRS NAMES sw/redis++/redis++.h PATHS /usr/local/include /usr/include)
+        find_library(REDIS_PLUS_PLUS_LIB NAMES redis++ PATHS /usr/local/lib /usr/lib /usr/lib/x86_64-linux-gnu)
+        find_library(HIREDIS_LIB NAMES hiredis PATHS /usr/local/lib /usr/lib /usr/lib/x86_64-linux-gnu)
+        if(REDIS_PLUS_PLUS_INCLUDE_DIRS AND REDIS_PLUS_PLUS_LIB AND HIREDIS_LIB)
+            message(STATUS "Found redis++: ${REDIS_PLUS_PLUS_LIB}")
+            message(STATUS "Found hiredis: ${HIREDIS_LIB}")
+            if(NOT TARGET redis++::redis++)
+                add_library(redis++::redis++ UNKNOWN IMPORTED)
+                set_target_properties(redis++::redis++ PROPERTIES
+                    IMPORTED_LOCATION "${REDIS_PLUS_PLUS_LIB}"
+                    INTERFACE_INCLUDE_DIRECTORIES "${REDIS_PLUS_PLUS_INCLUDE_DIRS}"
+                    INTERFACE_LINK_LIBRARIES "${HIREDIS_LIB}"
+                )
+            endif()
+        else()
+            message(FATAL_ERROR "redis++ or hiredis not found. Please install libredis++-dev and libhiredis-dev")
+        endif()
+    endif()
     add_compile_definitions(WITH_REDIS)
 endif()
 

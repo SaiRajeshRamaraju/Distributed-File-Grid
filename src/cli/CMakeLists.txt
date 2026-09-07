@@ -7,6 +7,7 @@ add_executable(dfg
     ${CMAKE_SOURCE_DIR}/src/head_server/file_download.cpp
     ${CMAKE_SOURCE_DIR}/src/cluster_server/chunk_service.cpp
     ${CMAKE_SOURCE_DIR}/src/cluster_server/metrics_exporter.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/src/zookeeper_client.cpp
 )
 
 target_compile_definitions(dfg PRIVATE DFG_UNIFIED_BINARY)

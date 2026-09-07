@@ -418,3 +418,82 @@ int process_file_upload(const char *filepath, const char *filename) {
     return -1;
   }
 }
+
+void handle_client_upload(int fd, const std::string &initial_req) {
+  // Expected initial_req: "UPLOAD <filename> <file_size> <file_hash>"
+  std::istringstream iss(initial_req);
+  std::string cmd, filename, file_hash;
+  size_t file_size = 0;
+
+  if (!(iss >> cmd >> filename >> file_size >> file_hash) || cmd != "UPLOAD") {
+    std::string err = "ERROR: Invalid upload request format. Expected: UPLOAD <filename> <size> <sha256>\n";
+    ::send(fd, err.data(), err.size(), 0);
+    return;
+  }
+
+  // Acknowledge ready to receive file data
+  std::string ready_msg = "READY\n";
+  if (::send(fd, ready_msg.data(), ready_msg.size(), 0) < 0) {
+    std::cerr << "Failed to send READY to client" << std::endl;
+    return;
+  }
+
+  // Create temporary file to store incoming data
+  std::string temp_path = "/tmp/dfg_upload_" + std::to_string(getpid()) + "_" +
+                          std::to_string(std::chrono::system_clock::now().time_since_epoch().count()) +
+                          "_" + filename;
+
+  std::ofstream out(temp_path, std::ios::binary);
+  if (!out) {
+    std::string err = "ERROR: Failed to create temporary file on head server\n";
+    ::send(fd, err.data(), err.size(), 0);
+    return;
+  }
+
+  dfg::hash::SHA256 hasher;
+  size_t total_received = 0;
+  std::vector<char> buffer(64 * 1024);
+
+  while (total_received < file_size) {
+    size_t to_read = std::min(buffer.size(), file_size - total_received);
+    ssize_t n = ::recv(fd, buffer.data(), to_read, 0);
+    if (n <= 0) {
+      if (n < 0 && errno == EINTR) continue;
+      std::cerr << "Connection dropped while receiving file data" << std::endl;
+      out.close();
+      std::filesystem::remove(temp_path);
+      return;
+    }
+    out.write(buffer.data(), n);
+    hasher.update(buffer.data(), n);
+    total_received += n;
+  }
+
+  out.close();
+
+  std::string received_hash = hasher.digest();
+  if (!file_hash.empty() && received_hash != file_hash) {
+    std::cerr << "Upload hash mismatch for " << filename
+              << " expected: " << file_hash
+              << " got: " << received_hash << std::endl;
+    std::filesystem::remove(temp_path);
+    std::string err = "ERROR: SHA256 checksum mismatch\n";
+    ::send(fd, err.data(), err.size(), 0);
+    return;
+  }
+
+  // Process chunking and distribute to cluster servers
+  int res = process_file_upload(temp_path.c_str(), filename.c_str());
+  std::filesystem::remove(temp_path);
+
+  if (res == 0) {
+    std::string ok_msg = "SUCCESS\n";
+    ::send(fd, ok_msg.data(), ok_msg.size(), 0);
+    std::cout << "Successfully processed client upload for file: " << filename << std::endl;
+  } else {
+    std::string err = "ERROR: Failed to chunk or store file chunks\n";
+    ::send(fd, err.data(), err.size(), 0);
+    std::cerr << "Failed to process upload for file: " << filename << std::endl;
+  }
+}
+

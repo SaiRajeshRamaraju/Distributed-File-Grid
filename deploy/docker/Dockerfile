@@ -91,6 +91,7 @@ COPY --from=builder /app/build/cluster_server /usr/local/bin/
 COPY --from=builder /app/build/health_checker /usr/local/bin/
 COPY --from=builder /app/build/zk_head_server_monitor /usr/local/bin/
 COPY --from=builder /app/build/dfg /usr/local/bin/dfg
+COPY --from=builder /app/build/dfg_client /usr/local/bin/dfg_client
 
 # Copy shared libraries from builder (redis++, hiredis, prometheus-cpp)
 COPY --from=builder /usr/local/lib/ /usr/local/lib/
