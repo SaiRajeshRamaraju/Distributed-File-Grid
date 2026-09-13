@@ -26,26 +26,35 @@
 
 static bool self_register_with_head(const std::string &head_host, int head_control_port, int server_id, const std::string &ip, int port);
 
-std::atomic<bool> g_is_dead_process(false);
+inline std::atomic<bool> g_is_dead_process(false);
 
 void liveness_monitor(const std::string& zk_hosts, const std::string& head_host, int head_port, int server_id, const std::string& ip, int port) {
     ZooKeeperClient zk(zk_hosts);
     bool zk_init = zk.connect();
     std::string znode = "/dfg/cluster_servers/server_" + std::to_string(server_id);
+    auto make_zk_data = [&]() {
+        auto now_sec = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        return ip + ":" + std::to_string(port) + "|timestamp:" + std::to_string(now_sec);
+    };
+
     if (zk_init) {
         if (!zk.node_exists("/dfg/cluster_servers")) {
             zk.create_node("/dfg/cluster_servers", "");
         }
-        zk.create_node(znode, ip + ":" + std::to_string(port), true, false); // Ephemeral
+        zk.create_node(znode, make_zk_data(), true, false); // Ephemeral
     }
     
     int consecutive_failures = 0;
     while (!g_is_dead_process) {
         std::this_thread::sleep_for(std::chrono::seconds(5));
+        if (g_is_dead_process) break;
         
         bool zk_ok = zk.is_connected() && zk.node_exists(znode);
-        if (!zk_ok && zk.connect()) {
-            zk.create_node(znode, ip + ":" + std::to_string(port), true, false);
+        if (zk_ok) {
+            zk.set_node_data(znode, make_zk_data());
+        } else if (zk.connect()) {
+            zk.create_node(znode, make_zk_data(), true, false);
             zk_ok = zk.is_connected() && zk.node_exists(znode);
         }
         
@@ -61,7 +70,12 @@ void liveness_monitor(const std::string& zk_hosts, const std::string& head_host,
             consecutive_failures = 0;
         }
     }
+
+    if (zk.is_connected()) {
+        zk.delete_node(znode);
+    }
 }
+
 
 int start_cluster_server(int server_id, const char *ip, int port);
 

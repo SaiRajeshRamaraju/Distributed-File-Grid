@@ -112,6 +112,11 @@ private:
 
         if (method == "GET" && path == "/api/v1/servers/cluster") {
             response = handle_list_servers();
+        } else if (method == "GET" && path.find("/api/v1/servers/cluster/") == 0 && path.find("/health") != std::string::npos) {
+            size_t start = 23;
+            size_t end = path.find("/health");
+            std::string id_str = path.substr(start, end - start);
+            response = handle_server_health(id_str);
         } else if (method == "POST" && path == "/api/v1/servers/cluster") {
             response = handle_add_server(body);
         } else if (method == "DELETE" && path.find("/api/v1/servers/cluster/") == 0) {
@@ -126,6 +131,30 @@ private:
         }
 
         ::send(cfd, response.data(), response.size(), 0);
+    }
+
+    std::string handle_server_health(const std::string& id_str) {
+        try {
+            int id = std::stoi(id_str);
+            auto health_map = health_.get_all_health();
+            auto it = health_map.find(id);
+            if (it == health_map.end()) {
+                return make_response(404, "{\"error\":\"Server not found\",\"healthy\":false}");
+            }
+            const auto& h = it->second;
+            std::ostringstream json;
+            json << "{\"id\":" << id
+                 << ",\"ip\":\"" << h.ip << "\""
+                 << ",\"healthy\":" << (h.is_healthy ? "true" : "false")
+                 << ",\"missed_heartbeats\":" << h.missed_heartbeats
+                 << ",\"cpu\":" << h.cpu_usage
+                 << ",\"ram\":" << h.ram_usage
+                 << ",\"disk\":" << h.disk_usage
+                 << "}";
+            return make_response(200, json.str());
+        } catch (...) {
+            return make_response(400, "{\"error\":\"Invalid server ID\"}");
+        }
     }
 
     std::string handle_list_servers() {

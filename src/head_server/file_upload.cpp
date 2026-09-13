@@ -47,6 +47,7 @@ struct ChunkInfo {
   std::string file_path;
   size_t size;
   std::string checksum;
+  int replica_count{1};
 };
 
 // ── Transfer result for tracking chunk distribution ──
@@ -55,6 +56,7 @@ struct TransferResult {
   std::string server;
   size_t size;
   std::string checksum;
+  std::string file_path;
   bool success;
 };
 
@@ -140,7 +142,8 @@ private:
 
   bool send_chunk_to_server(const std::string &server, int chunk_id,
                             const std::vector<char> &chunk_data,
-                            const std::string &filename) {
+                            const std::string &filename,
+                            std::string &out_file_path) {
 
     std::string ip;
     int port;
@@ -199,6 +202,7 @@ private:
       return false;
     }
 
+    out_file_path = resp.file_path();
     ::close(sock);
     return true;
   }
@@ -291,9 +295,14 @@ public:
     int chunk_id = 0;
     size_t bytes_read = 0;
 
+    struct TransferOutcome {
+      bool success;
+      std::string file_path;
+    };
+
     // Collect all transfer results for the status table
     struct PendingTransfer {
-      std::future<bool> result;
+      std::future<TransferOutcome> result;
       int chunk_id;
       std::string server;
       std::string checksum;
@@ -337,8 +346,10 @@ public:
         std::string srv = server;
 
         auto fut =
-            transfer_pool().submit([this, srv, cid, data_ptr, fname]() -> bool {
-              return send_chunk_to_server(srv, cid, *data_ptr, fname);
+            transfer_pool().submit([this, srv, cid, data_ptr, fname]() -> TransferOutcome {
+              std::string path;
+              bool ok = send_chunk_to_server(srv, cid, *data_ptr, fname, path);
+              return {ok, path};
             });
 
         pending.push_back(
@@ -357,18 +368,40 @@ public:
               << " concurrent chunk transfers..." << std::endl;
 
     std::vector<TransferResult> all_results;
+    std::map<int, int> success_replicas_count;
+
+    struct CompletedItem {
+      int chunk_id;
+      std::string server;
+      std::string checksum;
+      size_t size;
+      std::string file_path;
+      bool success;
+    };
+    std::vector<CompletedItem> completed_items;
+
     for (auto &p : pending) {
-      bool ok = p.result.get();
+      TransferOutcome outcome = p.result.get();
       all_results.push_back(
-          TransferResult{p.chunk_id, p.server, p.size, p.checksum, ok});
-      if (ok) {
+          TransferResult{p.chunk_id, p.server, p.size, p.checksum, outcome.file_path, outcome.success});
+      if (outcome.success) {
+        success_replicas_count[p.chunk_id]++;
+      }
+      completed_items.push_back(
+          CompletedItem{p.chunk_id, p.server, p.checksum, p.size, outcome.file_path, outcome.success});
+    }
+
+    for (const auto &item : completed_items) {
+      if (item.success) {
         ChunkInfo chunk_info;
-        chunk_info.chunk_id = p.chunk_id;
-        chunk_info.server_ip = p.server;
-        chunk_info.file_path = "/tmp/chunks/" + p.server + "_" + filename +
-                               "_chunk_" + std::to_string(p.chunk_id);
-        chunk_info.size = p.size;
-        chunk_info.checksum = p.checksum;
+        chunk_info.chunk_id = item.chunk_id;
+        chunk_info.server_ip = item.server;
+        // If cluster server returned actual file path, use it; otherwise fallback
+        chunk_info.file_path = !item.file_path.empty() ? item.file_path
+                             : ("/tmp/chunks/" + item.server + "_" + filename + "_chunk_" + std::to_string(item.chunk_id));
+        chunk_info.size = item.size;
+        chunk_info.checksum = item.checksum;
+        chunk_info.replica_count = success_replicas_count[item.chunk_id];
         chunks.push_back(chunk_info);
       }
     }
@@ -385,14 +418,17 @@ public:
     request << filename << "\n";
     request << "TTL=3600\n";
     request << "HASH=" << file_hash << "\n";
+    request << "REPLICAS=" << config_replication_factor() << "\n";
 
     for (const auto &chunk : chunks) {
       request << chunk.chunk_id << " " << chunk.server_ip << " "
-              << chunk.file_path << " " << chunk.checksum << "\n";
+              << chunk.file_path << " " << chunk.checksum << " "
+              << chunk.replica_count << "\n";
     }
 
     create_entry(request.str());
-    std::cout << "Metadata stored for file: " << filename << std::endl;
+    std::cout << "Metadata stored for file: " << filename
+              << " (" << chunks.size() << " chunks/replicas)" << std::endl;
   }
 };
 

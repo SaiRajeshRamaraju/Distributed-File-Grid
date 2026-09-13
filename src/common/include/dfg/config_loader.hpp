@@ -141,6 +141,31 @@ public:
     return servers;
   }
 
+  /// Get the list of head server entries (id, host, port, control_port).
+  struct HeadServerEntry {
+    std::string id;
+    std::string host;
+    int port;
+    int control_port;
+  };
+
+  std::vector<HeadServerEntry> get_head_servers() const {
+    std::vector<HeadServerEntry> servers;
+    for (int i = 0; i < 100; ++i) {
+      std::string prefix = "head_servers." + std::to_string(i);
+      std::string host = get_string(prefix + ".host", "");
+      if (host.empty())
+        break;
+      HeadServerEntry entry;
+      entry.id = get_string(prefix + ".id", "head_server_" + std::to_string(i + 1));
+      entry.host = host;
+      entry.port = get_int(prefix + ".port", 9669);
+      entry.control_port = get_int(prefix + ".control_port", 9670 + i);
+      servers.push_back(entry);
+    }
+    return servers;
+  }
+
   /// Debug: dump all parsed key-value pairs.
   void dump() const {
     std::shared_lock lock(mutex_);

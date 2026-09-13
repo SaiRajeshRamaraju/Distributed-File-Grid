@@ -76,6 +76,7 @@ private:
         file_transfer::v1::FetchHashRequest req;
         std::string unique_chunk_id = filename + "_chunk_" + std::to_string(location.chunk_id);
         req.set_chunk_id(unique_chunk_id);
+        req.set_file_path(location.file_path);
 
         std::string serialized;
         req.SerializeToString(&serialized);
@@ -109,7 +110,7 @@ private:
     }
 
 public:
-    bool repair_chunk_on_server(const ChunkLocation& location, const std::string& filename, const std::vector<char>& chunk_data) {
+    bool repair_chunk_on_server(const ChunkLocation& location, const std::string& filename, const std::vector<char>& chunk_data, std::string* out_file_path = nullptr) {
         std::string ip;
         int port;
         dfg::net::parse_address(location.server_ip, ip, port);
@@ -144,6 +145,9 @@ public:
             if (dfg::net::recv_all(sock, resp_buf.data(), resp_len)) {
                 file_transfer::v1::ChunkResponse resp;
                 if (resp.ParseFromArray(resp_buf.data(), resp_len) && resp.success()) {
+                    if (out_file_path) {
+                        *out_file_path = resp.file_path();
+                    }
                     ::close(sock);
                     return true;
                 }
@@ -167,6 +171,7 @@ public:
         file_transfer::v1::FetchChunkRequest req;
         std::string unique_chunk_id = filename + "_chunk_" + std::to_string(location.chunk_id);
         req.set_chunk_id(unique_chunk_id);
+        req.set_file_path(location.file_path);
 
         std::string serialized;
         req.SerializeToString(&serialized);
@@ -570,11 +575,11 @@ void handle_client_download(int fd, const std::string& filename) {
     g_file_reconstructor.stream_file_to_client(filename, fd);
 }
 
-bool replicate_chunk_to_server(const std::string& source_server, int chunk_id, const std::string& target_server, const std::string& filename) {
+bool replicate_chunk_to_server(const std::string& source_server, int chunk_id, const std::string& target_server, const std::string& filename, std::string* out_file_path = nullptr, const std::string& source_file_path = "") {
     ChunkLocation source_loc;
     source_loc.chunk_id = chunk_id;
     source_loc.server_ip = source_server;
-    source_loc.file_path = "";
+    source_loc.file_path = source_file_path;
 
     auto chunk_data = g_file_reconstructor.read_chunk_from_server(source_loc, filename);
     if (chunk_data.empty()) {
@@ -588,7 +593,7 @@ bool replicate_chunk_to_server(const std::string& source_server, int chunk_id, c
     target_loc.server_ip = target_server;
     target_loc.file_path = "/tmp/chunks/" + target_server + "_" + filename + "_chunk_" + std::to_string(chunk_id);
 
-    bool ok = g_file_reconstructor.repair_chunk_on_server(target_loc, filename, chunk_data);
+    bool ok = g_file_reconstructor.repair_chunk_on_server(target_loc, filename, chunk_data, out_file_path);
     if (ok) {
         std::cout << "[Replication] Successfully duplicated chunk " << chunk_id
                   << " of file " << filename << " to new server " << target_server << std::endl;

@@ -43,9 +43,25 @@ target_include_directories(test_heartbeat PRIVATE
 )
 add_test(NAME HeartbeatTest COMMAND test_heartbeat)
 
+add_executable(test_metadata_replication
+    unit/test_metadata_replication.cpp
+)
+target_link_libraries(test_metadata_replication PRIVATE
+    GTest::GTest GTest::Main
+    Threads::Threads
+    dfg_common
+    dfg_proto
+)
+target_include_directories(test_metadata_replication PRIVATE
+    ${CMAKE_BINARY_DIR}/generated
+    ${CMAKE_SOURCE_DIR}/src/head_server
+)
+add_test(NAME MetadataReplicationTest COMMAND test_metadata_replication)
+
 # ── Convenience target ──
 add_custom_target(run_tests
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-    DEPENDS test_async_io simple_heartbeat_test test_heartbeat
+    DEPENDS test_async_io simple_heartbeat_test test_heartbeat test_metadata_replication
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
 )
+

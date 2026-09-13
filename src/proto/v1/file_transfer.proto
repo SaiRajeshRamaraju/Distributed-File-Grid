@@ -11,10 +11,12 @@ message ChunkResponse {
   bool success = 1;
   string chunk_id = 2;
   string error_message = 3;
+  string file_path = 4;
 }
 
 message FetchChunkRequest {
   string chunk_id = 1;
+  string file_path = 2;
 }
 
 message FetchChunkResponse {
@@ -26,6 +28,7 @@ message FetchChunkResponse {
 
 message FetchHashRequest {
   string chunk_id = 1;
+  string file_path = 2;
 }
 
 message FetchHashResponse {
@@ -47,4 +50,6 @@ message ReplicateChunkRequest {
 message ReplicateChunkResponse {
   bool success = 1;
   string error_message = 2;
+  string file_path = 3;
 }
+
