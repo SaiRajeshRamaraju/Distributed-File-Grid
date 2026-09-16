@@ -38,7 +38,7 @@ HeadServerMetrics *get_head_metrics() { return g_head_metrics.get(); }
 
 // Global health monitor and server registry
 std::unique_ptr<dfg::HealthMonitor> g_health_monitor;
-static std::unique_ptr<dfg::ServerRegistry> g_cluster_registry;
+std::unique_ptr<dfg::ServerRegistry> g_cluster_registry;
 static std::unique_ptr<dfg::ControlAPI> g_control_api;
 
 // Graceful shutdown flag

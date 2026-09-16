@@ -10,8 +10,10 @@
 #include <dfg/sha256.hpp>
 #include <dfg/thread_pool.hpp>
 #include <dfg/health_monitor.hpp>
+#include <dfg/server_registry.hpp>
 
 extern std::unique_ptr<dfg::HealthMonitor> g_health_monitor;
+extern std::unique_ptr<dfg::ServerRegistry> g_cluster_registry;
 
 #include <algorithm>
 #include <atomic>
@@ -87,9 +89,17 @@ private:
   }
 
   std::vector<std::string> select_servers_for_chunk(int replication_factor) {
-    std::vector<std::string> selected;
+    load_cluster_servers();
 
-    auto servers_copy = cluster_servers;
+    std::vector<std::string> servers_copy;
+    if (g_cluster_registry) {
+      servers_copy = g_cluster_registry->get_addresses();
+    }
+    if (servers_copy.empty()) {
+      servers_copy = cluster_servers;
+    }
+
+    std::vector<std::string> selected;
     
     // Sort by lowest disk usage and filter healthy servers
     if (g_health_monitor) {

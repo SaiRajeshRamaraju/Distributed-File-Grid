@@ -255,6 +255,9 @@ inline void delete_server_metadata(const std::string &server_address) {
 #ifndef WITH_REDIS
 using metadata_store::atomic_replace_server_chunks;
 using metadata_store::delete_server_metadata;
+inline std::vector<std::string> list_all_files() {
+  return metadata_store::list_files_snapshot();
+}
 #endif
 
 #ifdef WITH_REDIS
@@ -269,6 +272,30 @@ inline std::string get_redis_connection_string() {
 inline Redis& get_redis() {
   static Redis redis(get_redis_connection_string());
   return redis;
+}
+
+inline std::vector<std::string> list_all_files() {
+  try {
+    Redis &redis = get_redis();
+    std::vector<std::string> files;
+    long long cursor = 0;
+    do {
+      std::vector<std::string> batch;
+      cursor = redis.scan(cursor, "file:*", 100, std::back_inserter(batch));
+      for (const auto &key : batch) {
+        if (key.rfind("file:", 0) == 0) {
+          files.push_back(key.substr(5));
+        }
+      }
+    } while (cursor != 0);
+
+    std::sort(files.begin(), files.end());
+    files.erase(std::unique(files.begin(), files.end()), files.end());
+    return files;
+  } catch (const std::exception &e) {
+    std::cerr << "list_all_files error: " << e.what() << std::endl;
+    return {};
+  }
 }
 
 inline void create_entry(const std::string &request) {
@@ -726,11 +753,20 @@ inline int create_replication(const std::string &ip_address) {
 
 #ifdef WITH_REDIS
 // Check if Redis is already running by trying to connect
-inline bool is_redis_running(const std::string &host = "127.0.0.1",
-                             int port = 6379) {
+inline bool is_redis_running(const std::string &host = "",
+                             int port = 0) {
   try {
-    // Use the provided host/port for checking
-    Redis redis("tcp://" + host + ":" + std::to_string(port));
+    std::string h = host;
+    int p = port;
+    if (h.empty()) {
+      const char *env_h = std::getenv("REDIS_HOST");
+      h = (env_h && *env_h) ? env_h : "127.0.0.1";
+    }
+    if (p <= 0) {
+      const char *env_p = std::getenv("REDIS_PORT");
+      p = (env_p && *env_p) ? std::stoi(env_p) : 6379;
+    }
+    Redis redis("tcp://" + h + ":" + std::to_string(p));
     redis.ping();
     return true;
   } catch (const std::exception &) {
@@ -803,36 +839,6 @@ inline int start_server() {
   std::cout << "Redis disabled - using in-memory storage simulation"
             << std::endl;
   return 0; // Return success since we're simulating
-}
-#endif
-
-#ifdef WITH_REDIS
-inline std::vector<std::string> list_all_files() {
-  try {
-    Redis &redis = get_redis();
-    std::vector<std::string> files;
-    long long cursor = 0;
-    do {
-      std::vector<std::string> batch;
-      cursor = redis.scan(cursor, "file:*", 100, std::back_inserter(batch));
-      for (const auto &key : batch) {
-        if (key.rfind("file:", 0) == 0) {
-          files.push_back(key.substr(5));
-        }
-      }
-    } while (cursor != 0);
-
-    std::sort(files.begin(), files.end());
-    files.erase(std::unique(files.begin(), files.end()), files.end());
-    return files;
-  } catch (const std::exception &e) {
-    std::cerr << "list_all_files error: " << e.what() << std::endl;
-    return {};
-  }
-}
-#else
-inline std::vector<std::string> list_all_files() {
-  return metadata_store::list_files_snapshot();
 }
 #endif
 

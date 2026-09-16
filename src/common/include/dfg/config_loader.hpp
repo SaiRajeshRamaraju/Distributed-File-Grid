@@ -60,11 +60,32 @@ public:
   /// Get a string value.  Returns `default_val` if key is absent.
   std::string get_string(const std::string &key,
                          const std::string &default_val = "") const {
-    // Environment variable override: DFG_SERVER_PORT for "server.port"
-    std::string env_key = "DFG_" + to_env_name(key);
+    // 1. Check DFG_<UPPER_SNAKE_CASE> override
+    std::string raw_env = to_env_name(key);
+    std::string env_key = "DFG_" + raw_env;
     const char *env = std::getenv(env_key.c_str());
     if (env && *env)
       return std::string(env);
+
+    // 2. Check <UPPER_SNAKE_CASE> without DFG_ prefix (e.g. HEAD_SERVER_HOST)
+    env = std::getenv(raw_env.c_str());
+    if (env && *env)
+      return std::string(env);
+
+    // 3. Known aliases used across deployment configs
+    if (key == "zookeeper.hosts") {
+      const char *v = std::getenv("ZK_HOSTS");
+      if (v && *v) return std::string(v);
+    } else if (key == "head_server.control_port") {
+      const char *v = std::getenv("CONTROL_PORT");
+      if (v && *v) return std::string(v);
+    } else if (key == "heartbeat.target_host") {
+      const char *v = std::getenv("HEALTH_CHECKER_HOST");
+      if (v && *v) return std::string(v);
+    } else if (key == "heartbeat.target_port") {
+      const char *v = std::getenv("HEALTH_CHECKER_PORT");
+      if (v && *v) return std::string(v);
+    }
 
     std::shared_lock lock(mutex_);
     auto it = values_.find(key);

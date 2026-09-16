@@ -34,10 +34,10 @@ RUN git clone https://github.com/redis/hiredis.git && \
 
 # Install Prometheus-CPP from source
 WORKDIR /tmp
-RUN git clone --recursive https://github.com/jupp0r/prometheus-cpp.git && \
+RUN git clone --recursive -b v1.2.4 https://github.com/jupp0r/prometheus-cpp.git && \
     cd prometheus-cpp && \
     mkdir build && cd build && \
-    cmake -DBUILD_SHARED_LIBS=ON -DENABLE_PULL=ON -DENABLE_PUSH=ON .. && \
+    cmake -DBUILD_SHARED_LIBS=ON -DENABLE_PULL=ON -DENABLE_PUSH=OFF -DENABLE_TESTING=OFF .. && \
     make -j$(nproc) && \
     make install && \
     ldconfig
@@ -102,8 +102,9 @@ RUN ldconfig
 COPY config/ /app/config/
 COPY scripts/ /app/scripts/
 
-# Create necessary directories
-RUN mkdir -p /app/logs /app/data /tmp/chunks /tmp/cluster_storage
+# Create necessary directories and populate /etc/dfg
+RUN mkdir -p /app/logs /app/data /tmp/chunks /tmp/cluster_storage /etc/dfg && \
+    cp -r /app/config/* /etc/dfg/
 
 # Copy ZooKeeper configuration
 COPY deploy/docker/zoo.cfg /opt/zookeeper/conf/
@@ -112,6 +113,8 @@ COPY deploy/docker/zoo.cfg /opt/zookeeper/conf/
 COPY deploy/docker/start-services.sh /app/
 COPY deploy/docker/healthcheck.sh /app/
 RUN chmod +x /app/start-services.sh /app/healthcheck.sh
+
+WORKDIR /app
 
 # Expose ports
 EXPOSE 9669 8080 8081 8082 9000 6379 2181 9091

@@ -51,6 +51,7 @@ services:
       - "9669:9669"
       - "9670:9670"  # Control API for dynamic server management
       - "9000:9000/udp"  # Heartbeat receiver (UDP)
+      - "9095:9095"  # Prometheus metrics
     environment:
       - SERVER_ID=head_server_1
       - SERVER_PORT=9669
@@ -58,6 +59,14 @@ services:
       - REDIS_PORT=6379
       - ZK_HOSTS=zookeeper:2181
       - SERVER_ROLE=primary
+      - METRICS_PORT=9095
+      - CONTROL_PORT=9670
+      - DFG_CLUSTER_SERVERS_0_HOST=cluster-server-1
+      - DFG_CLUSTER_SERVERS_0_PORT=8080
+      - DFG_CLUSTER_SERVERS_1_HOST=cluster-server-2
+      - DFG_CLUSTER_SERVERS_1_PORT=8081
+      - DFG_CLUSTER_SERVERS_2_HOST=cluster-server-3
+      - DFG_CLUSTER_SERVERS_2_PORT=8082
     volumes:
       - ./logs:/app/logs
       - ./data:/app/data
@@ -90,6 +99,12 @@ services:
       - REDIS_PORT=6379
       - ZK_HOSTS=zookeeper:2181
       - SERVER_ROLE=backup
+      - DFG_CLUSTER_SERVERS_0_HOST=cluster-server-1
+      - DFG_CLUSTER_SERVERS_0_PORT=8080
+      - DFG_CLUSTER_SERVERS_1_HOST=cluster-server-2
+      - DFG_CLUSTER_SERVERS_1_PORT=8081
+      - DFG_CLUSTER_SERVERS_2_HOST=cluster-server-3
+      - DFG_CLUSTER_SERVERS_2_PORT=8082
     volumes:
       - ./logs:/app/logs
       - ./data:/app/data
@@ -119,6 +134,7 @@ services:
       - "9091:9091"  # Prometheus metrics
     environment:
       - SERVER_ID=1
+      - SERVER_HOST=cluster-server-1
       - SERVER_PORT=8080
       - METRICS_PORT=9091
       - HEAD_SERVER_HOST=head-server-1
@@ -151,6 +167,7 @@ services:
       - "9092:9091"  # Prometheus metrics
     environment:
       - SERVER_ID=2
+      - SERVER_HOST=cluster-server-2
       - SERVER_PORT=8081
       - METRICS_PORT=9091
       - HEAD_SERVER_HOST=head-server-1
@@ -183,6 +200,7 @@ services:
       - "9093:9091"  # Prometheus metrics
     environment:
       - SERVER_ID=3
+      - SERVER_HOST=cluster-server-3
       - SERVER_PORT=8082
       - METRICS_PORT=9091
       - HEAD_SERVER_HOST=head-server-1
@@ -211,6 +229,7 @@ services:
     container_name: dfg-health-checker
     ports:
       - "9001:9000/udp"
+      - "9096:9096"
     environment:
       - MONITOR_PORT=9000
       - HEAD_SERVER_HOST=head-server-1
