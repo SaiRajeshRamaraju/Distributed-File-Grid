@@ -55,19 +55,19 @@ status:
 # Run system tests
 test: build
 	@echo "Running system tests..."
-	@cd build && ./dfg test
+	@cd build && ./client test
 
 # Upload a test file
 upload-test: build
 	@echo "Creating and uploading test file..."
 	@echo "This is a test file for the distributed storage system." > /tmp/test_upload.txt
 	@echo "It demonstrates file upload functionality." >> /tmp/test_upload.txt
-	@cd build && ./dfg upload /tmp/test_upload.txt test_upload.txt
+	@cd build && ./client upload /tmp/test_upload.txt test_upload.txt
 
 # Download the test file
 download-test: build
 	@echo "Downloading test file..."
-	@cd build && ./dfg download test_upload.txt /tmp/test_download.txt
+	@cd build && ./client download test_upload.txt /tmp/test_download.txt
 	@echo "Downloaded file contents:"
 	@cat /tmp/test_download.txt
 
@@ -102,8 +102,9 @@ help:
 	@echo "  make all            - Build everything (default)"
 	@echo "  make help           - Show this help message"
 	@echo ""
-	@echo "Manual Commands:"
+	@echo "Manual Commands (Server & Client):"
 	@echo "  cd build && ./dfg head-server"
 	@echo "  cd build && ./dfg cluster-server --server-id 1 --port 8080"
-	@echo "  cd build && ./dfg upload <file> <name>"
-	@echo "  cd build && ./dfg download <name> <output>"
+	@echo "  cd build && ./client upload <file> [name]"
+	@echo "  cd build && ./client download <name> [output]"
+	@echo "  cd build && ./client list"

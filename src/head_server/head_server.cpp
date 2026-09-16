@@ -698,6 +698,14 @@ int run_head_server(int argc, char **argv) {
                       }
                       extern void handle_client_upload(int fd, const std::string& initial_req);
                       handle_client_upload(cfd, req);
+                  } else if (req.rfind("LIST", 0) == 0) {
+                      auto files = list_all_files();
+                      std::string resp;
+                      for (const auto &file : files) {
+                          resp += file + "\n";
+                      }
+                      resp += "EOF\n";
+                      ::send(cfd, resp.data(), resp.size(), 0);
                   }
               }
               ::close(cfd);

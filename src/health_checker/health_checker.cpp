@@ -440,7 +440,7 @@ public:
 // Global health checker instance
 static std::unique_ptr<HealthChecker> g_health_checker;
 
-int main(int argc, char** argv) {
+int run_health_checker(int argc, char** argv) {
     if (argc > 1) {
         std::string arg = argv[1];
         
@@ -467,6 +467,12 @@ int main(int argc, char** argv) {
     
     return 0;
 }
+
+#ifndef DFG_UNIFIED_BINARY
+int main(int argc, char** argv) {
+    return run_health_checker(argc, argv);
+}
+#endif
 
 extern "C" {
     int start_health_checker() {

@@ -47,7 +47,7 @@ const char *zerror(int code) {
 }
 } // namespace
 
-std::string get_local_ip_address();
+static std::string get_local_ip_address();
 
 // Real ZooKeeper client wrapper
 class ZooKeeperClientWrapper {
@@ -957,7 +957,7 @@ public:
 // Global monitor instance
 static std::unique_ptr<ZooKeeperHeadServerMonitor> g_monitor;
 
-void signal_handler(int signal) {
+static void signal_handler(int signal) {
   std::cout << "\nReceived signal " << signal << ", shutting down..."
             << std::endl;
   if (g_monitor) {
@@ -970,7 +970,7 @@ void signal_handler(int signal) {
 // Address from DHCP using the interface. This already have network permission.
 // We should be able read the interface address pretty easily. Helper function
 // to get local IP address
-std::string get_local_ip_address() {
+static std::string get_local_ip_address() {
   int sock = socket(AF_INET, SOCK_DGRAM, 0);
   if (sock < 0) {
     return "unknown";
@@ -1005,7 +1005,7 @@ std::string get_local_ip_address() {
   return std::string(ip);
 }
 
-int main(int argc, char *argv[]) {
+int run_zk_monitor(int argc, char *argv[]) {
   // Load configuration
   auto &cfg = zookeeper_config();
 
@@ -1087,3 +1087,9 @@ int main(int argc, char *argv[]) {
 
   return 0;
 }
+
+#ifndef DFG_UNIFIED_BINARY
+int main(int argc, char *argv[]) {
+  return run_zk_monitor(argc, argv);
+}
+#endif

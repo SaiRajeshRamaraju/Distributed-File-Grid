@@ -21,12 +21,12 @@ A high-performance, fault-tolerant distributed file storage grid in modern **C++
                        ┌────────────────────────────────────────────────────────┐
                        │                   User Applications                    │
                        │   ┌──────────────────┐          ┌──────────────────┐   │
-                       │   │  dfg Unified CLI │          │ dfg_client / App │   │
+                       │   │  client CLI      │          │ App Integrations │   │
                        │   └─────────┬────────┘          └────────┬─────────┘   │
                        └─────────────┼────────────────────────────┼─────────────┘
                                      │                            │
-                     HTTP Control    │                            │ TCP Streaming
-                     API (:9670)     │                            │ (:9669)
+                                     │ TCP Streaming (:9669)      │
+                                     │ (UPLOAD / DOWNLOAD / LIST) │
                                      ▼                            ▼
                        ┌────────────────────────────────────────────────────────┐
                        │                      Head Server                       │
@@ -70,12 +70,12 @@ A high-performance, fault-tolerant distributed file storage grid in modern **C++
 
 | Binary | Description |
 |---|---|
-| `dfg` | Unified CLI binary — handles file upload/download/list, cluster management, and starting embedded daemons. |
+| `dfg` | Server binary — launches and manages backend services (`head-server`, `cluster-server`, `health-checker`, `zk-monitor`, and runtime cluster node management). |
+| `client` | Client binary — dedicated CLI for client-side operations (`upload`, `download`, `list`, `test`). Symlinked to `dfg_client` for backward compatibility. |
 | `head_server` | Standalone metadata and coordination master. |
 | `cluster_server` | Standalone storage node daemon for receiving and serving chunk data. |
 | `health_checker` | Standalone health monitoring daemon with web dashboard and Prometheus metrics. |
 | `zk_head_server_monitor` | ZooKeeper-based leader election and head server failover monitor. |
-| `dfg_client` | Standalone dedicated client utility for file downloads. |
 
 ---
 
@@ -171,7 +171,7 @@ You can launch the entire grid locally using the provided automation scripts:
 ./scripts/stop_services.sh
 ```
 
-### Manual Service Startup
+### Manual Service Startup (`dfg`)
 
 Open multiple terminals:
 
@@ -185,61 +185,53 @@ Open multiple terminals:
 ./build/dfg cluster-server --server-id 3 --port 8082
 
 # Terminal 3: Start Health Checker
-./build/health_checker
-```
+./build/dfg health-checker
 
----
+# Terminal 4: Start ZooKeeper Monitor (Optional)
+./build/dfg zk-monitor
 
-## Client Applications
-
-The grid provides two client interfaces for interacting with the cluster:
-
-### 1. Unified Client CLI (`dfg`)
-
-The primary client interface supporting complete file lifecycle management and diagnostic status:
-
-```bash
-# Upload a file (splits, calculates hashes, replicates to storage nodes)
-./build/dfg upload <local-file-path> <remote-grid-name>
-# Example: ./build/dfg upload document.pdf my_doc.pdf
-
-# Download a file (queries replicas, consensus hash voting, read repair, assembly)
-./build/dfg download <remote-grid-name> <output-file-path>
-# Example: ./build/dfg download my_doc.pdf /tmp/restored_doc.pdf
-
-# List all stored files with metadata
-./build/dfg list
-
-# Check chunk distribution and replica health for a file
-./build/dfg status <remote-grid-name>
-
-# Run an end-to-end upload/download verification test
-./build/dfg test
-
-# Cluster Server Management (via Head Server Control API)
+# Runtime Cluster Node Management (via Head Server Control API :9670)
 ./build/dfg list-servers
 ./build/dfg add-server --host 192.168.1.50 --port 8083
 ./build/dfg remove-server --id 4
 ```
 
-### 2. Standalone Client Utility (`dfg_client`)
+---
 
-A dedicated network client utility supporting both streaming file downloads and direct file uploads to the Head Server (`:9669`) with cryptographic SHA-256 validation:
+## Client Application (`client`)
 
-#### Download File:
+The dedicated client CLI (`client`, symlinked as `dfg_client`) handles all client-side file lifecycle operations over TCP streaming (`:9669`) with cryptographic SHA-256 validation:
+
+### 1. Subcommands:
+
 ```bash
-# Named flags:
-./build/dfg_client --server_ip 127.0.0.1 --server_port 9669 --download my_doc.pdf -o /tmp/downloaded_doc.pdf
+# Upload a file (calculates SHA-256, streams to head server, replicates to nodes)
+./build/client upload <local-file-path> [remote-grid-name]
+# Example: ./build/client upload document.pdf my_doc.pdf
 
-# Or legacy positional arguments:
-# Usage: dfg_client <head_ip> <head_port> <filename> [output_path]
-./build/dfg_client 127.0.0.1 9669 my_doc.pdf /tmp/downloaded_doc.pdf
+# Download a file (queries replicas, consensus hash voting, read repair, assembly)
+./build/client download <remote-grid-name> [output-file-path]
+# Example: ./build/client download my_doc.pdf /tmp/restored_doc.pdf
+
+# List all stored files with metadata
+./build/client list
+
+# Run end-to-end upload/download verification test
+./build/client test
 ```
 
-#### Upload File:
+### 2. Flags & Compatibility Options:
+
 ```bash
-# Calculate SHA-256 digest locally, stream chunks to Head Server, and replicate:
-./build/dfg_client --server_ip 127.0.0.1 --server_port 9669 --upload /path/to/local_file.iso
+# Flag-based upload:
+./build/client --server_ip 127.0.0.1 --server_port 9669 --upload /path/to/local_file.iso
+
+# Flag-based download:
+./build/client --server_ip 127.0.0.1 --server_port 9669 --download my_doc.pdf -o /tmp/downloaded_doc.pdf
+
+# Legacy positional arguments:
+# Usage: client <head_ip> <head_port> <filename> [output_path]
+./build/client 127.0.0.1 9669 my_doc.pdf /tmp/downloaded_doc.pdf
 ```
 
 #### Client Protocol & Integrity Guarantees

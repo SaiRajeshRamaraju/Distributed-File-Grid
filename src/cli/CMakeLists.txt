@@ -1,12 +1,15 @@
-# src/cli/CMakeLists.txt — Unified dfg binary
+# src/cli/CMakeLists.txt — Server-side dfg binary
 
 add_executable(dfg
     dfg_cli.cpp
     ${CMAKE_SOURCE_DIR}/src/head_server/head_server.cpp
     ${CMAKE_SOURCE_DIR}/src/head_server/file_upload.cpp
     ${CMAKE_SOURCE_DIR}/src/head_server/file_download.cpp
+    ${CMAKE_SOURCE_DIR}/src/cluster_server/cluster_server.cpp
     ${CMAKE_SOURCE_DIR}/src/cluster_server/chunk_service.cpp
     ${CMAKE_SOURCE_DIR}/src/cluster_server/metrics_exporter.cpp
+    ${CMAKE_SOURCE_DIR}/src/health_checker/health_checker.cpp
+    ${CMAKE_SOURCE_DIR}/src/zk_monitor/zk_monitor.cpp
     ${CMAKE_SOURCE_DIR}/src/common/src/zookeeper_client.cpp
 )
 
@@ -15,6 +18,8 @@ target_compile_definitions(dfg PRIVATE DFG_UNIFIED_BINARY)
 target_include_directories(dfg PRIVATE
     ${CMAKE_SOURCE_DIR}/src/head_server
     ${CMAKE_SOURCE_DIR}/src/cluster_server
+    ${CMAKE_SOURCE_DIR}/src/health_checker
+    ${CMAKE_SOURCE_DIR}/src/zk_monitor
 )
 
 target_link_libraries(dfg PRIVATE

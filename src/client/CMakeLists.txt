@@ -18,12 +18,20 @@ if(NOT argparse_FOUND)
     FetchContent_MakeAvailable(argparse)
 endif()
 
-add_executable(dfg_client client.cpp)
+add_executable(client client.cpp)
 
-target_link_libraries(dfg_client
+target_link_libraries(client
     PRIVATE
     dfg_common
     pthread
     argparse
 )
+
+# Provide dfg_client as a symlink to client for backward compatibility
+add_custom_command(TARGET client POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E create_symlink $<TARGET_FILE_NAME:client> $<TARGET_FILE_DIR:client>/dfg_client
+    COMMENT "Creating symlink dfg_client -> client"
+)
+
+add_custom_target(dfg_client ALL DEPENDS client)
 

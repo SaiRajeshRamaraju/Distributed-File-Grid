@@ -8,7 +8,8 @@ set -uo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${PROJECT_ROOT}/build"
 DFG_BIN="${BUILD_DIR}/dfg"
-CLIENT_BIN="${BUILD_DIR}/dfg_client"
+CLIENT_BIN="${BUILD_DIR}/client"
+[[ ! -x "${CLIENT_BIN}" && -x "${BUILD_DIR}/dfg_client" ]] && CLIENT_BIN="${BUILD_DIR}/dfg_client"
 COMPOSE_FILE="${PROJECT_ROOT}/deploy/docker/docker-compose.yml"
 COMPOSE_PROJECT="dfg"
 
@@ -133,7 +134,12 @@ run_local_mode() {
 
     # Ensure required binaries exist
     if [[ ! -x "${DFG_BIN}" ]]; then
-        echo -e "${RED}[ERROR] Main binary '${DFG_BIN}' not found. Please build the project first.${NC}"
+        echo -e "${RED}[ERROR] Server binary '${DFG_BIN}' not found. Please build the project first.${NC}"
+        echo "Example: cmake -B build -DBUILD_TESTS=ON && cmake --build build"
+        exit 1
+    fi
+    if [[ ! -x "${CLIENT_BIN}" ]]; then
+        echo -e "${RED}[ERROR] Client binary '${CLIENT_BIN}' not found. Please build the project first.${NC}"
         echo "Example: cmake -B build -DBUILD_TESTS=ON && cmake --build build"
         exit 1
     fi
@@ -174,11 +180,11 @@ run_local_mode() {
     local ORIGINAL_HASH_SMALL
     ORIGINAL_HASH_SMALL=$(sha256sum "${SMALL_SRC}" | awk '{print $1}')
 
-    "${DFG_BIN}" upload "${SMALL_SRC}" "e2e_small.bin" > "${LOG_DIR}/upload_small.log" 2>&1
+    "${CLIENT_BIN}" upload "${SMALL_SRC}" "e2e_small.bin" > "${LOG_DIR}/upload_small.log" 2>&1
     local UP_STATUS_1=$?
 
     if [[ ${UP_STATUS_1} -eq 0 ]]; then
-        "${DFG_BIN}" download "e2e_small.bin" "${SMALL_OUT}" > "${LOG_DIR}/download_small.log" 2>&1
+        "${CLIENT_BIN}" download "e2e_small.bin" "${SMALL_OUT}" > "${LOG_DIR}/download_small.log" 2>&1
         local DOWN_STATUS_1=$?
         if [[ ${DOWN_STATUS_1} -eq 0 && -f "${SMALL_OUT}" ]]; then
             local RESTORED_HASH_SMALL
@@ -204,11 +210,11 @@ run_local_mode() {
     local ORIGINAL_HASH_LARGE
     ORIGINAL_HASH_LARGE=$(sha256sum "${LARGE_SRC}" | awk '{print $1}')
 
-    "${DFG_BIN}" upload "${LARGE_SRC}" "e2e_large.bin" > "${LOG_DIR}/upload_large.log" 2>&1
+    "${CLIENT_BIN}" upload "${LARGE_SRC}" "e2e_large.bin" > "${LOG_DIR}/upload_large.log" 2>&1
     local UP_STATUS_2=$?
 
     if [[ ${UP_STATUS_2} -eq 0 ]]; then
-        "${DFG_BIN}" download "e2e_large.bin" "${LARGE_OUT}" > "${LOG_DIR}/download_large.log" 2>&1
+        "${CLIENT_BIN}" download "e2e_large.bin" "${LARGE_OUT}" > "${LOG_DIR}/download_large.log" 2>&1
         local DOWN_STATUS_2=$?
         if [[ ${DOWN_STATUS_2} -eq 0 && -f "${LARGE_OUT}" ]]; then
             local RESTORED_HASH_LARGE
@@ -254,11 +260,11 @@ run_local_mode() {
     local EMPTY_OUT="${TMP_DIR}/out_empty.txt"
     touch "${EMPTY_SRC}"
 
-    "${DFG_BIN}" upload "${EMPTY_SRC}" "e2e_empty.txt" > "${LOG_DIR}/upload_empty.log" 2>&1
+    "${CLIENT_BIN}" upload "${EMPTY_SRC}" "e2e_empty.txt" > "${LOG_DIR}/upload_empty.log" 2>&1
     local UP_STATUS_4=$?
 
     if [[ ${UP_STATUS_4} -eq 0 ]]; then
-        "${DFG_BIN}" download "e2e_empty.txt" "${EMPTY_OUT}" > "${LOG_DIR}/download_empty.log" 2>&1
+        "${CLIENT_BIN}" download "e2e_empty.txt" "${EMPTY_OUT}" > "${LOG_DIR}/download_empty.log" 2>&1
         local DOWN_STATUS_4=$?
         if [[ ${DOWN_STATUS_4} -eq 0 && -f "${EMPTY_OUT}" && ! -s "${EMPTY_OUT}" ]]; then
             report_result "Test 4: 0-Byte Empty File Upload & Download" 0
@@ -273,11 +279,11 @@ run_local_mode() {
     # Test 5: Metadata Store & File Listing Command
     # ─────────────────────────────────────────────────────────────────────────
     local LIST_OUTPUT
-    LIST_OUTPUT=$("${DFG_BIN}" list 2>&1 || true)
+    LIST_OUTPUT=$("${CLIENT_BIN}" list 2>&1 || true)
     if echo "${LIST_OUTPUT}" | grep -q "e2e_small.bin" && echo "${LIST_OUTPUT}" | grep -q "e2e_large.bin"; then
-        report_result "Test 5: Metadata Store & File Listing (dfg list)" 0
+        report_result "Test 5: Metadata Store & File Listing (client list)" 0
     else
-        report_result "Test 5: Metadata Store & File Listing (dfg list)" 1 "Files not found in listing output: ${LIST_OUTPUT}"
+        report_result "Test 5: Metadata Store & File Listing (client list)" 1 "Files not found in listing output: ${LIST_OUTPUT}"
     fi
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -323,7 +329,7 @@ run_local_mode() {
     fi
 
     local REPAIR_OUT="${TMP_DIR}/out_repaired.bin"
-    "${DFG_BIN}" download "e2e_small.bin" "${REPAIR_OUT}" > "${LOG_DIR}/download_repair.log" 2>&1
+    "${CLIENT_BIN}" download "e2e_small.bin" "${REPAIR_OUT}" > "${LOG_DIR}/download_repair.log" 2>&1
     local REPAIR_STATUS=$?
 
     if [[ ${REPAIR_STATUS} -eq 0 && -f "${REPAIR_OUT}" ]]; then
@@ -430,11 +436,11 @@ run_system_mode() {
     local SYS_ORIGINAL_HASH_SMALL
     SYS_ORIGINAL_HASH_SMALL=$(sha256sum "${SYS_SMALL_SRC}" | awk '{print $1}')
 
-    if [[ -x "${DFG_BIN}" ]]; then
-        "${DFG_BIN}" upload "${SYS_SMALL_SRC}" "sys_small.bin" > "${LOG_DIR}/sys_upload_small.log" 2>&1
+    if [[ -x "${CLIENT_BIN}" ]]; then
+        "${CLIENT_BIN}" upload "${SYS_SMALL_SRC}" "sys_small.bin" > "${LOG_DIR}/sys_upload_small.log" 2>&1
         local SYS_UP_STATUS=$?
         if [[ ${SYS_UP_STATUS} -eq 0 ]]; then
-            "${DFG_BIN}" download "sys_small.bin" "${SYS_SMALL_OUT}" > "${LOG_DIR}/sys_download_small.log" 2>&1
+            "${CLIENT_BIN}" download "sys_small.bin" "${SYS_SMALL_OUT}" > "${LOG_DIR}/sys_download_small.log" 2>&1
             local SYS_DOWN_STATUS=$?
             if [[ ${SYS_DOWN_STATUS} -eq 0 && -f "${SYS_SMALL_OUT}" ]]; then
                 local SYS_RESTORED_HASH_SMALL
@@ -453,7 +459,7 @@ run_system_mode() {
     else
         # Fallback to test-client container execution
         ${DOCKER_COMPOSE_CMD} -f "${COMPOSE_FILE}" -p "${COMPOSE_PROJECT}" exec -T test-client bash -c \
-            "head -c 262144 /dev/urandom > /tmp/test_c.bin && dfg upload /tmp/test_c.bin sys_small.bin && dfg download sys_small.bin /tmp/out_c.bin && diff -q /tmp/test_c.bin /tmp/out_c.bin" > "${LOG_DIR}/sys_upload_client.log" 2>&1
+            "head -c 262144 /dev/urandom > /tmp/test_c.bin && client upload /tmp/test_c.bin sys_small.bin && client download sys_small.bin /tmp/out_c.bin && diff -q /tmp/test_c.bin /tmp/out_c.bin" > "${LOG_DIR}/sys_upload_client.log" 2>&1
         local CLIENT_EXEC_STATUS=$?
         if [[ ${CLIENT_EXEC_STATUS} -eq 0 ]]; then
             report_result "System Test 1: Small File Transfer & SHA-256 Integrity (in-container client)" 0
@@ -471,11 +477,11 @@ run_system_mode() {
     local SYS_ORIGINAL_HASH_LARGE
     SYS_ORIGINAL_HASH_LARGE=$(sha256sum "${SYS_LARGE_SRC}" | awk '{print $1}')
 
-    if [[ -x "${DFG_BIN}" ]]; then
-        "${DFG_BIN}" upload "${SYS_LARGE_SRC}" "sys_large.bin" > "${LOG_DIR}/sys_upload_large.log" 2>&1
+    if [[ -x "${CLIENT_BIN}" ]]; then
+        "${CLIENT_BIN}" upload "${SYS_LARGE_SRC}" "sys_large.bin" > "${LOG_DIR}/sys_upload_large.log" 2>&1
         local SYS_LARGE_UP_STATUS=$?
         if [[ ${SYS_LARGE_UP_STATUS} -eq 0 ]]; then
-            "${DFG_BIN}" download "sys_large.bin" "${SYS_LARGE_OUT}" > "${LOG_DIR}/sys_download_large.log" 2>&1
+            "${CLIENT_BIN}" download "sys_large.bin" "${SYS_LARGE_OUT}" > "${LOG_DIR}/sys_download_large.log" 2>&1
             local SYS_LARGE_DOWN_STATUS=$?
             if [[ ${SYS_LARGE_DOWN_STATUS} -eq 0 && -f "${SYS_LARGE_OUT}" ]]; then
                 local SYS_RESTORED_HASH_LARGE
@@ -520,11 +526,11 @@ run_system_mode() {
     local SYS_EMPTY_OUT="${TMP_DIR}/sys_empty_out.txt"
     touch "${SYS_EMPTY_SRC}"
 
-    if [[ -x "${DFG_BIN}" ]]; then
-        "${DFG_BIN}" upload "${SYS_EMPTY_SRC}" "sys_empty.txt" > "${LOG_DIR}/sys_upload_empty.log" 2>&1
+    if [[ -x "${CLIENT_BIN}" ]]; then
+        "${CLIENT_BIN}" upload "${SYS_EMPTY_SRC}" "sys_empty.txt" > "${LOG_DIR}/sys_upload_empty.log" 2>&1
         local SYS_EMPTY_UP=$?
         if [[ ${SYS_EMPTY_UP} -eq 0 ]]; then
-            "${DFG_BIN}" download "sys_empty.txt" "${SYS_EMPTY_OUT}" > "${LOG_DIR}/sys_download_empty.log" 2>&1
+            "${CLIENT_BIN}" download "sys_empty.txt" "${SYS_EMPTY_OUT}" > "${LOG_DIR}/sys_download_empty.log" 2>&1
             local SYS_EMPTY_DOWN=$?
             if [[ ${SYS_EMPTY_DOWN} -eq 0 && -f "${SYS_EMPTY_OUT}" && ! -s "${SYS_EMPTY_OUT}" ]]; then
                 report_result "System Test 4: 0-Byte Empty File Lifecycle in Container Grid" 0
@@ -539,11 +545,11 @@ run_system_mode() {
     # ─────────────────────────────────────────────────────────────────────────
     # System Test 5: Metadata Listing Command
     # ─────────────────────────────────────────────────────────────────────────
-    if [[ -x "${DFG_BIN}" ]]; then
+    if [[ -x "${CLIENT_BIN}" ]]; then
         local SYS_LIST_OUT
-        SYS_LIST_OUT=$("${DFG_BIN}" list 2>&1 || true)
+        SYS_LIST_OUT=$("${CLIENT_BIN}" list 2>&1 || true)
         if echo "${SYS_LIST_OUT}" | grep -q "sys_small.bin"; then
-            report_result "System Test 5: Metadata Store & File Listing (dfg list against container cluster)" 0
+            report_result "System Test 5: Metadata Store & File Listing (client list against container cluster)" 0
         else
             report_result "System Test 5: Metadata Store & File Listing" 1 "File not listed in metadata"
         fi
@@ -558,33 +564,31 @@ run_system_mode() {
     SYS_CLUSTER_JSON=$(curl -sf http://127.0.0.1:9670/api/v1/servers/cluster || echo "")
 
     if echo "${SYS_STATUS_JSON}" | grep -q "total_servers" && echo "${SYS_CLUSTER_JSON}" | grep -q "servers"; then
-        report_result "System Test 6: Containerized HTTP Control API (status & cluster list :9670)" 0
+        report_result "System Test 6: Containerized Control API (status & cluster list :9670)" 0
     else
-        report_result "System Test 6: Containerized HTTP Control API" 1 "Invalid response from Control API"
+        report_result "System Test 6: Containerized Control API" 1 "Invalid response from Control API endpoints"
     fi
 
     # ─────────────────────────────────────────────────────────────────────────
-    # System Test 7: Prometheus Metrics Exporters Across Grid Containers
+    # System Test 7: Containerized Prometheus Metrics Endpoints
     # ─────────────────────────────────────────────────────────────────────────
-    local METRIC_HEAD
-    local METRIC_HC
-    local METRIC_CS1
-    local METRIC_ZK
-    METRIC_HEAD=$(curl -sf http://127.0.0.1:9095/metrics 2>/dev/null || echo "")
-    METRIC_HC=$(curl -sf http://127.0.0.1:9096/metrics 2>/dev/null || echo "")
-    METRIC_CS1=$(curl -sf http://127.0.0.1:9091/metrics 2>/dev/null || echo "")
-    METRIC_ZK=$(curl -sf http://127.0.0.1:9097/metrics 2>/dev/null || echo "")
+    local SYS_HEAD_METRICS
+    local SYS_HC_METRICS
+    local SYS_CLUSTER_METRICS
+    SYS_HEAD_METRICS=$(curl -sf http://127.0.0.1:9095/metrics 2>/dev/null || echo "")
+    SYS_HC_METRICS=$(curl -sf http://127.0.0.1:9096/metrics 2>/dev/null || echo "")
+    SYS_CLUSTER_METRICS=$(curl -sf http://127.0.0.1:9091/metrics 2>/dev/null || echo "")
 
-    if [[ -n "${METRIC_HEAD}" && -n "${METRIC_HC}" && -n "${METRIC_CS1}" ]]; then
-        report_result "System Test 7: Prometheus Metrics Exporters (:9095, :9096, :9091, :9097)" 0
+    if [[ -n "${SYS_HEAD_METRICS}" && -n "${SYS_HC_METRICS}" && -n "${SYS_CLUSTER_METRICS}" ]]; then
+        report_result "System Test 7: Prometheus Metrics Exporters across Container Topology" 0
     else
-        report_result "System Test 7: Prometheus Metrics Exporters" 1 "One or more container metrics endpoints unavailable"
+        report_result "System Test 7: Prometheus Metrics Exporters" 1 "One or more container metrics endpoints did not respond"
     fi
 
     # ─────────────────────────────────────────────────────────────────────────
-    # System Test 8: Containerized Replica Fault Tolerance & Voting
+    # System Test 8: Containerized Replica Fault Tolerance & Read-Repair
     # ─────────────────────────────────────────────────────────────────────────
-    # Corrupt chunk inside container cluster-server-1 volume
+    echo "Simulating chunk corruption inside cluster-server-1 container..."
     local CORRUPT_RES
     CORRUPT_RES=$(${DOCKER_COMPOSE_CMD} -f "${COMPOSE_FILE}" -p "${COMPOSE_PROJECT}" exec -T cluster-server-1 bash -c \
         "CHUNK=\$(find /tmp/cluster_storage/ /var/cluster_storage/ -name '*sys_small.bin_chunk_0*' 2>/dev/null | head -n 1); if [ -n \"\$CHUNK\" ]; then echo 'CORRUPTED_CONTAINER_DATA' > \"\$CHUNK\"; echo 'CORRUPTED'; else echo 'NOT_FOUND'; fi" 2>/dev/null || echo "EXEC_FAILED")
@@ -595,8 +599,8 @@ run_system_mode() {
     fi
 
     local SYS_REPAIR_OUT="${TMP_DIR}/sys_repaired.bin"
-    if [[ -x "${DFG_BIN}" ]]; then
-        "${DFG_BIN}" download "sys_small.bin" "${SYS_REPAIR_OUT}" > "${LOG_DIR}/sys_download_repair.log" 2>&1
+    if [[ -x "${CLIENT_BIN}" ]]; then
+        "${CLIENT_BIN}" download "sys_small.bin" "${SYS_REPAIR_OUT}" > "${LOG_DIR}/sys_download_repair.log" 2>&1
         local SYS_REP_STATUS=$?
         if [[ ${SYS_REP_STATUS} -eq 0 && -f "${SYS_REPAIR_OUT}" ]]; then
             local SYS_REP_HASH

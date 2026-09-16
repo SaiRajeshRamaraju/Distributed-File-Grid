@@ -43,7 +43,7 @@ add_test(NAME E2ETest COMMAND test_e2e)
 # ── Convenience custom target to execute full E2E test script ──
 add_custom_target(run_e2e
     COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/e2e_test.sh
-    DEPENDS dfg dfg_client head_server cluster_server health_checker test_e2e
+    DEPENDS dfg client dfg_client head_server cluster_server health_checker test_e2e
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Executing Distributed File Grid End-to-End (E2E) Test Runner"
 )

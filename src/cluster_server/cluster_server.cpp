@@ -28,7 +28,7 @@ static bool self_register_with_head(const std::string &head_host, int head_contr
 
 inline std::atomic<bool> g_is_dead_process(false);
 
-void liveness_monitor(const std::string& zk_hosts, const std::string& head_host, int head_port, int server_id, const std::string& ip, int port) {
+static void liveness_monitor(const std::string& zk_hosts, const std::string& head_host, int head_port, int server_id, const std::string& ip, int port) {
     ZooKeeperClient zk(zk_hosts);
     bool zk_init = zk.connect();
     std::string znode = "/dfg/cluster_servers/server_" + std::to_string(server_id);
@@ -197,7 +197,7 @@ static bool self_register_with_head(const std::string &head_host,
   return false;
 }
 
-int main(int argc, char **argv) {
+int run_cluster_server(int argc, char **argv) {
   if (argc > 1) {
     std::string arg = argv[1];
     if (arg == "-h" || arg == "--help") {
@@ -305,3 +305,9 @@ int main(int argc, char **argv) {
 
   return start_cluster_server(server_id, ip.c_str(), port);
 }
+
+#ifndef DFG_UNIFIED_BINARY
+int main(int argc, char **argv) {
+  return run_cluster_server(argc, argv);
+}
+#endif
