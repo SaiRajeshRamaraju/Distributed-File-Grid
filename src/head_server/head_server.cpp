@@ -52,7 +52,8 @@ static dfg::ThreadPool& fetch_pool() {
 
 extern std::unique_ptr<dfg::ServerRegistry> g_cluster_registry;
 class FileReconstructor {
-private:
+public:
+
     std::pair<std::vector<ChunkLocation>, std::string> get_chunk_locations_from_metadata(const std::string& filename) {
         std::vector<ChunkLocation> locations;
         std::string file_hash;
@@ -382,7 +383,55 @@ public:
 
 static FileReconstructor g_file_reconstructor;
 
+
+void handle_client_delete(int fd, const std::string& filename) {
+    auto [chunk_locations, file_hash] = g_file_reconstructor.get_chunk_locations_from_metadata(filename);
+    if (chunk_locations.empty()) {
+        std::string err = "ERROR: File not found\n";
+        ::send(fd, err.data(), err.size(), 0);
+        return;
+    }
+
+    bool all_deleted = true;
+    for (const auto& loc : chunk_locations) {
+        std::string ip;
+        int port;
+        dfg::net::parse_address(loc.server_ip, ip, port);
+        
+        int sock = dfg::net::connect_with_timeout(ip, port, 5); // Connect to base port
+        if (sock >= 0) {
+            std::string unique_chunk_id = filename + "_chunk_" + std::to_string(loc.chunk_id);
+            std::string del_req = "DELETE_CHUNK " + unique_chunk_id + "\n";
+            ::send(sock, del_req.data(), del_req.size(), 0);
+            
+            char buf[64] = {0};
+            ssize_t n = ::recv(sock, buf, sizeof(buf)-1, 0);
+            if (n > 0) {
+                std::string resp(buf, n);
+                if (resp.find("SUCCESS") == std::string::npos) {
+                    all_deleted = false;
+                }
+            } else {
+                all_deleted = false;
+            }
+            ::close(sock);
+        } else {
+            all_deleted = false;
+        }
+    }
+
+    if (all_deleted) {
+        delete_entry(filename);
+        std::string ok = "SUCCESS\n";
+        ::send(fd, ok.data(), ok.size(), 0);
+    } else {
+        std::string err = "ERROR: Could not delete chunks\n";
+        ::send(fd, err.data(), err.size(), 0);
+    }
+}
+
 void handle_client_download(int fd, const std::string& filename) {
+
     g_file_reconstructor.stream_file_to_client(filename, fd);
 }
 
@@ -1078,7 +1127,13 @@ int run_head_server(int argc, char **argv) {
                           filename.pop_back();
                       }
                       handle_client_download(cfd, filename);
-                  } else if (req.rfind("UPLOAD ", 0) == 0) {
+  
+                } else if (req.rfind("DELETE ", 0) == 0) {
+                    std::string filename = req.substr(7);
+                    filename.erase(filename.find_last_not_of(" \n\r\t") + 1);
+                    handle_client_delete(cfd, filename);
+                } else if (req.rfind("UPLOAD ", 0) == 0) {
+
                       // trim trailing newline
                       while (!req.empty() && (req.back() == '\n' || req.back() == '\r')) {
                           req.pop_back();

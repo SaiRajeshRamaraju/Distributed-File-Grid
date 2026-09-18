@@ -26,7 +26,40 @@ constexpr size_t DEFAULT_CHUNK_SIZE = 64 * 1024 * 1024; // 64 MB chunk size
 
 
 
+
+
+int file_delete(std::string server_ip, int server_port, std::string file_name) {
+
+  int sock = socket(AF_INET, SOCK_STREAM, 0);
+  if (sock < 0) return 1;
+
+  sockaddr_in serv_addr;
+  serv_addr.sin_family = AF_INET;
+  serv_addr.sin_port = htons(server_port);
+  if (inet_pton(AF_INET, server_ip.c_str(), &serv_addr.sin_addr) <= 0) return 1;
+
+  if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) return 1;
+
+  std::string req = "DELETE " + file_name + "\n";
+  send(sock, req.c_str(), req.length(), 0);
+
+  char buf[256] = {0};
+  ssize_t n = recv(sock, buf, sizeof(buf)-1, 0);
+  close(sock);
+
+  if (n > 0) {
+    std::string resp(buf, n);
+    if (resp.find("SUCCESS") != std::string::npos) {
+      std::cout << "delete success\n";
+      return 0;
+    }
+  }
+  std::cerr << "error\n";
+  return 1;
+}
+
 int file_download(std::string server_ip, int server_port, std::string file_name,
+
                   std::string output_path) {
   int sock = socket(AF_INET, SOCK_STREAM, 0);
   if (sock < 0) {
@@ -615,9 +648,25 @@ int main(int argc, char *argv[]) {
       .scan<'i', int>()
       .help("Head server port");
 
+
   // Subcommand: list
   argparse::ArgumentParser list_cmd("list");
   list_cmd.add_description("List all files stored across the Distributed File Grid");
+
+
+  // Subcommand: delete
+  argparse::ArgumentParser delete_cmd("delete");
+  delete_cmd.add_description("Delete a file from the distributed storage");
+  delete_cmd.add_argument("filename")
+      .help("Name of the file to delete");
+  delete_cmd.add_argument("--server_ip", "--si", "-s")
+      .default_value(get_default_server_ip())
+      .help("Head server IP address");
+  delete_cmd.add_argument("--server_port", "--sp", "-p")
+      .default_value(get_default_server_port())
+      .scan<'i', int>()
+      .help("Head server port");
+
   list_cmd.add_argument("--server_ip", "--si", "-s")
       .default_value(get_default_server_ip())
       .help("Head server IP address");
@@ -647,7 +696,10 @@ int main(int argc, char *argv[]) {
 
   program.add_subparser(upload_cmd);
   program.add_subparser(download_cmd);
+
   program.add_subparser(list_cmd);
+  program.add_subparser(delete_cmd);
+
   program.add_subparser(test_cmd);
   program.add_subparser(help_cmd);
   program.add_subparser(version_cmd);
@@ -675,7 +727,18 @@ int main(int argc, char *argv[]) {
     return 0;
   }
 
+
+
+  if (program.is_subcommand_used(delete_cmd)) {
+
+    auto [server_ip, server_port] = resolve_server_target(delete_cmd, program);
+    if (!validate_port(server_port)) return 1;
+    std::string filename = delete_cmd.get<std::string>("filename");
+    return file_delete(server_ip, server_port, filename);
+  }
+
   if (program.is_subcommand_used(upload_cmd)) {
+
     auto [server_ip, server_port] = resolve_server_target(upload_cmd, program);
     if (!validate_port(server_port)) return 1;
 

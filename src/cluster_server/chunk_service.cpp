@@ -692,8 +692,9 @@ private:
         break;
       }
 
-      char buf[64] = {0};
+      char buf[1024] = {0};
       ssize_t n = ::recv(cfd, buf, sizeof(buf) - 1, 0);
+
       if (n > 0) {
         std::string msg(buf, n);
         if (msg.find("DEAD") != std::string::npos || msg.find("KILL") != std::string::npos) {
@@ -707,8 +708,48 @@ private:
             ::_exit(0);
           }).detach();
           break;
+        } else if (msg.find("RESTART") != std::string::npos) {
+          std::cout << "\n[Emergency Protocol] Received RESTART signal on port " << port
+                    << "! Restarting..." << std::endl;
+          ::send(cfd, "OK\n", 3, 0);
+          ::close(cfd);
+          
+          std::vector<char*> args;
+          std::string cmdline;
+          {
+              std::ifstream f("/proc/self/cmdline");
+              if(f) {
+                  std::ostringstream ss;
+                  ss << f.rdbuf();
+                  cmdline = ss.str();
+              }
+          }
+          std::vector<std::string> args_str;
+          size_t pos = 0;
+          while(pos < cmdline.size()) {
+              std::string arg = cmdline.c_str() + pos;
+              if(!arg.empty()) args_str.push_back(arg);
+              pos += arg.size() + 1;
+          }
+          for(auto& s : args_str) args.push_back(&s[0]);
+          args.push_back(nullptr);
+
+          execv("/proc/self/exe", args.data());
+          ::_exit(1);
+        } else if (msg.find("DELETE_CHUNK ") != std::string::npos) {
+          std::stringstream ss(msg.substr(13));
+          std::string chunk_id;
+          ss >> chunk_id;
+          std::cout << "[Emergency Protocol] Deleting chunk " << chunk_id << std::endl;
+          bool success = delete_chunk(chunk_id);
+          if (success) {
+              ::send(cfd, "SUCCESS\n", 8, 0);
+          } else {
+              ::send(cfd, "ERROR\n", 6, 0);
+          }
         }
       }
+
       ::close(cfd);
     }
     ::close(lfd);

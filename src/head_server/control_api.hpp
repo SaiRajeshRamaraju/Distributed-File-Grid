@@ -7,6 +7,8 @@
 #include <dfg/server_registry.hpp>
 #include <dfg/health_monitor.hpp>
 #include <dfg/net_utils.hpp>
+#include <fstream>
+#include <unistd.h>
 
 #include <string>
 #include <thread>
@@ -124,6 +126,18 @@ private:
             response = handle_remove_server(id_str);
         } else if (method == "GET" && path == "/api/v1/status") {
             response = handle_status();
+
+        } else if (method == "POST" && path == "/api/v1/system/restart_all") {
+            response = handle_restart_all();
+        } else if (method == "POST" && path == "/api/v1/system/restart_head") {
+            response = handle_restart_head();
+        } else if (method == "POST" && path.find("/api/v1/servers/cluster/") == 0 && path.find("/restart") != std::string::npos) {
+            // e.g. /api/v1/servers/cluster/1/restart
+            size_t start = 24;
+            size_t end = path.find("/restart", start);
+            std::string id_str = path.substr(start, end - start);
+            response = handle_restart_cluster_node(id_str);
+
         } else if (method == "POST" && path == "/api/v1/servers/cluster/register") {
             response = handle_self_register(body);
         } else {
@@ -217,7 +231,105 @@ private:
         }
     }
 
+
+
+    std::string handle_restart_head() {
+        std::thread([]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            std::vector<char*> args;
+            std::string cmdline;
+            {
+                std::ifstream f("/proc/self/cmdline");
+                if(f) {
+                    std::ostringstream ss;
+                    ss << f.rdbuf();
+                    cmdline = ss.str();
+                }
+            }
+            std::vector<std::string> args_str;
+            size_t pos = 0;
+            while(pos < cmdline.size()) {
+                std::string arg = cmdline.c_str() + pos;
+                if(!arg.empty()) args_str.push_back(arg);
+                pos += arg.size() + 1;
+            }
+            for(auto& s : args_str) args.push_back(&s[0]);
+            args.push_back(nullptr);
+            execv("/proc/self/exe", args.data());
+            ::_exit(1);
+        }).detach();
+        return make_response(200, "{\"head_server_restarting\":true}");
+    }
+
+    std::string handle_restart_cluster_node(const std::string& id_str) {
+        try {
+            int id = std::stoi(id_str);
+            auto servers = registry_.get_all();
+            for (const auto& s : servers) {
+                if (s.id == id) {
+                    int sock = dfg::net::connect_with_timeout(s.host, s.port, 5);
+                    if (sock >= 0) {
+                        std::string req = "RESTART\n";
+                        ::send(sock, req.data(), req.size(), 0);
+                        ::close(sock);
+                        return make_response(200, "{\"restarted_cluster_id\":" + std::to_string(id) + "}");
+                    }
+                    return make_response(500, "{\"error\":\"Could not connect to cluster server\"}");
+                }
+            }
+            return make_response(404, "{\"error\":\"Server not found\"}");
+        } catch (...) {
+            return make_response(400, "{\"error\":\"Invalid server ID\"}");
+        }
+    }
+
+    std::string handle_restart_all() {
+
+        auto servers = registry_.get_all();
+        int restarted_count = 0;
+        for (const auto& s : servers) {
+            int sock = dfg::net::connect_with_timeout(s.host, s.port, 5);
+            if (sock >= 0) {
+                std::string req = "RESTART\n";
+                ::send(sock, req.data(), req.size(), 0);
+                ::close(sock);
+                restarted_count++;
+            }
+        }
+        
+        std::thread([]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            std::vector<char*> args;
+            std::string cmdline;
+            {
+                std::ifstream f("/proc/self/cmdline");
+                if(f) {
+                    std::ostringstream ss;
+                    ss << f.rdbuf();
+                    cmdline = ss.str();
+                }
+            }
+            std::vector<std::string> args_str;
+            size_t pos = 0;
+            while(pos < cmdline.size()) {
+                std::string arg = cmdline.c_str() + pos;
+                if(!arg.empty()) args_str.push_back(arg);
+                pos += arg.size() + 1;
+            }
+            for(auto& s : args_str) args.push_back(&s[0]);
+            args.push_back(nullptr);
+            execv("/proc/self/exe", args.data());
+            ::_exit(1);
+        }).detach();
+        
+        std::ostringstream json;
+        json << "{\"restarted_clusters\":" << restarted_count 
+             << ",\"head_server_restarting\":true}";
+        return make_response(200, json.str());
+    }
+
     std::string handle_self_register(const std::string& body) {
+
         // Cluster server self-registers: {"server_id":1,"host":"x.x.x.x","port":8080}
         int server_id = extract_json_int(body, "server_id");
         std::string host = extract_json_string(body, "host");
