@@ -24,11 +24,11 @@
 
 // Forward declaration from chunk_service.cpp
 
-static bool self_register_with_head(const std::string &head_host, int head_control_port, int server_id, const std::string &ip, int port);
+static bool self_register_with_head(const std::string &head_host, int head_control_port, int server_id, const std::string &ip, int port, int transfer_port, int public_port);
 
 inline std::atomic<bool> g_is_dead_process(false);
 
-static void liveness_monitor(const std::string& zk_hosts, const std::string& head_host, int head_port, int server_id, const std::string& ip, int port) {
+static void liveness_monitor(const std::string& zk_hosts, const std::string& head_host, int head_port, int server_id, const std::string& ip, int port, int transfer_port, int public_port) {
     ZooKeeperClient zk(zk_hosts);
     bool zk_init = zk.connect();
     std::string znode = "/dfg/cluster_servers/server_" + std::to_string(server_id);
@@ -59,7 +59,7 @@ static void liveness_monitor(const std::string& zk_hosts, const std::string& hea
         }
         
         // ping head server
-        bool head_ok = self_register_with_head(head_host, head_port, server_id, ip, port);
+        bool head_ok = self_register_with_head(head_host, head_port, server_id, ip, port, transfer_port, public_port);
         
         if (!zk_ok && !head_ok) {
             consecutive_failures++;
@@ -77,7 +77,7 @@ static void liveness_monitor(const std::string& zk_hosts, const std::string& hea
 }
 
 
-int start_cluster_server(int server_id, const char *ip, int port);
+int start_cluster_server(int server_id, const char *ip, int port, int transfer_port, int public_port);
 
 static std::string chooseLanAddress() {
   struct ifaddrs *ifaddr, *ifa;
@@ -140,7 +140,7 @@ static std::string chooseLanAddress() {
 /// What's the differene between ip and head_host
 static bool self_register_with_head(const std::string &head_host,
                                     int head_control_port, int server_id,
-                                    const std::string &ip, int port) {
+                                    const std::string &ip, int port, int transfer_port, int public_port) {
   int sock = dfg::net::connect_with_timeout(head_host, head_control_port, 10);
   if (sock < 0) {
     std::cerr << "Could not connect to head server control API at " << head_host
@@ -150,7 +150,7 @@ static bool self_register_with_head(const std::string &head_host,
   // HTTP 1.,1 Post request headers
   std::ostringstream body;
   body << "{\"server_id\":" << server_id << ",\"host\":\"" << ip
-       << "\",\"port\":" << port << "}";
+       << "\",\"port\":" << port << ",\"transfer_port\":" << transfer_port << ",\"public_port\":" << public_port << "}";
   std::string body_str = body.str();
   std::ostringstream req;
   req << "POST /api/v1/servers/cluster/register HTTP/1.1\r\n"
@@ -207,6 +207,8 @@ int run_cluster_server(int argc, char **argv) {
       std::cout << "  -v, --version    Show version" << std::endl;
       std::cout << "  --server-id ID   Set the server ID" << std::endl;
       std::cout << "  --port PORT      Set the port number" << std::endl;
+      std::cout << "  --transfer-port PORT Set transfer port" << std::endl;
+      std::cout << "  --public-port PORT Set public port" << std::endl;
       std::cout << "  --ip IP          Set IP address" << std::endl;
       std::cout << "  --no-register    Skip self-registration with head server"
                 << std::endl;
@@ -224,6 +226,8 @@ int run_cluster_server(int argc, char **argv) {
   int server_id = cfg.get_int("server.id", 1);
   std::string ip = cfg.get_string("server.host", "");
   int port = cfg.get_int("server.port", 8080);
+  int transfer_port = cfg.get_int("server.transfer_port", 8180);
+  int public_port = cfg.get_int("server.public_port", 8280);
   bool should_register = true;
   std::string zk_hosts_arg = "";
 
@@ -233,6 +237,10 @@ int run_cluster_server(int argc, char **argv) {
       server_id = std::stoi(argv[++i]);
     else if (current_arg == "--port" && i + 1 < argc)
       port = std::stoi(argv[++i]);
+    else if (current_arg == "--transfer-port" && i + 1 < argc)
+      transfer_port = std::stoi(argv[++i]);
+    else if (current_arg == "--public-port" && i + 1 < argc)
+      public_port = std::stoi(argv[++i]);
     else if (current_arg == "--ip" && i + 1 < argc)
       ip = argv[++i];
     else if (current_arg == "--no-register")
@@ -281,11 +289,11 @@ int run_cluster_server(int argc, char **argv) {
   if (should_register) {
     // Try registration in background (don't block startup)
     std::thread reg_thread(
-        [head_host, head_control_port, server_id, ip, port]() {
+        [head_host, head_control_port, server_id, ip, port, transfer_port, public_port]() {
           // Retry a few times in case head server isn't up yet
           for (int attempt = 0; attempt < 5; attempt++) {
             if (self_register_with_head(head_host, head_control_port, server_id,
-                                        ip, port)) {
+                                        ip, port, transfer_port, public_port)) {
               return;
             }
             std::cerr << "Registration attempt " << (attempt + 1)
@@ -300,10 +308,10 @@ int run_cluster_server(int argc, char **argv) {
   }
 
   // Start liveness monitor for Zookeeper and Head Server
-  std::thread monitor_thread(liveness_monitor, zk_hosts, head_host, head_control_port, server_id, ip, port);
+  std::thread monitor_thread(liveness_monitor, zk_hosts, head_host, head_control_port, server_id, ip, port, transfer_port, public_port);
   monitor_thread.detach();
 
-  return start_cluster_server(server_id, ip.c_str(), port);
+  return start_cluster_server(server_id, ip.c_str(), port, transfer_port, public_port);
 }
 
 #ifndef DFG_UNIFIED_BINARY

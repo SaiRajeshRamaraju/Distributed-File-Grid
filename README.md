@@ -239,14 +239,15 @@ The dedicated client CLI (`client`, symlinked as `dfg_client`) handles all clien
 The client and head server communicate over a deterministic line-delimited and binary stream protocol:
 
 1. **Upload Protocol**:
-   - Client connects to TCP `:9669` and computes the local full-file SHA-256 hash.
-   - Sends upload header: `UPLOAD <filename> <filesize> <sha256_hash>\n`.
+   - Client connects to TCP `:9669` and computes the local full-file SHA-256 hash and total chunk count.
+   - Sends upload header: `UPLOAD <filename> <filesize> <num_chunks> <sha256_hash>\n`.
    - Streams file chunks: `CHUNK <order_id> <chunk_size> <chunk_sha256>\n` followed by raw chunk bytes.
-   - Head Server verifies chunk checksums on receipt, stores chunks across cluster nodes, commits metadata (including SHA-256 hash) to Redis or disk, and returns `SUCCESS\n`.
+   - Sends `EOF\n` upon transferring all chunks.
+   - Head Server verifies chunk checksums on receipt, stores chunk replicas across cluster nodes concurrently, commits metadata to Redis, and returns `SUCCESS\n`.
 2. **Download Protocol**:
    - Client sends `DOWNLOAD <filename>\n`.
-   - Server queries metadata and returns `FILE_HASH <sha256_digest>\n`.
-   - Server streams each chunk with header `CHUNK <order_id> <chunk_size> <chunk_sha256>\n` followed by raw binary payload.
+   - Server queries metadata and returns `FILE_HASH <sha256_digest>\n` and `CHUNKS <num_chunks>\n`.
+   - Server fetches chunks from cluster nodes in parallel (acting as a reverse proxy), validates hash consensus, repairs any corrupt replicas, and streams each chunk with header `CHUNK <order_id> <chunk_size> <chunk_sha256>\n` followed by raw binary payload.
    - **Per-Chunk Verification**: Client verifies the SHA-256 checksum of each chunk as it arrives.
    - **Full-File Verification**: Upon receiving `EOF\n`, the client verifies the reconstructed file's SHA-256 digest matches the original server digest.
 

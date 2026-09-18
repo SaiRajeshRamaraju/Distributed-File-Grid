@@ -232,22 +232,22 @@ run_local_mode() {
     fi
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Test 3: Standalone dfg_client Streaming Download
+    # Test 3: Standalone Protocol Client Streaming Download
     # ─────────────────────────────────────────────────────────────────────────
     if [[ -x "${CLIENT_BIN}" ]]; then
         local CLIENT_OUT="${TMP_DIR}/out_client.bin"
-        "${CLIENT_BIN}" 127.0.0.1 9669 "e2e_small.bin" "${CLIENT_OUT}" > "${LOG_DIR}/dfg_client.log" 2>&1
+        "${CLIENT_BIN}" download "e2e_small.bin" "${CLIENT_OUT}" --server_ip 127.0.0.1 --server_port 9669 > "${LOG_DIR}/dfg_client.log" 2>&1
         local CLIENT_STATUS=$?
         if [[ ${CLIENT_STATUS} -eq 0 && -f "${CLIENT_OUT}" ]]; then
             local CLIENT_HASH
             CLIENT_HASH=$(sha256sum "${CLIENT_OUT}" | awk '{print $1}')
             if [[ "${ORIGINAL_HASH_SMALL}" == "${CLIENT_HASH}" ]]; then
-                report_result "Test 3: Standalone Protocol Client (dfg_client TCP :9669 stream & verify)" 0
+                report_result "Test 3: Standalone Protocol Client (client download TCP :9669 stream & verify)" 0
             else
-                report_result "Test 3: Standalone Protocol Client" 1 "Hash mismatch from dfg_client"
+                report_result "Test 3: Standalone Protocol Client" 1 "Hash mismatch from client download"
             fi
         else
-            report_result "Test 3: Standalone Protocol Client" 1 "dfg_client failed with exit code ${CLIENT_STATUS}"
+            report_result "Test 3: Standalone Protocol Client" 1 "client download failed with exit code ${CLIENT_STATUS}"
         fi
     else
         report_result "Test 3: Standalone Protocol Client (dfg_client)" 1 "Binary not found at ${CLIENT_BIN}"

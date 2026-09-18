@@ -189,12 +189,14 @@ private:
         // Parse simple JSON: {"host":"x.x.x.x","port":8080}
         std::string host = extract_json_string(body, "host");
         int port = extract_json_int(body, "port");
+        int transfer_port = extract_json_int(body, "transfer_port");
+        int public_port = extract_json_int(body, "public_port");
         
         if (host.empty() || port <= 0) {
             return make_response(400, "{\"error\":\"Missing host or port\"}");
         }
         
-        int id = registry_.add_server(host, port);
+        int id = registry_.add_server(host, port, transfer_port, public_port);
         health_.register_server(id, host + ":" + std::to_string(port));
         
         std::ostringstream json;
@@ -220,6 +222,8 @@ private:
         int server_id = extract_json_int(body, "server_id");
         std::string host = extract_json_string(body, "host");
         int port = extract_json_int(body, "port");
+        int transfer_port = extract_json_int(body, "transfer_port");
+        int public_port = extract_json_int(body, "public_port");
 
         if (host.empty() || port <= 0) {
             return make_response(400, "{\"error\":\"Missing host or port\"}");
@@ -229,7 +233,7 @@ private:
         if (server_id > 0) {
             registry_.set_next_id(std::max(server_id + 1, registry_.count() + 1));
         }
-        int id = registry_.add_server(host, port);
+        int id = registry_.add_server(host, port, transfer_port, public_port);
         health_.register_server(id, host + ":" + std::to_string(port));
 
         std::ostringstream json;

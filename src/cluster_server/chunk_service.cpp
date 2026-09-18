@@ -273,6 +273,8 @@ private:
   int server_id;
   std::string server_ip;
   int port;
+  int transfer_port;
+  int public_port;
   bool running = false;
 
   // Coroutine that periodically samples system metrics (CPU, RAM, disk,
@@ -525,7 +527,8 @@ private:
           resp.set_success(false);
           resp.set_error_message("Chunk not found locally to replicate");
         } else {
-          int target_transfer_port = req.target_server_port() + 100;
+          int target_transfer_port = req.target_transfer_port();
+          if(target_transfer_port == 0) target_transfer_port = 8180;
           int target_sock = dfg::net::connect_with_timeout(req.target_server_ip(), target_transfer_port, 5);
           if (target_sock < 0) {
             resp.set_success(false);
@@ -579,9 +582,7 @@ private:
   }
 
   async_hb::task chunk_server(async_hb::Reactor &reactor) {
-    int transfer_port = port + 100; // NOTE: Why not a static port id rather
-                                    // than 100+ current server port? Come out
-                                    // with a static port number
+    
     int lfd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (lfd < 0) {
       std::cerr << "Listen socket failed\n";
@@ -713,10 +714,101 @@ private:
     ::close(lfd);
   }
 
+
+  async_hb::task handle_public_connection(async_hb::Reactor &r, int cfd) {
+    ConnectionTracker tracker(active_connections);
+    try {
+      char buf[256];
+      ssize_t n = ::recv(cfd, buf, sizeof(buf) - 1, 0);
+      if (n > 0) {
+        buf[n] = 0;
+        std::string req(buf);
+        
+        if (req.rfind("GET_CHUNK ", 0) == 0) {
+          std::stringstream ss(req.substr(10));
+          std::string chunk_id, file_name;
+          ss >> chunk_id >> file_name;
+          
+          std::string unique_chunk_id = file_name + "_chunk_" + chunk_id;
+
+          auto fut = storage.async_retrieve_chunk(unique_chunk_id);
+
+          std::vector<char> data = co_await await_future(r, std::move(fut));
+          
+          if (!data.empty()) {
+            std::string header = "CHUNK_SIZE " + std::to_string(data.size()) + "\n";
+            co_await async_hb::async_send_all(r, cfd, reinterpret_cast<const uint8_t*>(header.data()), header.size());
+            co_await async_hb::async_send_all(r, cfd, reinterpret_cast<const uint8_t*>(data.data()), data.size());
+          } else {
+            std::string err = "ERROR: Chunk not found\n";
+            co_await async_hb::async_send_all(r, cfd, reinterpret_cast<const uint8_t*>(err.data()), err.size());
+          }
+        }
+      }
+    } catch (const std::exception &e) {
+      std::cerr << "handle_public_connection error: " << e.what() << std::endl;
+    }
+    ::close(cfd);
+    co_return;
+  }
+
+  async_hb::task public_chunk_server(async_hb::Reactor &reactor) {
+    int lfd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (lfd < 0) {
+      std::cerr << "Public listen socket failed\n";
+      co_return;
+    }
+    int yes = 1;
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(public_port);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (::bind(lfd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+      std::cerr << "Bind failed for public chunk server\n";
+      ::close(lfd);
+      co_return;
+    }
+    if (::listen(lfd, 128) < 0) {
+      std::cerr << "Listen failed for public chunk server\n";
+      ::close(lfd);
+      co_return;
+    }
+    if (async_hb::set_nonblock(lfd) < 0) {
+      std::cerr << "Failed to set nonblocking public chunk server\n";
+      ::close(lfd);
+      co_return;
+    }
+
+    std::cout << "Public chunk server started on port " << public_port << std::endl;
+
+    while (running) {
+      int cfd = -1;
+      while (true) {
+        sockaddr_in peer{};
+        socklen_t len = sizeof(peer);
+        cfd = ::accept4(lfd, reinterpret_cast<sockaddr *>(&peer), &len,
+                        SOCK_CLOEXEC | SOCK_NONBLOCK);
+        if (cfd >= 0)
+          break;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          co_await reactor.wait_readable(lfd);
+        } else {
+          break;
+        }
+      }
+      if (cfd >= 0) {
+        reactor.spawn(handle_public_connection(reactor, cfd));
+      }
+    }
+    ::close(lfd);
+  }
+
 public:
-  ClusterServerService(int id, const std::string &ip, int p)
+  ClusterServerService(int id, const std::string &ip, int p, int tp, int pp)
       : exporter("0.0.0.0:" + std::to_string(9090 + id)), server_id(id),
-        server_ip(ip), port(p) {}
+        server_ip(ip), port(p), transfer_port(tp), public_port(pp) {}
 
   void start() {
     running = true;
@@ -740,6 +832,9 @@ public:
     // Start chunk server
     reactor.spawn(chunk_server(reactor));
 
+    // Start public chunk server
+    reactor.spawn(public_chunk_server(reactor));
+
     // Run the reactor
     reactor.run();
   }
@@ -761,10 +856,10 @@ public:
 // Global cluster server instance
 static std::unique_ptr<ClusterServerService> g_cluster_server;
 
-int start_cluster_server(int server_id, const char *ip, int port) {
+int start_cluster_server(int server_id, const char *ip, int port, int transfer_port, int public_port) {
   try {
     g_cluster_server =
-        std::make_unique<ClusterServerService>(server_id, ip, port);
+        std::make_unique<ClusterServerService>(server_id, ip, port, transfer_port, public_port);
     g_cluster_server->start();
     return 0;
   } catch (const std::exception &e) {

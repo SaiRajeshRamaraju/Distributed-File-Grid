@@ -20,6 +20,8 @@ struct ServerEntry {
     int id;
     std::string host;
     int port;
+    int transfer_port = -1;
+    int public_port = -1;
     std::string status = "active";
     std::chrono::steady_clock::time_point registered_at;
     
@@ -34,7 +36,7 @@ public:
     ServerRegistry() : next_id_(1) {}
 
     /// Add a server. Returns assigned ID (or existing ID if already registered).
-    int add_server(const std::string& host, int port) {
+    int add_server(const std::string& host, int port, int transfer_port = -1, int public_port = -1) {
         std::lock_guard<std::mutex> lock(mutex_);
         
         // Check for duplicate
@@ -51,6 +53,8 @@ public:
         entry.id = id;
         entry.host = host;
         entry.port = port;
+        entry.transfer_port = transfer_port;
+        entry.public_port = public_port;
         entry.registered_at = std::chrono::steady_clock::now();
         servers_[id] = entry;
         

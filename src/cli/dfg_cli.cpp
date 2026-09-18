@@ -57,12 +57,6 @@ Examples:
   dfg zk-monitor
   dfg add-server --host 192.168.1.50 --port 8083
   dfg list-servers
-
-Note: For client file operations (upload, download, list, test), use the dedicated 'client' binary:
-  client upload <path> [name]
-  client download <name> [output_path]
-  client list
-  client test
 )" << std::endl;
 }
 
@@ -187,14 +181,6 @@ int main(int argc, char *argv[]) {
   if (command == "-v" || command == "--version") {
     std::cout << "Distributed File Grid Server version " << APP_VERSION << std::endl;
     return 0;
-  }
-
-  // File operation redirection
-  if (command == "upload" || command == "download" || command == "list" || command == "test") {
-    std::cerr << "Error: File operations have been moved to the dedicated 'client' binary.\n";
-    std::cerr << "Please use the 'client' executable instead:\n";
-    std::cerr << "  client " << command << " [options]\n";
-    return 1;
   }
 
   // Parse common arguments for cluster management

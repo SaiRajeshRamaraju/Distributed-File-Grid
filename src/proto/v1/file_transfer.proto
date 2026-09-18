@@ -44,6 +44,7 @@ message ReplicateChunkRequest {
   string chunk_id = 1;
   string target_server_ip = 2; // the cluster node to replicate to
   int32 target_server_port = 3;
+  int32 target_transfer_port = 5;
   string filename = 4;
 }
 

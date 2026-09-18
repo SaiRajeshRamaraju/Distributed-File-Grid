@@ -4,7 +4,6 @@ add_executable(dfg
     dfg_cli.cpp
     ${CMAKE_SOURCE_DIR}/src/head_server/head_server.cpp
     ${CMAKE_SOURCE_DIR}/src/head_server/file_upload.cpp
-    ${CMAKE_SOURCE_DIR}/src/head_server/file_download.cpp
     ${CMAKE_SOURCE_DIR}/src/cluster_server/cluster_server.cpp
     ${CMAKE_SOURCE_DIR}/src/cluster_server/chunk_service.cpp
     ${CMAKE_SOURCE_DIR}/src/cluster_server/metrics_exporter.cpp
