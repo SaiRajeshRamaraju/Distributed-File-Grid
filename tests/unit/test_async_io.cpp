@@ -3,6 +3,8 @@
 #include <gtest/gtest.h>
 #include <thread>
 #include <vector>
+#include <atomic>
+#include <stdexcept>
 
 TEST(ThreadPoolTest, SubmitAndReturnValue) {
   dfg::ThreadPool pool(2);
@@ -13,37 +15,47 @@ TEST(ThreadPoolTest, SubmitAndReturnValue) {
 
 TEST(ThreadPoolTest, SubmitAndExecuteConcurrently) {
   dfg::ThreadPool pool(4);
-  auto start = std::chrono::steady_clock::now();
+  std::promise<void> release;
+  auto gate = release.get_future().share();
+  std::atomic<int> started{0};
+  std::vector<std::future<int>> futures;
+  for (int i = 0; i < 4; ++i) {
+    futures.push_back(pool.submit([&, i] {
+      ++started;
+      gate.wait();
+      return i;
+    }));
+  }
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (started < 4 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  EXPECT_EQ(started.load(), 4);
+  // Always release workers, even on failure, so teardown cannot deadlock.
+  release.set_value();
+  for (int i = 0; i < 4; ++i) EXPECT_EQ(futures[i].get(), i);
+}
 
-  auto fut1 = pool.submit([] {
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    return 1;
-  });
-  auto fut2 = pool.submit([] {
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    return 2;
-  });
-  auto fut3 = pool.submit([] {
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    return 3;
-  });
-  auto fut4 = pool.submit([] {
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    return 4;
-  });
+TEST(ThreadPoolTest, PropagatesExceptionsAndKeepsWorkerAlive) {
+  dfg::ThreadPool pool(1);
+  auto failure = pool.submit([]() -> int { throw std::runtime_error("failed job"); });
+  EXPECT_THROW(failure.get(), std::runtime_error);
+  EXPECT_EQ(pool.submit([] { return 42; }).get(), 42);
+}
 
-  EXPECT_EQ(fut1.get(), 1);
-  EXPECT_EQ(fut2.get(), 2);
-  EXPECT_EQ(fut3.get(), 3);
-  EXPECT_EQ(fut4.get(), 4);
+TEST(ThreadPoolTest, DestructorDrainsQueuedJobs) {
+  std::atomic<int> completed{0};
+  {
+    dfg::ThreadPool pool(2);
+    for (int i = 0; i < 100; ++i) pool.submit([&] { ++completed; });
+  }
+  EXPECT_EQ(completed.load(), 100);
+}
 
-  auto end = std::chrono::steady_clock::now();
-  auto dur = std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
-                 .count();
-
-  // With 4 threads processing 4 sleep(100ms) commands simultaneously,
-  // the total duration should be around 100-200ms, definitely less than 300ms.
-  EXPECT_LT(dur, 300);
+TEST(ThreadPoolTest, SupportsMoveOnlyTasks) {
+  dfg::ThreadPool pool(1);
+  auto result = pool.submit([value = std::make_unique<int>(17)] { return *value; });
+  EXPECT_EQ(result.get(), 17);
 }
 
 TEST(ThreadPoolTest, SubmitsManyJobs) {

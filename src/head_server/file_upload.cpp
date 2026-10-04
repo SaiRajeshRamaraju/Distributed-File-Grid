@@ -162,7 +162,7 @@ private:
         int transfer_port = 8180;
         if (g_cluster_registry) {
             for (const auto& s : g_cluster_registry->get_all()) {
-                if (s.address() == server || s.host == ip) {
+                if (s.address() == server) {
                     if(s.transfer_port > 0) transfer_port = s.transfer_port;
                     break;
                 }
@@ -526,4 +526,3 @@ void handle_client_upload(int fd, const std::string &initial_req) {
   std::cout << "Successfully processed client upload for file: " << filename
             << " (" << chunks_received << " chunks, " << total_bytes_received << " bytes)" << std::endl;
 }
-

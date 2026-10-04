@@ -118,7 +118,7 @@ A high-performance, fault-tolerant distributed file storage grid in modern **C++
 sudo apt-get update
 sudo apt-get install -y build-essential cmake pkg-config \
     libprotobuf-dev protobuf-compiler \
-    zlib1g-dev libfmt-dev redis-server redis-tools
+    zlib1g-dev libfmt-dev redis-server redis-tools libgtest-dev python3
 ```
 
 **Arch Linux**:
@@ -148,10 +148,38 @@ make -j$(nproc)
 
 ### Build and Run Unit Tests
 ```bash
-cmake -DBUILD_TESTS=ON ..
-make -j$(nproc)
-ctest --output-on-failure
+# From the repository root:
+cmake -S . -B build -DBUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel 2
+ctest --test-dir build -L unit --output-on-failure --no-tests=error
+ctest --test-dir build -L integration --output-on-failure --no-tests=error
 ```
+
+Tests cover SHA-256 reference vectors and streaming boundaries, thread-pool
+concurrency and exception handling, complete heartbeat frames, metadata replica
+replacement, server membership, and health recovery. The integration suite starts
+a real head server and three storage nodes, verifies empty/binary/2 MB uploads and
+downloads, missing-file errors, and downloads with one replica offline. It uses
+temporary metadata and separate storage directories, dynamically allocates data
+and control ports, and stops only its own processes. Service logs are saved under
+`build/integration-logs/`. The services still use their standard metrics and UDP
+heartbeat ports, so run the integration suite without another local grid running.
+The live tests also check requests delivered in separate TCP writes.
+
+### PR Merge Pipeline
+
+`.github/workflows/pr-merge.yml` runs on pull requests targeting `main`, merge queue
+checks, pushes to `main`, and manual dispatch. Both Release and Debug builds compile
+all binaries and run the unit and live cluster integration suites. Debug enables
+AddressSanitizer and UndefinedBehaviorSanitizer, and any sanitizer finding fails
+the job. JUnit reports and service logs are uploaded for 14 days. This pipeline
+tests the on-disk metadata backend (`WITH_REDIS=OFF`); Redis and the Docker Compose
+topology are not covered by this workflow.
+
+To enforce these checks before merging, configure a GitHub branch rule/ruleset for
+`main` to require pull requests and the **Merge ready** status check, with branches
+up to date (or a merge queue). The workflow supplies this check; branch protection
+must be enabled in the repository settings. It does not automatically merge PRs.
 
 ---
 
@@ -322,4 +350,3 @@ The project includes an end-to-end integration test runner [`e2e/e2e_test.sh`](e
 ## License
 
 This project is licensed under the [GNU General Public License v2.0](LICENSE).
-

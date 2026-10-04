@@ -10,6 +10,41 @@
 
 namespace fs = std::filesystem;
 
+TEST(Sha256Test, MatchesPublishedKnownDigests) {
+    EXPECT_EQ(dfg::hash::sha256(std::string("abc")),
+              "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    EXPECT_EQ(dfg::hash::sha256(std::string(
+                  "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")),
+              "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+    EXPECT_EQ(dfg::hash::sha256(std::string(1000000, 'a')),
+              "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+}
+
+TEST(Sha256Test, StreamingUpdatesMatchKnownDigestAcrossBlockBoundaries) {
+    std::string payload(1000000, 'a');
+    for (size_t stride : {1u, 55u, 56u, 63u, 64u, 65u, 4096u}) {
+        SCOPED_TRACE(stride);
+        dfg::hash::SHA256 hash;
+        for (size_t offset = 0; offset < payload.size(); offset += stride) {
+            hash.update(payload.data() + offset, std::min(stride, payload.size() - offset));
+        }
+        EXPECT_EQ(hash.digest(),
+                  "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+    }
+}
+
+TEST(Sha256Test, DigestPreservesStateAndResetStartsNewMessage) {
+    dfg::hash::SHA256 hash;
+    hash.update("ab", 2);
+    EXPECT_EQ(hash.digest(), hash.digest());
+    hash.update("c", 1);
+    EXPECT_EQ(hash.digest(),
+              "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    hash.reset();
+    EXPECT_EQ(hash.digest(),
+              "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+}
+
 class E2EIntegrityTest : public ::testing::Test {
 protected:
     std::string test_dir;

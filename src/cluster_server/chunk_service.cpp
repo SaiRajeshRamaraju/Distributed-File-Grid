@@ -5,6 +5,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <dfg/async_net.hpp>
+#include <dfg/config_loader.hpp>
 #include <dfg/net_utils.hpp>
 #include <dfg/system_info.hpp>
 #include <fcntl.h>
@@ -112,6 +113,11 @@ private:
 
 public:
   ChunkStorage() {
+    // Honor the configured directory so separate nodes can use isolated storage.
+    storage_path = cluster_server_config().get_string("storage.chunk_dir", storage_path);
+    if (!storage_path.empty() && storage_path.back() != '/') {
+      storage_path += '/';
+    }
     int status = ensure_storage_directory();
     if (status != 0) {
       throw std::runtime_error("Error creating storage directory");
@@ -759,11 +765,16 @@ private:
   async_hb::task handle_public_connection(async_hb::Reactor &r, int cfd) {
     ConnectionTracker tracker(active_connections);
     try {
-      char buf[256];
-      ssize_t n = ::recv(cfd, buf, sizeof(buf) - 1, 0);
-      if (n > 0) {
-        buf[n] = 0;
-        std::string req(buf);
+      // Accepted sockets are nonblocking. Wait for the full request line;
+      // a single recv can return EAGAIN or only part of a TCP request.
+      std::string req;
+      while (req.size() < 255) {
+        uint8_t byte;
+        co_await async_hb::async_read_exact(r, cfd, &byte, 1);
+        if (byte == '\n') break;
+        req += static_cast<char>(byte);
+      }
+      if (!req.empty()) {
         
         if (req.rfind("GET_CHUNK ", 0) == 0) {
           std::stringstream ss(req.substr(10));

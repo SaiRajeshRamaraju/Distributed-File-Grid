@@ -1,0 +1,93 @@
+name: PR merge checks
+
+on:
+  pull_request:
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build-and-test:
+    name: Build and test (${{ matrix.build_type }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Release, Debug]
+    env:
+      # Debug builds enable AddressSanitizer and UndefinedBehaviorSanitizer.
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - name: Check out proposed merge
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential cmake ninja-build pkg-config git python3 \
+            libprotobuf-dev protobuf-compiler zlib1g-dev libgtest-dev
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DBUILD_TESTS=ON -DWITH_REDIS=OFF
+
+      - name: Build all services and tests
+        run: cmake --build build --parallel 2
+
+      - name: Run unit and integrity tests
+        run: >-
+          ctest --test-dir build -L unit --output-on-failure
+          --no-tests=error --parallel 2 --timeout 90
+          --output-junit unit-results.xml
+
+      - name: Run live cluster integration tests
+        run: >-
+          ctest --test-dir build -L integration --output-on-failure
+          --no-tests=error --timeout 180
+          --output-junit integration-results.xml
+
+      - name: Upload test reports and service logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test-reports-${{ matrix.build_type }}
+          path: |
+            build/*-results.xml
+            build/Testing/Temporary/
+            build/integration-logs/
+          if-no-files-found: warn
+          retention-days: 14
+
+  merge-ready:
+    name: Merge ready
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs: [build-and-test]
+    if: always()
+    steps:
+      - name: Require every build and test job to succeed
+        env:
+          TEST_RESULT: ${{ needs.build-and-test.result }}
+        run: |
+          if [[ "$TEST_RESULT" != "success" ]]; then
+            echo "Build/test jobs did not all succeed: $TEST_RESULT"
+            exit 1
+          fi

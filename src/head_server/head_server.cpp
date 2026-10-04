@@ -88,7 +88,7 @@ public:
     int transfer_port = 8180;
     if (g_cluster_registry) {
       for (const auto &s : g_cluster_registry->get_all()) {
-        if (s.address() == location.server_ip || s.host == ip) {
+        if (s.address() == location.server_ip) {
           if (s.transfer_port > 0)
             transfer_port = s.transfer_port;
           break;
@@ -149,7 +149,7 @@ public:
     int transfer_port = 8180;
     if (g_cluster_registry) {
       for (const auto &s : g_cluster_registry->get_all()) {
-        if (s.address() == location.server_ip || s.host == ip) {
+        if (s.address() == location.server_ip) {
           if (s.transfer_port > 0)
             transfer_port = s.transfer_port;
           break;
@@ -211,7 +211,7 @@ public:
     int transfer_port = 8180;
     if (g_cluster_registry) {
       for (const auto &s : g_cluster_registry->get_all()) {
-        if (s.address() == location.server_ip || s.host == ip) {
+        if (s.address() == location.server_ip) {
           if (s.transfer_port > 0)
             transfer_port = s.transfer_port;
           break;

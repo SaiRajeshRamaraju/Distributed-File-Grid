@@ -15,6 +15,11 @@ protected:
         db_file_ = "/tmp/test_metadata_rep_" + std::to_string(getpid()) + ".db";
         setenv("DFG_METADATA_DB", db_file_.c_str(), 1);
         std::filesystem::remove(db_file_);
+#ifndef WITH_REDIS
+        // The in-memory store is static across test cases; isolate each case.
+        std::lock_guard lock(metadata_store::store_mutex());
+        metadata_store::store().clear();
+#endif
     }
 
     void TearDown() override {

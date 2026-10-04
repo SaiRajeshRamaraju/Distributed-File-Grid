@@ -39,6 +39,7 @@ target_include_directories(test_e2e PRIVATE
 
 # ── Register CTest Target ──
 add_test(NAME E2ETest COMMAND test_e2e)
+set_tests_properties(E2ETest PROPERTIES LABELS "unit;integrity" TIMEOUT 90)
 
 # ── Convenience custom target to execute full E2E test script ──
 add_custom_target(run_e2e

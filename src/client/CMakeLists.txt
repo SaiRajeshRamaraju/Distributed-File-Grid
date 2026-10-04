@@ -13,6 +13,7 @@ if(NOT argparse_FOUND)
     FetchContent_Declare(
         argparse
         GIT_REPOSITORY https://github.com/p-ranav/argparse.git
+        GIT_TAG v3.2
     )
 
     FetchContent_MakeAvailable(argparse)
@@ -34,4 +35,3 @@ add_custom_command(TARGET client POST_BUILD
 )
 
 add_custom_target(dfg_client ALL DEPENDS client)
-
