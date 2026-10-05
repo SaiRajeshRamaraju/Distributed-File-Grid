@@ -166,9 +166,11 @@ public:
   }
 
   void set_unhealthy_callback(UnhealthyCallback cb) {
+    std::lock_guard<std::mutex> lock(mutex_);
     unhealthy_cb_ = std::move(cb);
   }
   void set_recovered_callback(RecoveredCallback cb) {
+    std::lock_guard<std::mutex> lock(mutex_);
     recovered_cb_ = std::move(cb);
   }
 
