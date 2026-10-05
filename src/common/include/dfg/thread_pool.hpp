@@ -11,6 +11,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <stdexcept>
 
 namespace dfg {
 
@@ -41,6 +42,9 @@ public:
         auto fut = task->get_future();
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (stop_) {
+                throw std::runtime_error("Cannot submit task to stopped ThreadPool");
+            }
             jobs_.push([task]() { (*task)(); });
         }
         cv_.notify_one();

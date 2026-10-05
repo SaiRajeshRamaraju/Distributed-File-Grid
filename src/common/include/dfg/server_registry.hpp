@@ -37,44 +37,55 @@ public:
 
     /// Add a server. Returns assigned ID (or existing ID if already registered).
     int add_server(const std::string& host, int port, int transfer_port = -1, int public_port = -1) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        
-        // Check for duplicate
-        for (const auto& [id, entry] : servers_) {
-            if (entry.host == host && entry.port == port) {
-                std::cout << "Server already registered: " << entry.address() 
-                          << " (id=" << id << ")" << std::endl;
-                return id;
-            }
-        }
-        
-        int id = next_id_++;
         ServerEntry entry;
-        entry.id = id;
-        entry.host = host;
-        entry.port = port;
-        entry.transfer_port = transfer_port;
-        entry.public_port = public_port;
-        entry.registered_at = std::chrono::steady_clock::now();
-        servers_[id] = entry;
+        RegistryChangeCallback cb;
+        int id = -1;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            
+            // Check for duplicate
+            for (const auto& [existing_id, existing_entry] : servers_) {
+                if (existing_entry.host == host && existing_entry.port == port) {
+                    std::cout << "Server already registered: " << existing_entry.address() 
+                              << " (id=" << existing_id << ")" << std::endl;
+                    return existing_id;
+                }
+            }
+            
+            id = next_id_++;
+            entry.id = id;
+            entry.host = host;
+            entry.port = port;
+            entry.transfer_port = transfer_port;
+            entry.public_port = public_port;
+            entry.registered_at = std::chrono::steady_clock::now();
+            servers_[id] = entry;
+            cb = change_cb_;
+        }
         
         std::cout << "Registered server [" << id << "] " << entry.address() << std::endl;
         
-        if (change_cb_) change_cb_(entry, true);
+        if (cb) cb(entry, true);
         return id;
     }
 
     /// Remove a server by ID.
     bool remove_server(int id) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = servers_.find(id);
-        if (it == servers_.end()) return false;
+        ServerEntry entry;
+        RegistryChangeCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = servers_.find(id);
+            if (it == servers_.end()) return false;
+            
+            entry = it->second;
+            servers_.erase(it);
+            cb = change_cb_;
+        }
         
-        auto entry = it->second;
-        servers_.erase(it);
         std::cout << "Deregistered server [" << id << "] " << entry.address() << std::endl;
         
-        if (change_cb_) change_cb_(entry, false);
+        if (cb) cb(entry, false);
         return true;
     }
 
@@ -120,7 +131,10 @@ public:
         return static_cast<int>(servers_.size());
     }
 
-    void set_change_callback(RegistryChangeCallback cb) { change_cb_ = std::move(cb); }
+    void set_change_callback(RegistryChangeCallback cb) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        change_cb_ = std::move(cb);
+    }
 
     /// Print a formatted table of all registered servers.
     void print_status() const {
