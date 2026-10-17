@@ -104,10 +104,14 @@ private:
   }
 
   std::string generate_chunk_path(const std::string &chunk_id) {
+    static std::atomic<uint64_t> seq{0};
     auto now = std::chrono::system_clock::now();
-    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    auto epoch_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        now.time_since_epoch())
+                        .count();
     std::stringstream ss;
-    ss << storage_path << "chunk_" << chunk_id << "_" << t << ".dat";
+    ss << storage_path << "chunk_" << chunk_id << "_" << epoch_us << "_"
+       << (++seq) << ".dat";
     return ss.str();
   }
 
@@ -194,6 +198,11 @@ public:
       }
 
       off_t file_size = ::lseek(fd, 0, SEEK_END);
+      if (file_size < 0) {
+        std::cerr << "Failed to seek chunk file: " << chunk_path << std::endl;
+        ::close(fd);
+        return {};
+      }
       ::lseek(fd, 0, SEEK_SET);
 
       std::vector<char> data(static_cast<size_t>(file_size));
