@@ -1,8 +1,9 @@
-#include "../head_server/redis_handler.hpp"
 #include <algorithm>
 #include <chrono>
 #include <dfg/async_net.hpp>
 #include <dfg/config_loader.hpp>
+#include <dfg/health_checker/service.hpp>
+#include <dfg/metadata/store.hpp>
 #include <dfg/system_info.hpp>
 #include <dfg/version.hpp>
 #include <dfg/zookeeper_client.hpp>
@@ -521,10 +522,6 @@ int run_health_checker(int argc, char **argv) {
 
   return 0;
 }
-
-#ifndef DFG_UNIFIED_BINARY
-int main(int argc, char **argv) { return run_health_checker(argc, argv); }
-#endif
 
 extern "C" {
 int start_health_checker() {

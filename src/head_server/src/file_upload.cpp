@@ -1,22 +1,18 @@
-// ─────────────────── File Upload / Chunking ───────────────────
-// Splits a file into chunks and transfers replicas to cluster servers.
-// Uses shared net_utils and thread_pool instead of local duplicates.
+#include "file_upload.hpp"
 
 #include "file_transfer.pb.h"
-#include "redis_handler.hpp"
-#include <dfg/config_loader.hpp>
-#include <dfg/async_net.hpp>
-#include <dfg/net_utils.hpp>
-#include <dfg/sha256.hpp>
-#include <dfg/thread_pool.hpp>
-#include <dfg/health_monitor.hpp>
-#include <dfg/server_registry.hpp>
-
-extern std::unique_ptr<dfg::HealthMonitor> g_health_monitor;
-extern std::unique_ptr<dfg::ServerRegistry> g_cluster_registry;
+#include "server_state.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <dfg/async_net.hpp>
+#include <dfg/config_loader.hpp>
+#include <dfg/health_monitor.hpp>
+#include <dfg/metadata/store.hpp>
+#include <dfg/net_utils.hpp>
+#include <dfg/server_registry.hpp>
+#include <dfg/sha256.hpp>
+#include <dfg/thread_pool.hpp>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
@@ -31,9 +27,12 @@ extern std::unique_ptr<dfg::ServerRegistry> g_cluster_registry;
 #include <thread>
 #include <vector>
 
+// File Upload / Chunking
+// Splits a file into chunks and transfers replicas to cluster servers.
+// Uses shared net_utils and thread_pool instead of local duplicates.
+
 namespace fs = std::filesystem;
 
-// TODO: Read from config, with same defaults matching the README spec.
 static size_t config_chunk_size() {
   return static_cast<size_t>(
       head_server_config().get_long("storage.chunk_size", 64 * 1024 * 1024));
@@ -52,7 +51,7 @@ struct ChunkInfo {
   int replica_count{1};
 };
 
-// ── Transfer result for tracking chunk distribution ──
+// Transfer result for tracking chunk distribution
 struct TransferResult {
   int chunk_id;
   std::string server;
@@ -100,46 +99,50 @@ private:
     }
 
     std::vector<std::string> selected;
-    
+
     // Sort by lowest disk usage and filter healthy servers
     if (g_health_monitor) {
-        auto health_map = g_health_monitor->get_all_health();
-        std::vector<std::string> healthy_servers;
-        for (const auto &srv : servers_copy) {
-            std::string ip;
-            int port;
-            dfg::net::parse_address(srv, ip, port);
-            bool found = false;
-            bool is_healthy = false;
-            for (const auto& [id, health] : health_map) {
-                if (health.ip == ip || health.ip == srv) {
-                    found = true;
-                    is_healthy = health.is_healthy;
-                    break;
-                }
-            }
-            if (!found || is_healthy) {
-                healthy_servers.push_back(srv);
-            }
+      auto health_map = g_health_monitor->get_all_health();
+      std::vector<std::string> healthy_servers;
+      for (const auto &srv : servers_copy) {
+        std::string ip;
+        int port;
+        dfg::net::parse_address(srv, ip, port);
+        bool found = false;
+        bool is_healthy = false;
+        for (const auto &[id, health] : health_map) {
+          if (health.ip == ip || health.ip == srv) {
+            found = true;
+            is_healthy = health.is_healthy;
+            break;
+          }
         }
-        
-        std::vector<std::string> candidate_servers = !healthy_servers.empty() ? healthy_servers : servers_copy;
-        
-        std::sort(candidate_servers.begin(), candidate_servers.end(), [&health_map](const std::string& a, const std::string& b) {
-            std::string ip_a, ip_b;
-            int port_a, port_b;
-            dfg::net::parse_address(a, ip_a, port_a);
-            dfg::net::parse_address(b, ip_b, port_b);
-            float disk_a = 100.0f;
-            float disk_b = 100.0f;
-            
-            for (const auto& [id, health] : health_map) {
-                if (health.ip == ip_a || health.ip == a) disk_a = health.disk_usage;
-                if (health.ip == ip_b || health.ip == b) disk_b = health.disk_usage;
-            }
-            return disk_a < disk_b;
-        });
-        servers_copy = candidate_servers;
+        if (!found || is_healthy) {
+          healthy_servers.push_back(srv);
+        }
+      }
+
+      std::vector<std::string> candidate_servers =
+          !healthy_servers.empty() ? healthy_servers : servers_copy;
+
+      std::sort(candidate_servers.begin(), candidate_servers.end(),
+                [&health_map](const std::string &a, const std::string &b) {
+                  std::string ip_a, ip_b;
+                  int port_a, port_b;
+                  dfg::net::parse_address(a, ip_a, port_a);
+                  dfg::net::parse_address(b, ip_b, port_b);
+                  float disk_a = 100.0f;
+                  float disk_b = 100.0f;
+
+                  for (const auto &[id, health] : health_map) {
+                    if (health.ip == ip_a || health.ip == a)
+                      disk_a = health.disk_usage;
+                    if (health.ip == ip_b || health.ip == b)
+                      disk_b = health.disk_usage;
+                  }
+                  return disk_a < disk_b;
+                });
+      servers_copy = candidate_servers;
     }
 
     int count =
@@ -158,17 +161,17 @@ private:
     std::string ip;
     int port;
     dfg::net::parse_address(server, ip, port);
-    
-        int transfer_port = 8180;
-        if (g_cluster_registry) {
-            for (const auto& s : g_cluster_registry->get_all()) {
-                if (s.address() == server) {
-                    if(s.transfer_port > 0) transfer_port = s.transfer_port;
-                    break;
-                }
-            }
-        }
 
+    int transfer_port = 8180;
+    if (g_cluster_registry) {
+      for (const auto &s : g_cluster_registry->get_all()) {
+        if (s.address() == server) {
+          if (s.transfer_port > 0)
+            transfer_port = s.transfer_port;
+          break;
+        }
+      }
+    }
 
     int sock = dfg::net::connect_with_timeout(ip, transfer_port);
     if (sock < 0) {
@@ -227,7 +230,7 @@ private:
     return true;
   }
 
-  // ── Print chunk distribution table ──
+  // Print chunk distribution table
   void print_chunk_distribution(const std::string &filename,
                                 const std::vector<TransferResult> &results,
                                 int total_chunks) {
@@ -317,29 +320,30 @@ public:
       std::string fname = filename;
       std::string srv = server;
 
-      auto fut =
-          transfer_pool().submit([this, srv, cid, data_ptr, fname]() -> TransferOutcome {
+      auto fut = transfer_pool().submit(
+          [this, srv, cid, data_ptr, fname]() -> TransferOutcome {
             std::string path;
             bool ok = send_chunk_to_server(srv, cid, *data_ptr, fname, path);
             return {ok, path};
           });
 
-      pending.push_back(
-          PendingTransfer{std::move(fut), cid, server, checksum, chunk_data->size()});
+      pending.push_back(PendingTransfer{std::move(fut), cid, server, checksum,
+                                        chunk_data->size()});
     }
   }
 
-  std::vector<ChunkInfo> collect_transfers(const std::string &filename,
-                                           std::vector<PendingTransfer> &pending,
-                                           int total_chunks) {
+  std::vector<ChunkInfo>
+  collect_transfers(const std::string &filename,
+                    std::vector<PendingTransfer> &pending, int total_chunks) {
     std::vector<ChunkInfo> chunks;
     std::vector<TransferResult> all_results;
     std::map<int, int> success_replicas_count;
 
     for (auto &p : pending) {
       TransferOutcome outcome = p.result.get();
-      all_results.push_back(
-          TransferResult{p.chunk_id, p.server, p.size, p.checksum, outcome.file_path, outcome.success});
+      all_results.push_back(TransferResult{p.chunk_id, p.server, p.size,
+                                           p.checksum, outcome.file_path,
+                                           outcome.success});
       if (outcome.success) {
         success_replicas_count[p.chunk_id]++;
       }
@@ -350,8 +354,10 @@ public:
         ChunkInfo chunk_info;
         chunk_info.chunk_id = r.chunk_id;
         chunk_info.server_ip = r.server;
-        chunk_info.file_path = !r.file_path.empty() ? r.file_path
-                             : ("/tmp/chunks/" + r.server + "_" + filename + "_chunk_" + std::to_string(r.chunk_id));
+        chunk_info.file_path =
+            !r.file_path.empty() ? r.file_path
+                                 : ("/tmp/chunks/" + r.server + "_" + filename +
+                                    "_chunk_" + std::to_string(r.chunk_id));
         chunk_info.size = r.size;
         chunk_info.checksum = r.checksum;
         chunk_info.replica_count = success_replicas_count[r.chunk_id];
@@ -364,7 +370,8 @@ public:
   }
 
   void store_metadata(const std::string &filename,
-                      const std::vector<ChunkInfo> &chunks, const std::string& file_hash) {
+                      const std::vector<ChunkInfo> &chunks,
+                      const std::string &file_hash) {
     std::stringstream request;
     request << filename << "\n";
     request << "TTL=3600\n";
@@ -378,8 +385,8 @@ public:
     }
 
     create_entry(request.str());
-    std::cout << "Metadata stored for file: " << filename
-              << " (" << chunks.size() << " chunks/replicas)" << std::endl;
+    std::cout << "Metadata stored for file: " << filename << " ("
+              << chunks.size() << " chunks/replicas)" << std::endl;
   }
 };
 
@@ -387,12 +394,13 @@ public:
 static FileChunker g_file_chunker;
 
 void handle_client_upload(int fd, const std::string &initial_req) {
-  // Expected initial_req: "UPLOAD <filename> <file_size> <num_chunks> <file_hash>"
-  // or legacy: "UPLOAD <filename> <file_size> <file_hash>"
+  // Expected initial_req: "UPLOAD <filename> <file_size> <num_chunks>
+  // <file_hash>" or legacy: "UPLOAD <filename> <file_size> <file_hash>"
   std::istringstream iss(initial_req);
   std::vector<std::string> tokens;
   std::string t;
-  while (iss >> t) tokens.push_back(t);
+  while (iss >> t)
+    tokens.push_back(t);
 
   std::string filename, file_hash;
   size_t file_size = 0;
@@ -407,9 +415,12 @@ void handle_client_upload(int fd, const std::string &initial_req) {
     filename = tokens[1];
     file_size = std::stoull(tokens[2]);
     file_hash = tokens[3];
-    num_chunks = (file_size == 0) ? 0 : (file_size + config_chunk_size() - 1) / config_chunk_size();
+    num_chunks = (file_size == 0) ? 0
+                                  : (file_size + config_chunk_size() - 1) /
+                                        config_chunk_size();
   } else {
-    std::string err = "ERROR: Invalid upload request format. Expected: UPLOAD <filename> <size> [chunks] <sha256>\n";
+    std::string err = "ERROR: Invalid upload request format. Expected: UPLOAD "
+                      "<filename> <size> [chunks] <sha256>\n";
     ::send(fd, err.data(), err.size(), 0);
     return;
   }
@@ -422,11 +433,13 @@ void handle_client_upload(int fd, const std::string &initial_req) {
   }
 
   if (file_size == 0) {
-    std::string empty_hash = !file_hash.empty() ? file_hash : dfg::hash::sha256("");
+    std::string empty_hash =
+        !file_hash.empty() ? file_hash : dfg::hash::sha256("");
     g_file_chunker.store_metadata(filename, {}, empty_hash);
     std::string ok_msg = "SUCCESS\n";
     ::send(fd, ok_msg.data(), ok_msg.size(), 0);
-    std::cout << "Successfully processed 0-byte client upload for file: " << filename << std::endl;
+    std::cout << "Successfully processed 0-byte client upload for file: "
+              << filename << std::endl;
     return;
   }
 
@@ -434,7 +447,8 @@ void handle_client_upload(int fd, const std::string &initial_req) {
     std::string line;
     char c;
     while (::recv(sock_fd, &c, 1, 0) == 1) {
-      if (c == '\n') break;
+      if (c == '\n')
+        break;
       line += c;
     }
     return line;
@@ -451,7 +465,8 @@ void handle_client_upload(int fd, const std::string &initial_req) {
   while (chunks_received < num_chunks) {
     std::string line = read_line(fd);
     if (line.empty()) {
-      std::cerr << "Client disconnected prematurely while waiting for chunk " << chunks_received << std::endl;
+      std::cerr << "Client disconnected prematurely while waiting for chunk "
+                << chunks_received << std::endl;
       return;
     }
     if (line.rfind("CHUNK ", 0) == 0) {
@@ -468,10 +483,13 @@ void handle_client_upload(int fd, const std::string &initial_req) {
       auto chunk_data = std::make_shared<std::vector<char>>(chunk_size);
       size_t received = 0;
       while (received < chunk_size) {
-        ssize_t n = ::recv(fd, chunk_data->data() + received, chunk_size - received, 0);
+        ssize_t n =
+            ::recv(fd, chunk_data->data() + received, chunk_size - received, 0);
         if (n <= 0) {
-          if (n < 0 && errno == EINTR) continue;
-          std::cerr << "Connection dropped while receiving chunk " << chunk_id << std::endl;
+          if (n < 0 && errno == EINTR)
+            continue;
+          std::cerr << "Connection dropped while receiving chunk " << chunk_id
+                    << std::endl;
           return;
         }
         received += n;
@@ -479,9 +497,11 @@ void handle_client_upload(int fd, const std::string &initial_req) {
 
       std::string calc_hash = dfg::hash::sha256(*chunk_data);
       if (calc_hash != client_chunk_hash) {
-        std::cerr << "Checksum mismatch on chunk " << chunk_id
-                  << " (got " << calc_hash << ", expected " << client_chunk_hash << ")" << std::endl;
-        std::string err = "ERROR: Chunk checksum mismatch for chunk " + std::to_string(chunk_id) + "\n";
+        std::cerr << "Checksum mismatch on chunk " << chunk_id << " (got "
+                  << calc_hash << ", expected " << client_chunk_hash << ")"
+                  << std::endl;
+        std::string err = "ERROR: Chunk checksum mismatch for chunk " +
+                          std::to_string(chunk_id) + "\n";
         ::send(fd, err.data(), err.size(), 0);
         return;
       }
@@ -490,7 +510,8 @@ void handle_client_upload(int fd, const std::string &initial_req) {
       total_bytes_received += chunk_size;
 
       // Submit concurrent replication to cluster servers
-      g_file_chunker.submit_chunk_transfers(chunk_id, chunk_data, filename, calc_hash, pending);
+      g_file_chunker.submit_chunk_transfers(chunk_id, chunk_data, filename,
+                                            calc_hash, pending);
       chunks_received++;
     } else if (line == "EOF") {
       break;
@@ -503,19 +524,22 @@ void handle_client_upload(int fd, const std::string &initial_req) {
   }
 
   // Wait for all chunk replica transfers to finish across cluster servers
-  auto chunks = g_file_chunker.collect_transfers(filename, pending, chunks_received);
+  auto chunks =
+      g_file_chunker.collect_transfers(filename, pending, chunks_received);
 
   std::string computed_file_hash = full_file_hasher.digest();
   if (!file_hash.empty() && computed_file_hash != file_hash) {
-    std::cerr << "Full file checksum mismatch for " << filename
-              << " (got " << computed_file_hash << ", expected " << file_hash << ")" << std::endl;
+    std::cerr << "Full file checksum mismatch for " << filename << " (got "
+              << computed_file_hash << ", expected " << file_hash << ")"
+              << std::endl;
     std::string err = "ERROR: SHA256 checksum mismatch\n";
     ::send(fd, err.data(), err.size(), 0);
     return;
   }
 
   if (chunks.empty() && file_size > 0) {
-    std::string err = "ERROR: Failed to store chunk replicas across cluster servers\n";
+    std::string err =
+        "ERROR: Failed to store chunk replicas across cluster servers\n";
     ::send(fd, err.data(), err.size(), 0);
     return;
   }
@@ -524,5 +548,6 @@ void handle_client_upload(int fd, const std::string &initial_req) {
   std::string ok_msg = "SUCCESS\n";
   ::send(fd, ok_msg.data(), ok_msg.size(), 0);
   std::cout << "Successfully processed client upload for file: " << filename
-            << " (" << chunks_received << " chunks, " << total_bytes_received << " bytes)" << std::endl;
+            << " (" << chunks_received << " chunks, " << total_bytes_received
+            << " bytes)" << std::endl;
 }

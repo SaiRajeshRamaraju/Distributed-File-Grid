@@ -1,31 +1,19 @@
-// ─────────────────── Distributed File Grid — Server Entry Point ───────────────────
-// Server binary `dfg` for all cluster services and runtime server management.
-
-#include "../head_server/redis_handler.hpp"
+#include <dfg/cluster_server/service.hpp>
 #include <dfg/config_loader.hpp>
+#include <dfg/head_server/service.hpp>
+#include <dfg/health_checker/service.hpp>
 #include <dfg/net_utils.hpp>
 #include <dfg/version.hpp>
-
+#include <dfg/zk_monitor/service.hpp>
 #include <iostream>
-#include <signal.h>
 #include <sstream>
 #include <string>
 #include <unistd.h>
 #include <vector>
 
-// Forward declarations of server runners
-int run_head_server(int argc, char **argv);
-int run_cluster_server(int argc, char **argv);
-int run_health_checker(int argc, char **argv);
-int run_zk_monitor(int argc, char **argv);
-
-static volatile bool g_server_running = true;
-
-static void server_signal_handler(int signal) {
-  std::cout << "\nReceived signal " << signal << ", shutting down gracefully..."
-            << std::endl;
-  g_server_running = false;
-}
+// Distributed File Grid — Server Entry Point
+// Server binary `dfg` for all cluster services and runtime
+// server management.
 
 static void print_usage() {
   std::cout << R"(
@@ -60,7 +48,7 @@ Examples:
 )" << std::endl;
 }
 
-// ── Runtime server management via HTTP to head server's control API ──
+// Runtime server management via HTTP to head server's control API
 static int cmd_add_server(const std::string &host, int port) {
   auto &cfg = head_server_config();
   std::string head_host = cfg.get_string("head_server.host", "127.0.0.1");
@@ -164,9 +152,6 @@ static int cmd_list_servers() {
 }
 
 int main(int argc, char *argv[]) {
-  signal(SIGINT, server_signal_handler);
-  signal(SIGTERM, server_signal_handler);
-
   if (argc < 2) {
     print_usage();
     return 1;
@@ -179,26 +164,27 @@ int main(int argc, char *argv[]) {
     return 0;
   }
   if (command == "-v" || command == "--version") {
-    std::cout << "Distributed File Grid Server version " << APP_VERSION << std::endl;
+    std::cout << "Distributed File Grid Server version " << APP_VERSION
+              << std::endl;
     return 0;
   }
 
-  // Parse common arguments for cluster management
-  std::string host;
-  int target_id = -1;
-  int port = 8080;
-
-  for (int i = 2; i < argc; i++) {
-    std::string arg = argv[i];
-    if (arg == "--host" && i + 1 < argc)
-      host = argv[++i];
-    else if (arg == "--id" && i + 1 < argc)
-      target_id = std::stoi(argv[++i]);
-    else if (arg == "--port" && i + 1 < argc)
-      port = std::stoi(argv[++i]);
-  }
-
   try {
+    // Parse common arguments for cluster management
+    std::string host;
+    int target_id = -1;
+    int port = 8080;
+
+    for (int i = 2; i < argc; i++) {
+      std::string arg = argv[i];
+      if (arg == "--host" && i + 1 < argc)
+        host = argv[++i];
+      else if (arg == "--id" && i + 1 < argc)
+        target_id = std::stoi(argv[++i]);
+      else if (arg == "--port" && i + 1 < argc)
+        port = std::stoi(argv[++i]);
+    }
+
     if (command == "head-server" || command == "head") {
       return run_head_server(argc - 1, argv + 1);
     } else if (command == "cluster-server" || command == "cluster") {

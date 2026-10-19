@@ -1,7 +1,7 @@
 # Distributed File Grid - Makefile
 # Build and management commands for the distributed storage system
 
-.PHONY: all build clean install-deps start stop status test help
+.PHONY: all build clean install-deps install-deps-arch start stop status test help format format-check
 
 # Default target
 all: build
@@ -17,8 +17,6 @@ build:
 clean:
 	@echo "Cleaning build artifacts..."
 	@rm -rf build/
-	@rm -rf /tmp/chunks/
-	@rm -rf /tmp/cluster_storage/
 	@echo "Clean completed!"
 
 # Install system dependencies (Ubuntu/Debian)
@@ -52,10 +50,17 @@ stop:
 status:
 	@./scripts/status.sh
 
-# Run system tests
-test: build
-	@echo "Running system tests..."
-	@cd build && ./client test
+# Configure and run the isolated unit and integration suites.
+test:
+	cmake -S . -B build -DBUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+	cmake --build build --parallel 2
+	ctest --test-dir build --output-on-failure --no-tests=error
+
+format:
+	python3 scripts/format.py
+
+format-check:
+	python3 scripts/format.py --check
 
 # Upload a test file
 upload-test: build
@@ -83,6 +88,8 @@ help:
 	@echo ""
 	@echo "Build Commands:"
 	@echo "  make build          - Build the project"
+	@echo "  make format         - Format C++ source files"
+	@echo "  make format-check   - Check C++ formatting"
 	@echo "  make clean          - Clean build artifacts"
 	@echo "  make install-deps   - Install system dependencies (Ubuntu/Debian)"
 	@echo "  make install-deps-arch - Install system dependencies (Arch Linux)"
@@ -93,7 +100,7 @@ help:
 	@echo "  make status         - Check service status"
 	@echo ""
 	@echo "Testing:"
-	@echo "  make test           - Run system tests"
+	@echo "  make test           - Build and run unit and integration tests"
 	@echo "  make upload-test    - Upload a test file"
 	@echo "  make download-test  - Download the test file"
 	@echo ""

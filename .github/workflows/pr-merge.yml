@@ -40,8 +40,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            build-essential cmake ninja-build pkg-config git python3 \
+            build-essential cmake ninja-build pkg-config git python3 python3-venv \
             libprotobuf-dev protobuf-compiler zlib1g-dev libgtest-dev
+
+      - name: Check source formatting
+        run: |
+          python3 -m venv "$RUNNER_TEMP/dfg-format"
+          "$RUNNER_TEMP/dfg-format/bin/pip" install clang-format==21.1.4
+          CLANG_FORMAT="$RUNNER_TEMP/dfg-format/bin/clang-format" python3 scripts/format.py --check
 
       - name: Configure
         run: >-

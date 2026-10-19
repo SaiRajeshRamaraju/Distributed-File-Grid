@@ -1,4 +1,5 @@
 #include "metrics_exporter.hpp"
+
 #include <stdexcept>
 
 using namespace prometheus;

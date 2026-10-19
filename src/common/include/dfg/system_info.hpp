@@ -70,7 +70,7 @@ inline std::string formatBandwidth(unsigned long long bytesPerSecond) {
   return ss.str();
 }
 
-// ─────────────────── Raw stat readers (no sleep) ───────────────────
+// Raw stat readers (no sleep)
 
 inline CpuStats readCpuStats() {
   std::ifstream file("/proc/stat");
@@ -125,7 +125,7 @@ inline NetworkStats readNetworkStats() {
   return stats;
 }
 
-// ─────────────────── Blocking versions (original API) ───────────────────
+// Blocking versions (original API)
 
 // Function 1: Returns CPU usage percentage (blocks for ~1 second)
 inline float getCpuUsagePercent() {
@@ -231,7 +231,7 @@ inline std::pair<std::string, std::string> getNetworkBandwidthFormatted() {
   return {inBandwidth, outBandwidth};
 }
 
-// ─────────────────── Cached System Monitor ───────────────────
+// Cached System Monitor
 // Non-blocking: samples are taken in the background so heartbeat
 // senders never sleep(1) inside the reactor coroutine.
 
@@ -256,22 +256,30 @@ public:
     auto [diskGB, diskPct] = getDiskUsageGBPercent();
 
     std::lock_guard<std::mutex> lock(mu_);
-    
+
     if (has_sample_) {
-      auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_time_).count();
+      auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          now - last_time_)
+                          .count();
       if (duration > 0) {
-        unsigned long long totalDiff = curr_cpu.getTotal() - last_cpu_.getTotal();
-        unsigned long long idleDiff = curr_cpu.getTotalIdle() - last_cpu_.getTotalIdle();
+        unsigned long long totalDiff =
+            curr_cpu.getTotal() - last_cpu_.getTotal();
+        unsigned long long idleDiff =
+            curr_cpu.getTotalIdle() - last_cpu_.getTotalIdle();
         float cpu_pct = (totalDiff > 0)
                             ? (float)(totalDiff - idleDiff) / totalDiff * 100.0f
                             : 0.0f;
 
         // Convert duration to seconds for bps calculation
         double seconds = duration / 1000.0;
-        unsigned long long inBps = (curr_net.rxBytes >= last_net_.rxBytes) ? 
-            (curr_net.rxBytes - last_net_.rxBytes) / seconds : 0;
-        unsigned long long outBps = (curr_net.txBytes >= last_net_.txBytes) ? 
-            (curr_net.txBytes - last_net_.txBytes) / seconds : 0;
+        unsigned long long inBps =
+            (curr_net.rxBytes >= last_net_.rxBytes)
+                ? (curr_net.rxBytes - last_net_.rxBytes) / seconds
+                : 0;
+        unsigned long long outBps =
+            (curr_net.txBytes >= last_net_.txBytes)
+                ? (curr_net.txBytes - last_net_.txBytes) / seconds
+                : 0;
 
         cached_.cpu_usage = cpu_pct;
         cached_.network_in = formatBandwidth(inBps);

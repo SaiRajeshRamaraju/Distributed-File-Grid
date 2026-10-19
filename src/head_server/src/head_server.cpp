@@ -1,494 +1,38 @@
-// ─────────────────── Head Server ───────────────────
-// Manages file metadata, receives cluster server heartbeats,
-// tracks health, exposes control API for dynamic server management,
-// and reports status to ZooKeeper.
-
 #include "control_api.hpp"
+#include "file_download.hpp"
+#include "file_transfer.pb.h"
+#include "file_upload.hpp"
 #include "metrics.hpp"
-#include "redis_handler.hpp"
-#include <dfg/async_net.hpp>
-#include <dfg/config_loader.hpp>
-#include <dfg/health_monitor.hpp>
-#include <dfg/server_registry.hpp>
-#include <dfg/version.hpp>
-#include <dfg/zookeeper_client.hpp>
+#include "server_state.hpp"
 
 #include <algorithm>
+#include <arpa/inet.h>
 #include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstring>
+#include <dfg/async_net.hpp>
+#include <dfg/config_loader.hpp>
+#include <dfg/head_server/service.hpp>
+#include <dfg/health_monitor.hpp>
+#include <dfg/metadata/store.hpp>
+#include <dfg/net_utils.hpp>
+#include <dfg/server_registry.hpp>
+#include <dfg/thread_pool.hpp>
+#include <dfg/version.hpp>
+#include <dfg/zookeeper_client.hpp>
+#include <functional>
+#include <future>
 #include <iostream>
 #include <string>
 #include <sys/statvfs.h>
 #include <thread>
-
 #include <unordered_set>
 
-#include "file_transfer.pb.h"
-#include <arpa/inet.h>
-#include <dfg/net_utils.hpp>
-#include <dfg/thread_pool.hpp>
-#include <functional>
-#include <future>
-
-// Forward declaration for client upload handler (implemented in
-// file_upload.cpp)
-void handle_client_upload(int fd, const std::string &initial_req);
-
-// ─────────────────── File Download / Reverse Proxy & Replication
-// ───────────────────
-static constexpr int MAX_CONCURRENT_FETCHES = 6;
-
-struct ChunkLocation {
-  int chunk_id;
-  std::string server_ip;
-  std::string file_path;
-};
-
-static dfg::ThreadPool &fetch_pool() {
-  static dfg::ThreadPool pool(MAX_CONCURRENT_FETCHES);
-  return pool;
-}
-
-extern std::unique_ptr<dfg::ServerRegistry> g_cluster_registry;
-class FileReconstructor {
-public:
-  std::pair<std::vector<ChunkLocation>, std::string>
-  get_chunk_locations_from_metadata(const std::string &filename) {
-    std::vector<ChunkLocation> locations;
-    std::string file_hash;
-
-    try {
-      auto record = query_metadata(filename);
-      file_hash = record.file_hash;
-      for (const auto &chunk : record.chunks) {
-        ChunkLocation loc;
-        loc.chunk_id = static_cast<int>(chunk.chunk_id);
-        loc.server_ip = chunk.server;
-        loc.file_path = chunk.path;
-        locations.push_back(loc);
-      }
-    } catch (const std::exception &e) {
-      std::cerr << "Error getting chunk locations: " << e.what() << std::endl;
-    }
-
-    return {locations, file_hash};
-  }
-
-  file_transfer::v1::FetchHashResponse
-  get_chunk_hash(const ChunkLocation &location, const std::string &filename) {
-    file_transfer::v1::FetchHashResponse resp;
-    resp.set_success(false);
-
-    std::string ip;
-    int port;
-    dfg::net::parse_address(location.server_ip, ip, port);
-
-    int transfer_port = 8180;
-    if (g_cluster_registry) {
-      for (const auto &s : g_cluster_registry->get_all()) {
-        if (s.address() == location.server_ip) {
-          if (s.transfer_port > 0)
-            transfer_port = s.transfer_port;
-          break;
-        }
-      }
-    }
-
-    int sock = dfg::net::connect_with_timeout(ip, transfer_port);
-    if (sock < 0)
-      return resp;
-
-    file_transfer::v1::FetchHashRequest req;
-    std::string unique_chunk_id =
-        filename + "_chunk_" + std::to_string(location.chunk_id);
-    req.set_chunk_id(unique_chunk_id);
-    req.set_file_path(location.file_path);
-
-    std::string serialized;
-    req.SerializeToString(&serialized);
-    uint32_t type = htonl(3);
-    uint32_t len = htonl(serialized.size());
-
-    if (!dfg::net::send_all(sock, &type, sizeof(type)) ||
-        !dfg::net::send_all(sock, &len, sizeof(len)) ||
-        !dfg::net::send_all(sock, serialized.data(), serialized.size())) {
-      ::close(sock);
-      return resp;
-    }
-
-    uint32_t resp_len_net;
-    if (!dfg::net::recv_all(sock, &resp_len_net, sizeof(resp_len_net))) {
-      ::close(sock);
-      return resp;
-    }
-
-    uint32_t resp_len = ntohl(resp_len_net);
-    std::vector<char> resp_buf(resp_len);
-
-    if (!dfg::net::recv_all(sock, resp_buf.data(), resp_len)) {
-      ::close(sock);
-      return resp;
-    }
-
-    resp.ParseFromArray(resp_buf.data(), resp_len);
-    ::close(sock);
-    return resp;
-  }
-
-public:
-  bool repair_chunk_on_server(const ChunkLocation &location,
-                              const std::string &filename,
-                              const std::vector<char> &chunk_data,
-                              std::string *out_file_path = nullptr) {
-    std::string ip;
-    int port;
-    dfg::net::parse_address(location.server_ip, ip, port);
-
-    int transfer_port = 8180;
-    if (g_cluster_registry) {
-      for (const auto &s : g_cluster_registry->get_all()) {
-        if (s.address() == location.server_ip) {
-          if (s.transfer_port > 0)
-            transfer_port = s.transfer_port;
-          break;
-        }
-      }
-    }
-
-    int sock = dfg::net::connect_with_timeout(ip, transfer_port);
-    if (sock < 0)
-      return false;
-
-    file_transfer::v1::ChunkData msg;
-    std::string unique_chunk_id =
-        filename + "_chunk_" + std::to_string(location.chunk_id);
-    msg.set_chunk_id(unique_chunk_id);
-    msg.set_filename(filename);
-    msg.set_data(chunk_data.data(), chunk_data.size());
-
-    std::string serialized;
-    msg.SerializeToString(&serialized);
-
-    uint32_t type = htonl(1);
-    uint32_t len = htonl(serialized.size());
-
-    if (!dfg::net::send_all(sock, &type, sizeof(type)) ||
-        !dfg::net::send_all(sock, &len, sizeof(len)) ||
-        !dfg::net::send_all(sock, serialized.data(), serialized.size())) {
-      ::close(sock);
-      return false;
-    }
-
-    uint32_t resp_len_net;
-    if (dfg::net::recv_all(sock, &resp_len_net, sizeof(resp_len_net))) {
-      uint32_t resp_len = ntohl(resp_len_net);
-      std::vector<char> resp_buf(resp_len);
-      if (dfg::net::recv_all(sock, resp_buf.data(), resp_len)) {
-        file_transfer::v1::ChunkResponse resp;
-        if (resp.ParseFromArray(resp_buf.data(), resp_len) && resp.success()) {
-          if (out_file_path) {
-            *out_file_path = resp.file_path();
-          }
-          ::close(sock);
-          return true;
-        }
-      }
-    }
-    ::close(sock);
-    return false;
-  }
-
-  std::vector<char> read_chunk_from_server(const ChunkLocation &location,
-                                           const std::string &filename) {
-    std::vector<char> chunk_data;
-
-    std::string ip;
-    int port;
-    dfg::net::parse_address(location.server_ip, ip, port);
-
-    int transfer_port = 8180;
-    if (g_cluster_registry) {
-      for (const auto &s : g_cluster_registry->get_all()) {
-        if (s.address() == location.server_ip) {
-          if (s.transfer_port > 0)
-            transfer_port = s.transfer_port;
-          break;
-        }
-      }
-    }
-
-    int sock = dfg::net::connect_with_timeout(ip, transfer_port);
-    if (sock < 0)
-      return chunk_data;
-
-    file_transfer::v1::FetchChunkRequest req;
-    std::string unique_chunk_id =
-        filename + "_chunk_" + std::to_string(location.chunk_id);
-    req.set_chunk_id(unique_chunk_id);
-    req.set_file_path(location.file_path);
-
-    std::string serialized;
-    req.SerializeToString(&serialized);
-
-    uint32_t type = htonl(2);
-    uint32_t len = htonl(serialized.size());
-
-    if (!dfg::net::send_all(sock, &type, sizeof(type)) ||
-        !dfg::net::send_all(sock, &len, sizeof(len)) ||
-        !dfg::net::send_all(sock, serialized.data(), serialized.size())) {
-      ::close(sock);
-      return chunk_data;
-    }
-
-    uint32_t resp_len_net;
-    if (!dfg::net::recv_all(sock, &resp_len_net, sizeof(resp_len_net))) {
-      ::close(sock);
-      return chunk_data;
-    }
-
-    uint32_t resp_len = ntohl(resp_len_net);
-    std::vector<char> resp_buf(resp_len);
-
-    if (!dfg::net::recv_all(sock, resp_buf.data(), resp_len)) {
-      ::close(sock);
-      return chunk_data;
-    }
-
-    file_transfer::v1::FetchChunkResponse resp;
-    if (!resp.ParseFromArray(resp_buf.data(), resp_len) || !resp.success()) {
-      std::cerr << "Server rejected fetch: " << resp.error_message()
-                << std::endl;
-      ::close(sock);
-      return chunk_data;
-    }
-
-    chunk_data.assign(resp.data().begin(), resp.data().end());
-    ::close(sock);
-    std::cout << "Read chunk " << location.chunk_id << " (" << chunk_data.size()
-              << " bytes) from " << location.server_ip << std::endl;
-    return chunk_data;
-  }
-
-  bool stream_file_to_client(const std::string &filename, int fd) {
-    auto [chunk_locations, file_hash] =
-        get_chunk_locations_from_metadata(filename);
-    if (chunk_locations.empty()) {
-      if (!file_hash.empty()) {
-        std::string header = "FILE_HASH " + file_hash + "\nEOF\n";
-        ::send(fd, header.data(), header.size(), 0);
-        return true;
-      }
-      std::string err = "ERROR: No chunks found for file\n";
-      ::send(fd, err.data(), err.size(), 0);
-      return false;
-    }
-
-    std::map<int, std::vector<ChunkLocation>> chunk_replicas;
-    for (const auto &location : chunk_locations) {
-      chunk_replicas[location.chunk_id].push_back(location);
-    }
-
-    std::string hash_msg = "FILE_HASH " + file_hash + "\n";
-    ::send(fd, hash_msg.data(), hash_msg.size(), 0);
-
-    std::string count_msg =
-        "CHUNKS " + std::to_string(chunk_replicas.size()) + "\n";
-    ::send(fd, count_msg.data(), count_msg.size(), 0);
-
-    struct HashResult {
-      int chunk_id;
-      ChunkLocation location;
-      file_transfer::v1::FetchHashResponse response;
-    };
-
-    std::vector<std::future<HashResult>> hash_futures;
-    for (const auto &[chunk_id, replicas] : chunk_replicas) {
-      for (const auto &replica : replicas) {
-        auto cid = chunk_id;
-        auto loc = replica;
-        auto fname = filename;
-        hash_futures.push_back(
-            fetch_pool().submit([this, cid, loc, fname]() -> HashResult {
-              auto resp = get_chunk_hash(loc, fname);
-              return HashResult{cid, loc, resp};
-            }));
-      }
-    }
-
-    struct ServerInfo {
-      ChunkLocation loc;
-      float load_score;
-      int active_connections;
-    };
-    struct ChunkConsensus {
-      std::map<std::string, int> hash_counts;
-      std::map<std::string, std::vector<ServerInfo>> hash_to_servers;
-    };
-    std::map<int, ChunkConsensus> consensus_map;
-
-    for (auto &fut : hash_futures) {
-      auto result = fut.get();
-      auto &consensus = consensus_map[result.chunk_id];
-      if (result.response.success()) {
-        consensus.hash_counts[result.response.hash()]++;
-        consensus.hash_to_servers[result.response.hash()].push_back(
-            {result.location, result.response.load_score(),
-             result.response.active_connections()});
-      }
-    }
-
-    struct ChunkFetchPlan {
-      int chunk_id;
-      ChunkLocation best_server;
-      std::string majority_hash;
-    };
-
-    std::vector<ChunkFetchPlan> fetch_plans;
-    for (const auto &[chunk_id, consensus] : consensus_map) {
-      if (consensus.hash_counts.empty()) {
-        std::string err = "ERROR: Could not verify hashes for chunk " +
-                          std::to_string(chunk_id) + "\n";
-        ::send(fd, err.data(), err.size(), 0);
-        return false;
-      }
-      std::string majority_hash;
-      int max_count = 0;
-      for (const auto &[hash, count] : consensus.hash_counts) {
-        if (count > max_count) {
-          max_count = count;
-          majority_hash = hash;
-        }
-      }
-      auto majority_servers = consensus.hash_to_servers.at(majority_hash);
-      std::sort(majority_servers.begin(), majority_servers.end(),
-                [](const auto &a, const auto &b) {
-                  if (a.active_connections != b.active_connections)
-                    return a.active_connections < b.active_connections;
-                  return a.load_score < b.load_score;
-                });
-      fetch_plans.push_back(ChunkFetchPlan{
-          chunk_id, majority_servers.front().loc, majority_hash});
-    }
-
-    auto servers = g_cluster_registry->get_all();
-
-    for (const auto &plan : fetch_plans) {
-      std::string server_ip = plan.best_server.server_ip;
-      int public_port = 8080; // fallback
-      for (const auto &s : servers) {
-        if (s.address() == server_ip) {
-          public_port = s.public_port;
-          break;
-        }
-      }
-
-      std::string ip_only = server_ip.substr(0, server_ip.find(':'));
-
-      std::string loc_msg = "CHUNK_LOC " + std::to_string(plan.chunk_id) + " " +
-                            ip_only + " " + std::to_string(public_port) + " " +
-                            plan.majority_hash + "\n";
-      ::send(fd, loc_msg.data(), loc_msg.size(), 0);
-    }
-    std::string eof = "FILE_HASH " + file_hash + "\nEOF\n";
-    ::send(fd, eof.data(), eof.size(), 0);
-    return true;
-  }
-};
-
-static FileReconstructor g_file_reconstructor;
-
-void handle_client_delete(int fd, const std::string &filename) {
-  auto [chunk_locations, file_hash] =
-      g_file_reconstructor.get_chunk_locations_from_metadata(filename);
-  if (chunk_locations.empty()) {
-    std::string err = "ERROR: File not found\n";
-    ::send(fd, err.data(), err.size(), 0);
-    return;
-  }
-
-  bool all_deleted = true;
-  for (const auto &loc : chunk_locations) {
-    std::string ip;
-    int port;
-    dfg::net::parse_address(loc.server_ip, ip, port);
-
-    int sock =
-        dfg::net::connect_with_timeout(ip, port, 5); // Connect to base port
-    if (sock >= 0) {
-      std::string unique_chunk_id =
-          filename + "_chunk_" + std::to_string(loc.chunk_id);
-      std::string del_req = "DELETE_CHUNK " + unique_chunk_id + "\n";
-      ::send(sock, del_req.data(), del_req.size(), 0);
-
-      char buf[64] = {0};
-      ssize_t n = ::recv(sock, buf, sizeof(buf) - 1, 0);
-      if (n > 0) {
-        std::string resp(buf, n);
-        if (resp.find("SUCCESS") == std::string::npos) {
-          all_deleted = false;
-        }
-      } else {
-        all_deleted = false;
-      }
-      ::close(sock);
-    } else {
-      all_deleted = false;
-    }
-  }
-
-  if (all_deleted) {
-    delete_entry(filename);
-    std::string ok = "SUCCESS\n";
-    ::send(fd, ok.data(), ok.size(), 0);
-  } else {
-    std::string err = "ERROR: Could not delete chunks\n";
-    ::send(fd, err.data(), err.size(), 0);
-  }
-}
-
-void handle_client_download(int fd, const std::string &filename) {
-
-  g_file_reconstructor.stream_file_to_client(filename, fd);
-}
-
-bool replicate_chunk_to_server(const std::string &source_server, int chunk_id,
-                               const std::string &target_server,
-                               const std::string &filename,
-                               std::string *out_file_path = nullptr,
-                               const std::string &source_file_path = "") {
-  ChunkLocation source_loc;
-  source_loc.chunk_id = chunk_id;
-  source_loc.server_ip = source_server;
-  source_loc.file_path = source_file_path;
-
-  auto chunk_data =
-      g_file_reconstructor.read_chunk_from_server(source_loc, filename);
-  if (chunk_data.empty()) {
-    std::cerr << "[Replication] Failed to read chunk " << chunk_id
-              << " from surviving server " << source_server << std::endl;
-    return false;
-  }
-
-  ChunkLocation target_loc;
-  target_loc.chunk_id = chunk_id;
-  target_loc.server_ip = target_server;
-  target_loc.file_path = "/tmp/chunks/" + target_server + "_" + filename +
-                         "_chunk_" + std::to_string(chunk_id);
-
-  bool ok = g_file_reconstructor.repair_chunk_on_server(
-      target_loc, filename, chunk_data, out_file_path);
-  if (ok) {
-    std::cout << "[Replication] Successfully duplicated chunk " << chunk_id
-              << " of file " << filename << " to new server " << target_server
-              << std::endl;
-  } else {
-    std::cerr << "[Replication] Failed to write chunk " << chunk_id
-              << " to new server " << target_server << std::endl;
-  }
-  return ok;
-}
+// Head Server
+// Manages file metadata, receives cluster server heartbeats,
+// tracks health, exposes control API for dynamic server management,
+// and reports status to ZooKeeper.
 
 // Global metrics instance for the head server
 static std::unique_ptr<HeadServerMetrics> g_head_metrics;
@@ -508,7 +52,7 @@ static void head_signal_handler(int sig) {
   g_head_running = false;
 }
 
-// ── Heartbeat receiver thread ──
+// Heartbeat receiver thread
 // Receives UDP heartbeats from cluster servers on port 9000
 static void heartbeat_receiver_thread(dfg::HealthMonitor &monitor,
                                       HeadServerMetrics *metrics) {
@@ -581,12 +125,12 @@ static void heartbeat_receiver_thread(dfg::HealthMonitor &monitor,
   ::close(sfd);
 }
 
-// ── Recovery deduplication guard ──
+// Recovery deduplication guard
 static std::mutex g_recovering_mutex;
 static std::unordered_set<std::string> g_recovering_servers;
 
-// ── Emergency Protocol: Send DEAD signal to cluster server via TCP (up to 3
-// tries) ──
+// Emergency Protocol: Send DEAD signal to cluster server via TCP (up to 3
+// tries)
 static bool send_dead_signal_to_cluster_server(const std::string &server_addr) {
   std::string ip;
   int port = 0;
@@ -661,7 +205,7 @@ static bool send_dead_signal_to_cluster_server(const std::string &server_addr) {
   return true;
 }
 
-// ── Consensus Voting: Verify with ZooKeeper cluster and peer Head Servers ──
+// Consensus Voting: Verify with ZooKeeper cluster and peer Head Servers
 static bool verify_cluster_server_dead_consensus(
     int server_id, const std::string &server_ip_port,
     const std::string &zk_hosts, int our_control_port) {
@@ -792,7 +336,7 @@ static bool verify_cluster_server_dead_consensus(
   return true;
 }
 
-// ── Re-replicate chunks on cluster server failure ──
+// Re-replicate chunks on cluster server failure
 static void rereplicate_dead_server_chunks(const std::string &dead_server_ip) {
   std::cout
       << "[Failover] Starting chunk re-replication for failed cluster server: "
@@ -946,7 +490,7 @@ static void rereplicate_dead_server_chunks(const std::string &dead_server_ip) {
             << std::endl;
 }
 
-// ── Health check thread with ZooKeeper Voting ──
+// Health check thread with ZooKeeper Voting
 // Periodically checks for stale heartbeats, verifies with ZooKeeper cluster,
 // and triggers self-healing duplication if cluster server is dead.
 static void health_check_thread(dfg::HealthMonitor &monitor,
@@ -1013,6 +557,23 @@ static void on_server_unhealthy_callback(int server_id,
 }
 
 int run_head_server(int argc, char **argv) {
+  if (argc > 1) {
+    std::string arg = argv[1];
+    if (arg == "-h" || arg == "--help") {
+      std::cout << "Usage: head_server [OPTIONS]" << std::endl;
+      std::cout << "Options:" << std::endl;
+      std::cout << "  -h, --help       Show this help message" << std::endl;
+      std::cout << "  -v, --version    Show version" << std::endl;
+      std::cout << "  -p, --port PORT  Set server port" << std::endl;
+      std::cout << "  -c, --config F   Config file path" << std::endl;
+      std::cout << "  --dump-config    Dump parsed config" << std::endl;
+      return 0;
+    }
+    if (arg == "-v" || arg == "--version") {
+      std::cout << "Version: " << APP_VERSION << std::endl;
+      return 0;
+    }
+  }
   signal(SIGINT, head_signal_handler);
   signal(SIGTERM, head_signal_handler);
 
@@ -1027,7 +588,7 @@ int run_head_server(int argc, char **argv) {
     }
   }
 
-  // Handle --dump-config. What is the reason for this to exist??
+  // Print the effective configuration without starting the service.
   for (int i = 1; i < argc; ++i) {
     if (std::string(argv[i]) == "--dump-config") {
       cfg.dump();
@@ -1209,11 +770,8 @@ int run_head_server(int argc, char **argv) {
       }
 
       std::thread([cfd]() {
-        char buf[1024];
-        ssize_t n = ::recv(cfd, buf, sizeof(buf) - 1, 0);
-        if (n > 0) {
-          buf[n] = 0;
-          std::string req(buf);
+        std::string req;
+        if (dfg::net::recv_line(cfd, req)) {
           if (req.rfind("DOWNLOAD ", 0) == 0) {
             std::string filename = req.substr(9);
             // trim trailing newline
@@ -1241,7 +799,7 @@ int run_head_server(int argc, char **argv) {
               resp += file + "\n";
             }
             resp += "EOF\n";
-            ::send(cfd, resp.data(), resp.size(), 0);
+            dfg::net::send_all(cfd, resp.data(), resp.size());
           }
         }
         ::close(cfd);
@@ -1264,37 +822,3 @@ int run_head_server(int argc, char **argv) {
   std::cout << "Head Server shut down gracefully." << std::endl;
   return 0;
 }
-
-// Keep backward-compatible main() for the standalone head_server binary
-// Standalone main() — only compiled for the separate head_server binary.
-// When building the unified dfg binary, DFG_UNIFIED_BINARY is defined
-// and main() is provided by src/main.cpp instead.
-//
-// Reason for this to exist: I don't really know whether to make this standalone
-// binary and all combined all into one. So for now , I added both ways of
-// creating the binaries.
-//
-// WARNING: This might be removed or kept and the unified binary might be
-// removed.
-#ifndef DFG_UNIFIED_BINARY
-int main(int argc, char **argv) {
-  if (argc > 1) {
-    std::string arg = argv[1];
-    if (arg == "-h" || arg == "--help") {
-      std::cout << "Usage: head_server [OPTIONS]" << std::endl;
-      std::cout << "Options:" << std::endl;
-      std::cout << "  -h, --help       Show this help message" << std::endl;
-      std::cout << "  -v, --version    Show version" << std::endl;
-      std::cout << "  -p, --port PORT  Set server port" << std::endl;
-      std::cout << "  -c, --config F   Config file path" << std::endl;
-      std::cout << "  --dump-config    Dump parsed config" << std::endl;
-      return 0;
-    }
-    if (arg == "-v" || arg == "--version") {
-      std::cout << "Version: " << APP_VERSION << std::endl;
-      return 0;
-    }
-  }
-  return run_head_server(argc, argv);
-}
-#endif

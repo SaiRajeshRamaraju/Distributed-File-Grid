@@ -32,7 +32,7 @@ class ClusterIntegrationTest(unittest.TestCase):
         cls.sandbox = tempfile.TemporaryDirectory(prefix="dfg-ci-")
         cls.addClassCleanup(cls.sandbox.cleanup)
         cls.root = Path(cls.sandbox.name)
-        cls.logs = BUILD_DIR / "integration-logs"
+        cls.logs = BUILD_DIR / "integration-logs" / ("unified" if USE_UNIFIED else "standalone")
         cls.logs.mkdir(parents=True, exist_ok=True)
         cls.processes = []
         cls.addClassCleanup(cls.stop_services)
@@ -84,8 +84,11 @@ class ClusterIntegrationTest(unittest.TestCase):
     def start_service(cls, label, binary, *args, env=None):
         logfile = (cls.logs / f"{label}.log").open("w")
         cls.addClassCleanup(logfile.close)
+        commands = {"head_server": "head-server", "cluster_server": "cluster-server"}
+        command = ([str(BUILD_DIR / "dfg"), commands[binary], *args]
+                   if USE_UNIFIED else [str(BUILD_DIR / binary), *args])
         process = subprocess.Popen(
-            [str(BUILD_DIR / binary), *args], cwd=cls.root,
+            command, cwd=cls.root,
             env=env or cls.env, stdin=subprocess.DEVNULL,
             stdout=logfile, stderr=subprocess.STDOUT,
         )
@@ -174,10 +177,41 @@ class ClusterIntegrationTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.roundtrip(name, payload)
 
+    def test_invalid_management_port_reports_error(self):
+        result = subprocess.run(
+            [str(BUILD_DIR / "dfg"), "add-server", "--host", "127.0.0.1",
+             "--port", "invalid"], capture_output=True, text=True, timeout=5,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Error:", result.stderr)
+
     def test_missing_file_download_fails(self):
         result = self.client("download", "does-not-exist.bin",
                              self.root / "missing.bin", succeeds=False)
         self.assertIn("no chunks found", (result.stdout + result.stderr).lower())
+
+    def test_fragmented_head_request(self):
+        with socket.create_connection(("127.0.0.1", self.head_port), timeout=5) as sock:
+            sock.sendall(b"DOWN")
+            time.sleep(0.1)
+            sock.sendall(b"LOAD does-not-exist.bin\n")
+            with sock.makefile("rb") as stream:
+                self.assertTrue(stream.readline().startswith(b"ERROR:"))
+
+    def test_upload_header_and_payload_in_same_write(self):
+        payload = b"a coalesced TCP upload\x00\xff"
+        digest = hashlib.sha256(payload).hexdigest()
+        name = "coalesced.bin"
+        header = f"UPLOAD {name} {len(payload)} 1 {digest}\n"
+        chunk = f"CHUNK 0 {len(payload)} {digest}\n"
+        with socket.create_connection(("127.0.0.1", self.head_port), timeout=10) as sock:
+            sock.sendall(header.encode() + chunk.encode() + payload + b"EOF\n")
+            with sock.makefile("rb") as stream:
+                self.assertEqual(stream.readline(), b"READY\n")
+                self.assertEqual(stream.readline(), b"SUCCESS\n")
+        output = self.root / "coalesced.download"
+        self.client("download", name, output)
+        self.assertEqual(output.read_bytes(), payload)
 
     def test_fragmented_public_chunk_request(self):
         payload = bytes(range(256)) * 16
@@ -215,6 +249,8 @@ class ClusterIntegrationTest(unittest.TestCase):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--build-dir", required=True, type=Path)
+    parser.add_argument("--unified", action="store_true")
     args, unittest_args = parser.parse_known_args()
     BUILD_DIR = args.build_dir.resolve()
+    USE_UNIFIED = args.unified
     unittest.main(argv=[__file__, *unittest_args], verbosity=2)

@@ -3,7 +3,19 @@
 find_package(GTest REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+add_test(NAME CliSmokeTest
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/test_cli.py
+        --build-dir ${CMAKE_BINARY_DIR}
+)
+set_tests_properties(CliSmokeTest PROPERTIES LABELS "unit" TIMEOUT 30)
+
 # ── Unit tests ──
+
+add_executable(test_net_utils unit/test_net_utils.cpp)
+target_link_libraries(test_net_utils PRIVATE
+    GTest::GTest GTest::Main Threads::Threads dfg_common
+)
+add_test(NAME NetworkStreamTest COMMAND test_net_utils)
 
 add_executable(test_async_io
     unit/test_async_io.cpp
@@ -48,6 +60,7 @@ add_executable(test_metadata_replication
     unit/test_metadata_replication.cpp
 )
 target_link_libraries(test_metadata_replication PRIVATE
+    dfg_metadata
     GTest::GTest GTest::Main
     Threads::Threads
     dfg_common
@@ -55,7 +68,6 @@ target_link_libraries(test_metadata_replication PRIVATE
 )
 target_include_directories(test_metadata_replication PRIVATE
     ${CMAKE_BINARY_DIR}/generated
-    ${CMAKE_SOURCE_DIR}/src/head_server
 )
 add_test(NAME MetadataReplicationTest COMMAND test_metadata_replication)
 
@@ -66,7 +78,7 @@ target_link_libraries(test_server_registry PRIVATE
 add_test(NAME ServerRegistryTest COMMAND test_server_registry)
 
 set_tests_properties(
-    AsyncIoTest SimpleHeartbeatTest HeartbeatTest MetadataReplicationTest ServerRegistryTest
+    AsyncIoTest SimpleHeartbeatTest HeartbeatTest MetadataReplicationTest ServerRegistryTest NetworkStreamTest
     PROPERTIES LABELS "unit" TIMEOUT 90
 )
 
@@ -74,7 +86,11 @@ add_test(NAME ClusterIntegrationTest
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/integration/test_cluster.py
         --build-dir ${CMAKE_BINARY_DIR}
 )
-set_tests_properties(ClusterIntegrationTest PROPERTIES
+add_test(NAME ClusterUnifiedIntegrationTest
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/integration/test_cluster.py
+        --build-dir ${CMAKE_BINARY_DIR} --unified
+)
+set_tests_properties(ClusterIntegrationTest ClusterUnifiedIntegrationTest PROPERTIES
     LABELS "integration" TIMEOUT 180 RUN_SERIAL TRUE
 )
 
@@ -82,6 +98,6 @@ set_tests_properties(ClusterIntegrationTest PROPERTIES
 add_custom_target(run_tests
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
     DEPENDS test_async_io simple_heartbeat_test test_heartbeat test_metadata_replication
-            test_server_registry test_e2e head_server cluster_server client
+            test_server_registry test_net_utils test_e2e dfg head_server cluster_server client health_checker zk_head_server_monitor
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
 )

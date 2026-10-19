@@ -164,7 +164,42 @@ temporary metadata and separate storage directories, dynamically allocates data
 and control ports, and stops only its own processes. Service logs are saved under
 `build/integration-logs/`. The services still use their standard metrics and UDP
 heartbeat ports, so run the integration suite without another local grid running.
-The live tests also check requests delivered in separate TCP writes.
+The live tests cover both standalone services and the unified `dfg` binary,
+including commands split across TCP writes and upload headers coalesced with payloads.
+
+### Source Layout and Coding Style
+
+Each component keeps public headers in `include/dfg/<component>/` and private
+implementation files in `src/`. Executable entry points live in `src/main.cpp`.
+
+| Directory | Responsibility |
+|---|---|
+| `src/common` | Networking, configuration, hashing, health tracking, and the in-process ZooKeeper adapter |
+| `src/metadata` | Shared metadata API with on-disk and optional Redis backends |
+| `src/head_server` | Head service startup, upload placement, downloads, and replica repair |
+| `src/cluster_server` | Storage service, chunk transfer, and metrics |
+| `src/health_checker` | Heartbeat monitoring and health dashboard |
+| `src/zk_monitor` | Coordination monitor |
+| `src/client` | Client library, diagnostic command, and CLI |
+| `src/cli` | Unified server CLI |
+| `src/proto/v1` | Protocol schemas; generated C++ stays in the build directory |
+
+Service implementations compile into libraries shared by the standalone binaries
+and `dfg`. Declare cross-component interfaces in public headers and link their
+CMake targets; keep private headers local to the component. Link `dfg_metadata`
+when using `<dfg/metadata/store.hpp>` so Redis configuration propagates correctly.
+
+C++ uses the root `.clang-format` (LLVM style, two spaces, 80 columns).
+Use clang-format **21.1.4**, matching CI. Set `CLANG_FORMAT` when the executable
+is outside `PATH`.
+
+```bash
+make format        # Format owned C++ sources
+make format-check  # Check without editing
+make test          # Build Release and run isolated unit and integration suites
+```
+
+`make clean` removes build artifacts. Runtime storage is managed separately.
 
 ### PR Merge Pipeline
 
@@ -271,13 +306,14 @@ The client and head server communicate over a deterministic line-delimited and b
    - Sends upload header: `UPLOAD <filename> <filesize> <num_chunks> <sha256_hash>\n`.
    - Streams file chunks: `CHUNK <order_id> <chunk_size> <chunk_sha256>\n` followed by raw chunk bytes.
    - Sends `EOF\n` upon transferring all chunks.
-   - Head Server verifies chunk checksums on receipt, stores chunk replicas across cluster nodes concurrently, commits metadata to Redis, and returns `SUCCESS\n`.
+   - Head Server verifies chunk checksums on receipt, stores chunk replicas across cluster nodes concurrently, commits metadata to the configured backend, and returns `SUCCESS\n`.
 2. **Download Protocol**:
    - Client sends `DOWNLOAD <filename>\n`.
    - Server queries metadata and returns `FILE_HASH <sha256_digest>\n` and `CHUNKS <num_chunks>\n`.
-   - Server fetches chunks from cluster nodes in parallel (acting as a reverse proxy), validates hash consensus, repairs any corrupt replicas, and streams each chunk with header `CHUNK <order_id> <chunk_size> <chunk_sha256>\n` followed by raw binary payload.
-   - **Per-Chunk Verification**: Client verifies the SHA-256 checksum of each chunk as it arrives.
-   - **Full-File Verification**: Upon receiving `EOF\n`, the client verifies the reconstructed file's SHA-256 digest matches the original server digest.
+   - Server validates replica hash consensus, initiates repairs when needed, and returns `CHUNK_LOC <order_id> <ip> <public_port> <chunk_sha256>\n` entries followed by the file hash and `EOF\n`.
+   - Client fetches chunks in parallel from the storage nodes using `GET_CHUNK <order_id> <filename>\n`; each node returns `CHUNK_SIZE <bytes>\n` followed by the binary payload.
+   - **Per-Chunk Verification**: Client verifies each chunk's SHA-256 checksum.
+   - **Full-File Verification**: After assembly, the client verifies the reconstructed file's SHA-256 digest against the server digest.
 
 ---
 

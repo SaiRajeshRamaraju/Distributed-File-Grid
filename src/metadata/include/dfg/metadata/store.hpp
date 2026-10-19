@@ -1,5 +1,5 @@
-#ifndef REDIS_HANDLER_HPP
-#define REDIS_HANDLER_HPP
+#ifndef DFG_METADATA_STORE_HPP
+#define DFG_METADATA_STORE_HPP
 
 #include <algorithm>
 #include <chrono>
@@ -7,19 +7,18 @@
 #include <fcntl.h>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <map>
 #include <unordered_map>
 #include <vector>
 
 #ifdef WITH_REDIS
 #include <sw/redis++/redis++.h>
-using namespace sw::redis;
 #endif
 
 inline std::string file_key(const std::string &id) { return "file:" + id; }
@@ -47,9 +46,9 @@ struct ChunkRecord {
 };
 
 struct FileRecord {
-    std::string file_hash;
-    int replica_count{0};
-    std::vector<ChunkRecord> chunks;
+  std::string file_hash;
+  int replica_count{0};
+  std::vector<ChunkRecord> chunks;
 };
 
 #ifndef WITH_REDIS
@@ -73,30 +72,34 @@ inline MetadataMap load_from_disk() {
       continue;
     std::istringstream iss(line);
     std::string file_name;
-    
-    // We differentiate file hash line from chunk line by seeing if second word is "HASH=" or "REPLICAS="
+
+    // We differentiate file hash line from chunk line by seeing if second word
+    // is "HASH=" or "REPLICAS="
     std::string token2;
     if (!(iss >> file_name >> token2))
       continue;
-    
+
     if (token2.rfind("HASH=", 0) == 0) {
-        map[file_name].file_hash = token2.substr(5);
+      map[file_name].file_hash = token2.substr(5);
     } else if (token2.rfind("REPLICAS=", 0) == 0) {
-        try { map[file_name].replica_count = std::stoi(token2.substr(9)); } catch (...) {}
+      try {
+        map[file_name].replica_count = std::stoi(token2.substr(9));
+      } catch (...) {
+      }
     } else {
-        try {
-            ChunkRecord record;
-            record.chunk_id = std::stoll(token2);
-            if (iss >> record.server >> record.path) {
-                iss >> record.checksum;
-                if (!(iss >> record.replica_count)) {
-                    record.replica_count = 1;
-                }
-                map[file_name].chunks.push_back(record);
-            }
-        } catch (...) {
-            // Ignore malformed line
+      try {
+        ChunkRecord record;
+        record.chunk_id = std::stoll(token2);
+        if (iss >> record.server >> record.path) {
+          iss >> record.checksum;
+          if (!(iss >> record.replica_count)) {
+            record.replica_count = 1;
+          }
+          map[file_name].chunks.push_back(record);
         }
+      } catch (...) {
+        // Ignore malformed line
+      }
     }
   }
 
@@ -107,7 +110,8 @@ inline MetadataMap load_from_disk() {
       cid_counts[cr.chunk_id]++;
     }
     for (auto &cr : rec.chunks) {
-      if (cr.replica_count <= 0 || cr.replica_count != cid_counts[cr.chunk_id]) {
+      if (cr.replica_count <= 0 ||
+          cr.replica_count != cid_counts[cr.chunk_id]) {
         cr.replica_count = cid_counts[cr.chunk_id];
       }
     }
@@ -137,20 +141,23 @@ inline void persist_locked() {
   }
   for (const auto &kv : store()) {
     if (!kv.second.file_hash.empty()) {
-        out << kv.first << " HASH=" << kv.second.file_hash << '\n';
+      out << kv.first << " HASH=" << kv.second.file_hash << '\n';
     }
     if (kv.second.replica_count > 0) {
-        out << kv.first << " REPLICAS=" << kv.second.replica_count << '\n';
+      out << kv.first << " REPLICAS=" << kv.second.replica_count << '\n';
     }
     for (const auto &chunk : kv.second.chunks) {
       out << kv.first << ' ' << chunk.chunk_id << ' ' << chunk.server << ' '
-          << chunk.path << ' ' << chunk.checksum << ' ' << chunk.replica_count << '\n';
+          << chunk.path << ' ' << chunk.checksum << ' ' << chunk.replica_count
+          << '\n';
     }
   }
 }
 
-inline void replace_file_chunks(const std::string &file, const std::string& file_hash,
-                                std::vector<ChunkRecord> &&chunks, int replica_count = 0) {
+inline void replace_file_chunks(const std::string &file,
+                                const std::string &file_hash,
+                                std::vector<ChunkRecord> &&chunks,
+                                int replica_count = 0) {
   std::lock_guard<std::mutex> lock(store_mutex());
   store()[file].file_hash = file_hash;
 
@@ -197,20 +204,22 @@ inline std::vector<std::string> list_files_snapshot() {
 }
 
 inline bool atomic_replace_server_chunks(
-    const std::string &dead_server,
-    const std::string &new_server,
-    const std::map<std::string, std::vector<ChunkRecord>> &file_chunks_to_update) {
+    const std::string &dead_server, const std::string &new_server,
+    const std::map<std::string, std::vector<ChunkRecord>>
+        &file_chunks_to_update) {
   std::lock_guard<std::mutex> lock(store_mutex());
   for (const auto &[filename, new_chunks] : file_chunks_to_update) {
     auto it = store().find(filename);
-    if (it == store().end()) continue;
+    if (it == store().end())
+      continue;
 
     auto &chunks = it->second.chunks;
     // Remove dead server chunks
     chunks.erase(std::remove_if(chunks.begin(), chunks.end(),
-        [&dead_server](const ChunkRecord &cr) {
-          return cr.server == dead_server;
-        }), chunks.end());
+                                [&dead_server](const ChunkRecord &cr) {
+                                  return cr.server == dead_server;
+                                }),
+                 chunks.end());
 
     // Add new server chunks
     for (const auto &nc : new_chunks) {
@@ -235,10 +244,12 @@ inline bool atomic_replace_server_chunks(
 inline void delete_server_metadata(const std::string &server_address) {
   std::lock_guard<std::mutex> lock(store_mutex());
   for (auto &[filename, file_rec] : store()) {
-    file_rec.chunks.erase(std::remove_if(file_rec.chunks.begin(), file_rec.chunks.end(),
-        [&server_address](const ChunkRecord &cr) {
-          return cr.server == server_address;
-        }), file_rec.chunks.end());
+    file_rec.chunks.erase(
+        std::remove_if(file_rec.chunks.begin(), file_rec.chunks.end(),
+                       [&server_address](const ChunkRecord &cr) {
+                         return cr.server == server_address;
+                       }),
+        file_rec.chunks.end());
     std::map<long long, int> cid_counts;
     for (const auto &cr : file_rec.chunks) {
       cid_counts[cr.chunk_id]++;
@@ -269,14 +280,14 @@ inline std::string get_redis_connection_string() {
   return "tcp://" + host_str + ":" + port_str;
 }
 
-inline Redis& get_redis() {
-  static Redis redis(get_redis_connection_string());
+inline sw::redis::Redis &get_redis() {
+  static sw::redis::Redis redis(get_redis_connection_string());
   return redis;
 }
 
 inline std::vector<std::string> list_all_files() {
   try {
-    Redis &redis = get_redis();
+    sw::redis::Redis &redis = get_redis();
     std::vector<std::string> files;
     long long cursor = 0;
     do {
@@ -300,7 +311,7 @@ inline std::vector<std::string> list_all_files() {
 
 inline void create_entry(const std::string &request) {
   try {
-    Redis &redis = get_redis(); // reused connection pool
+    sw::redis::Redis &redis = get_redis(); // reused connection pool
 
     std::istringstream in(request);
     std::string file_name;
@@ -313,14 +324,17 @@ inline void create_entry(const std::string &request) {
     std::string file_hash;
     int file_replica_count = 0;
     std::string line;
-    
+
     while (std::getline(in, line)) {
       if (line.rfind("TTL=", 0) == 0) {
         ttl = std::stoll(line.substr(4));
       } else if (line.rfind("HASH=", 0) == 0) {
         file_hash = line.substr(5);
       } else if (line.rfind("REPLICAS=", 0) == 0) {
-        try { file_replica_count = std::stoi(line.substr(9)); } catch (...) {}
+        try {
+          file_replica_count = std::stoi(line.substr(9));
+        } catch (...) {
+        }
       } else {
         // Break out of header parsing, need to parse this line as a chunk
         break;
@@ -334,8 +348,9 @@ inline void create_entry(const std::string &request) {
     };
     std::vector<ParsedChunk> parsed_chunks;
 
-    auto parse_chunk_line = [&](const std::string& l) {
-      if (l.empty()) return;
+    auto parse_chunk_line = [&](const std::string &l) {
+      if (l.empty())
+        return;
       std::istringstream ls(l);
       ParsedChunk pc;
       if (ls >> pc.chunk_id >> pc.server >> pc.path) {
@@ -346,7 +361,7 @@ inline void create_entry(const std::string &request) {
         parsed_chunks.push_back(pc);
       }
     };
-    
+
     parse_chunk_line(line);
     while (std::getline(in, line)) {
       parse_chunk_line(line);
@@ -363,16 +378,19 @@ inline void create_entry(const std::string &request) {
       if (pc.replica_count <= 0) {
         pc.replica_count = cid_counts[pc.chunk_id];
       }
-      std::string field = "chunk:" + std::to_string(pc.chunk_id) + ":" + pc.server;
-      std::string value = encode_loc(pc.server, pc.path) + "|" + pc.checksum + "|" + std::to_string(pc.replica_count);
+      std::string field =
+          "chunk:" + std::to_string(pc.chunk_id) + ":" + pc.server;
+      std::string value = encode_loc(pc.server, pc.path) + "|" + pc.checksum +
+                          "|" + std::to_string(pc.replica_count);
       fields.emplace_back(field, value);
-      fields.emplace_back("chunk_replicas:" + std::to_string(pc.chunk_id), std::to_string(pc.replica_count));
+      fields.emplace_back("chunk_replicas:" + std::to_string(pc.chunk_id),
+                          std::to_string(pc.replica_count));
     }
 
     if (!fields.empty()) {
       redis.hset(key, fields.begin(), fields.end());
     }
-    
+
     if (!file_hash.empty()) {
       redis.hset(key, "file_hash", file_hash);
     }
@@ -388,7 +406,8 @@ inline void create_entry(const std::string &request) {
       redis.expire(key, std::chrono::seconds{ttl});
     }
 
-    std::cout << "Created file entry: " << file_name << " (replicas=" << file_replica_count << ")\n";
+    std::cout << "Created file entry: " << file_name
+              << " (replicas=" << file_replica_count << ")\n";
   } catch (const std::exception &e) {
     std::cerr << "create_entry error: " << e.what() << "\n";
   }
@@ -418,7 +437,10 @@ inline void create_entry(const std::string &request) {
 
   int file_replica_count = 0;
   if (!raw_lines.empty() && raw_lines.front().rfind("REPLICAS=", 0) == 0) {
-    try { file_replica_count = std::stoi(raw_lines.front().substr(9)); } catch (...) {}
+    try {
+      file_replica_count = std::stoi(raw_lines.front().substr(9));
+    } catch (...) {
+    }
     raw_lines.erase(raw_lines.begin());
   }
 
@@ -427,11 +449,11 @@ inline void create_entry(const std::string &request) {
     std::istringstream ls(entry_line);
     metadata_store::ChunkRecord record;
     if (ls >> record.chunk_id >> record.server >> record.path) {
-        ls >> record.checksum;
-        if (!(ls >> record.replica_count)) {
-            record.replica_count = 0;
-        }
-        chunks.push_back(record);
+      ls >> record.checksum;
+      if (!(ls >> record.replica_count)) {
+        record.replica_count = 0;
+      }
+      chunks.push_back(record);
     }
   }
 
@@ -448,28 +470,35 @@ inline void create_entry(const std::string &request) {
     file_replica_count = cid_counts.begin()->second;
   }
 
-  metadata_store::replace_file_chunks(file_name, file_hash, std::move(chunks), file_replica_count);
-  std::cout << "Created file entry: " << file_name << " (replicas=" << file_replica_count << ")\n";
+  metadata_store::replace_file_chunks(file_name, file_hash, std::move(chunks),
+                                      file_replica_count);
+  std::cout << "Created file entry: " << file_name
+            << " (replicas=" << file_replica_count << ")\n";
 }
 #endif
 
 #ifdef WITH_REDIS
 inline metadata_store::FileRecord query_metadata(const std::string &file_name) {
   metadata_store::FileRecord rec;
-  if (file_name.empty()) return rec;
+  if (file_name.empty())
+    return rec;
   try {
     const std::string key = file_key(file_name);
-    Redis &redis = get_redis();
+    sw::redis::Redis &redis = get_redis();
     std::unordered_map<std::string, std::string> all;
     redis.hgetall(key, std::inserter(all, all.end()));
-    if (all.empty()) return rec;
+    if (all.empty())
+      return rec;
     auto hash_it = all.find("file_hash");
     if (hash_it != all.end()) {
       rec.file_hash = hash_it->second;
     }
     auto rep_it = all.find("replica_count");
     if (rep_it != all.end()) {
-      try { rec.replica_count = std::stoi(rep_it->second); } catch (...) {}
+      try {
+        rec.replica_count = std::stoi(rep_it->second);
+      } catch (...) {
+      }
     }
 
     std::map<long long, int> per_chunk_rep;
@@ -478,7 +507,8 @@ inline metadata_store::FileRecord query_metadata(const std::string &file_name) {
         try {
           long long cid = std::stoll(kv.first.substr(15));
           per_chunk_rep[cid] = std::stoi(kv.second);
-        } catch (...) {}
+        } catch (...) {
+        }
       }
     }
 
@@ -488,8 +518,11 @@ inline metadata_store::FileRecord query_metadata(const std::string &file_name) {
         try {
           std::string rest = kv.first.substr(6);
           size_t colon = rest.find(':');
-          cr.chunk_id = std::stoll(colon == std::string::npos ? rest : rest.substr(0, colon));
-        } catch (...) { continue; }
+          cr.chunk_id = std::stoll(
+              colon == std::string::npos ? rest : rest.substr(0, colon));
+        } catch (...) {
+          continue;
+        }
         std::string v = kv.second;
         auto p1 = v.find('|');
         if (p1 != std::string::npos) {
@@ -500,10 +533,16 @@ inline metadata_store::FileRecord query_metadata(const std::string &file_name) {
             auto p3 = v.find('|', p2 + 1);
             if (p3 != std::string::npos) {
               cr.checksum = v.substr(p2 + 1, p3 - p2 - 1);
-              try { cr.replica_count = std::stoi(v.substr(p3 + 1)); } catch (...) { cr.replica_count = 1; }
+              try {
+                cr.replica_count = std::stoi(v.substr(p3 + 1));
+              } catch (...) {
+                cr.replica_count = 1;
+              }
             } else {
               cr.checksum = v.substr(p2 + 1);
-              cr.replica_count = per_chunk_rep[cr.chunk_id] > 0 ? per_chunk_rep[cr.chunk_id] : 1;
+              cr.replica_count = per_chunk_rep[cr.chunk_id] > 0
+                                     ? per_chunk_rep[cr.chunk_id]
+                                     : 1;
             }
           } else {
             cr.path = v.substr(p1 + 1);
@@ -519,9 +558,11 @@ inline metadata_store::FileRecord query_metadata(const std::string &file_name) {
 
     // Set consistent replica counts
     std::map<long long, int> actual_counts;
-    for (const auto &cr : rec.chunks) actual_counts[cr.chunk_id]++;
+    for (const auto &cr : rec.chunks)
+      actual_counts[cr.chunk_id]++;
     for (auto &cr : rec.chunks) {
-      if (cr.replica_count <= 0) cr.replica_count = actual_counts[cr.chunk_id];
+      if (cr.replica_count <= 0)
+        cr.replica_count = actual_counts[cr.chunk_id];
     }
     if (rec.replica_count <= 0 && !actual_counts.empty()) {
       rec.replica_count = actual_counts.begin()->second;
@@ -554,15 +595,16 @@ inline void read_entry(const std::string &request) {
 
   long long desired_chunk = -1;
   if (in >> desired_chunk) {
-    auto it = std::find_if(
-        record.chunks.begin(), record.chunks.end(),
-        [desired_chunk](const metadata_store::ChunkRecord &r) {
-          return r.chunk_id == desired_chunk;
-        });
+    auto it =
+        std::find_if(record.chunks.begin(), record.chunks.end(),
+                     [desired_chunk](const metadata_store::ChunkRecord &r) {
+                       return r.chunk_id == desired_chunk;
+                     });
     if (it != record.chunks.end()) {
       std::cout << "chunk:" << it->chunk_id << " server=" << it->server
                 << " path=" << it->path;
-      if (!it->checksum.empty()) std::cout << " checksum=" << it->checksum;
+      if (!it->checksum.empty())
+        std::cout << " checksum=" << it->checksum;
       std::cout << " replicas=" << it->replica_count << "\n";
     } else {
       std::cout << "Chunk not found\n";
@@ -581,44 +623,53 @@ inline void read_entry(const std::string &request) {
 }
 
 inline bool atomic_replace_server_chunks(
-    const std::string &dead_server,
-    const std::string &new_server,
-    const std::map<std::string, std::vector<metadata_store::ChunkRecord>> &file_chunks_to_update) {
+    const std::string &dead_server, const std::string &new_server,
+    const std::map<std::string, std::vector<metadata_store::ChunkRecord>>
+        &file_chunks_to_update) {
   try {
-    Redis &redis = get_redis();
+    sw::redis::Redis &redis = get_redis();
     auto pipe = redis.pipeline();
     for (const auto &[filename, new_chunks] : file_chunks_to_update) {
       std::string key = file_key(filename);
       for (const auto &chunk : new_chunks) {
-        std::string old_field = "chunk:" + std::to_string(chunk.chunk_id) + ":" + dead_server;
+        std::string old_field =
+            "chunk:" + std::to_string(chunk.chunk_id) + ":" + dead_server;
         pipe.hdel(key, old_field);
 
-        std::string target_srv = !chunk.server.empty() ? chunk.server : new_server;
-        std::string new_field = "chunk:" + std::to_string(chunk.chunk_id) + ":" + target_srv;
-        std::string val = encode_loc(target_srv, chunk.path) + "|" + chunk.checksum + "|" + std::to_string(chunk.replica_count);
+        std::string target_srv =
+            !chunk.server.empty() ? chunk.server : new_server;
+        std::string new_field =
+            "chunk:" + std::to_string(chunk.chunk_id) + ":" + target_srv;
+        std::string val = encode_loc(target_srv, chunk.path) + "|" +
+                          chunk.checksum + "|" +
+                          std::to_string(chunk.replica_count);
         pipe.hset(key, new_field, val);
 
-        pipe.hset(key, "chunk_replicas:" + std::to_string(chunk.chunk_id), std::to_string(chunk.replica_count));
+        pipe.hset(key, "chunk_replicas:" + std::to_string(chunk.chunk_id),
+                  std::to_string(chunk.replica_count));
       }
     }
     pipe.exec();
     return true;
   } catch (const std::exception &e) {
-    std::cerr << "atomic_replace_server_chunks error: " << e.what() << std::endl;
+    std::cerr << "atomic_replace_server_chunks error: " << e.what()
+              << std::endl;
     return false;
   }
 }
 
 inline void delete_server_metadata(const std::string &server_address) {
   try {
-    Redis &redis = get_redis();
+    sw::redis::Redis &redis = get_redis();
     auto all_files = list_all_files();
     auto pipe = redis.pipeline();
     for (const auto &filename : all_files) {
       auto rec = query_metadata(filename);
       for (const auto &chunk : rec.chunks) {
         if (chunk.server == server_address) {
-          pipe.hdel(file_key(filename), "chunk:" + std::to_string(chunk.chunk_id) + ":" + server_address);
+          pipe.hdel(file_key(filename),
+                    "chunk:" + std::to_string(chunk.chunk_id) + ":" +
+                        server_address);
         }
       }
     }
@@ -629,7 +680,8 @@ inline void delete_server_metadata(const std::string &server_address) {
 }
 #else
 inline metadata_store::FileRecord query_metadata(const std::string &file_name) {
-  if (file_name.empty()) return {};
+  if (file_name.empty())
+    return {};
   return metadata_store::get_chunks(file_name);
 }
 
@@ -649,17 +701,17 @@ inline void read_entry(const std::string &request) {
   }
 
   if (!record.file_hash.empty()) {
-      std::cout << "file_hash=" << record.file_hash << std::endl;
+    std::cout << "file_hash=" << record.file_hash << std::endl;
   }
   std::cout << "replica_count=" << record.replica_count << std::endl;
 
   long long desired_chunk = -1;
   if (in >> desired_chunk) {
-    auto it = std::find_if(
-        record.chunks.begin(), record.chunks.end(),
-        [desired_chunk](const metadata_store::ChunkRecord &r) {
-          return r.chunk_id == desired_chunk;
-        });
+    auto it =
+        std::find_if(record.chunks.begin(), record.chunks.end(),
+                     [desired_chunk](const metadata_store::ChunkRecord &r) {
+                       return r.chunk_id == desired_chunk;
+                     });
     if (it != record.chunks.end()) {
       std::cout << "chunk:" << it->chunk_id << " server=" << it->server
                 << " path=" << it->path << " checksum=" << it->checksum
@@ -674,7 +726,7 @@ inline void read_entry(const std::string &request) {
     std::cout << "chunk:" << r.chunk_id << " server=" << r.server
               << " path=" << r.path;
     if (!r.checksum.empty()) {
-        std::cout << " checksum=" << r.checksum;
+      std::cout << " checksum=" << r.checksum;
     }
     std::cout << " replicas=" << r.replica_count << std::endl;
   }
@@ -696,7 +748,7 @@ inline void delete_entry(const std::string &file_name) {
     }
 
     const std::string key = file_key(base);
-    Redis &redis = get_redis();
+    sw::redis::Redis &redis = get_redis();
 
     if (!field.empty()) {
       long long n = redis.hdel(key, field); // [1][15]
@@ -734,7 +786,7 @@ inline int create_replication(const std::string &ip_address) {
                    ? 6379
                    : std::stoi(ip_address.substr(pos + 1));
 
-    Redis &redis = get_redis();
+    sw::redis::Redis &redis = get_redis();
     redis.command("REPLICAOF", host,
                   std::to_string(port)); // server-side replication [19]
     return 0;
@@ -753,8 +805,7 @@ inline int create_replication(const std::string &ip_address) {
 
 #ifdef WITH_REDIS
 // Check if Redis is already running by trying to connect
-inline bool is_redis_running(const std::string &host = "",
-                             int port = 0) {
+inline bool is_redis_running(const std::string &host = "", int port = 0) {
   try {
     std::string h = host;
     int p = port;
@@ -766,7 +817,7 @@ inline bool is_redis_running(const std::string &host = "",
       const char *env_p = std::getenv("REDIS_PORT");
       p = (env_p && *env_p) ? std::stoi(env_p) : 6379;
     }
-    Redis redis("tcp://" + h + ":" + std::to_string(p));
+    sw::redis::Redis redis("tcp://" + h + ":" + std::to_string(p));
     redis.ping();
     return true;
   } catch (const std::exception &) {
@@ -807,20 +858,19 @@ inline int start_server() {
   // Detach stdio and route log to safe location
   for (int fd = 0; fd < 3; ++fd)
     close(fd);
-  open("/dev/null", O_RDONLY);                          // stdin
-  open("/tmp/dfg_redis_server.log", O_WRONLY | O_CREAT | O_APPEND, 0644); // stdout
-  open("/tmp/dfg_redis_server.log", O_WRONLY | O_CREAT | O_APPEND, 0644); // stderr
+  open("/dev/null", O_RDONLY); // stdin
+  open("/tmp/dfg_redis_server.log", O_WRONLY | O_CREAT | O_APPEND,
+       0644); // stdout
+  open("/tmp/dfg_redis_server.log", O_WRONLY | O_CREAT | O_APPEND,
+       0644); // stderr
 
   // Find redis-server executable in PATH or standard paths
-  const char *server_paths[] = {
-      "redis-server",
-      "/usr/bin/redis-server",
-      "/usr/local/bin/redis-server",
-      "/opt/homebrew/bin/redis-server"
-  };
+  const char *server_paths[] = {"redis-server", "/usr/bin/redis-server",
+                                "/usr/local/bin/redis-server",
+                                "/opt/homebrew/bin/redis-server"};
 
   for (const char *path : server_paths) {
-      execlp(path, "redis-server", (char *)nullptr);
+    execlp(path, "redis-server", (char *)nullptr);
   }
 
   // If all exec attempts fail
@@ -878,4 +928,4 @@ inline void start_daemon() {
   std::cout << "Head Server daemon is ready" << std::endl;
 }
 
-#endif // REDIS_HANDLER_HPP
+#endif // DFG_METADATA_STORE_HPP

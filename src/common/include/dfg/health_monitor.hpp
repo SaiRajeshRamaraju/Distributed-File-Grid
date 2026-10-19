@@ -1,9 +1,10 @@
 #pragma once
-// ─────────────────── Embedded Health Monitor ───────────────────
+// Embedded Health Monitor
 // Shared health monitoring component that can be embedded in both
 // Head Server and Cluster Server. Receives heartbeats, tracks server
 // health, and exposes the data for upstream reporting.
 
+#include <arpa/inet.h>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -11,14 +12,12 @@
 #include <iostream>
 #include <map>
 #include <mutex>
-#include <string>
-#include <thread>
-#include <vector>
-
-#include <arpa/inet.h>
 #include <netinet/in.h>
+#include <string>
 #include <sys/socket.h>
+#include <thread>
 #include <unistd.h>
+#include <vector>
 
 namespace dfg {
 
@@ -61,8 +60,7 @@ public:
       auto &record = servers_[server_id];
       bool was_unhealthy =
           !record.is_healthy &&
-          record.last_heartbeat !=
-              std::chrono::steady_clock::time_point{};
+          record.last_heartbeat != std::chrono::steady_clock::time_point{};
 
       record = health;
       record.is_healthy = true;

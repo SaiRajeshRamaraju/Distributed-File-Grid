@@ -1,39 +1,4 @@
-# src/cli/CMakeLists.txt — Server-side dfg binary
-
-add_executable(dfg
-    dfg_cli.cpp
-    ${CMAKE_SOURCE_DIR}/src/head_server/head_server.cpp
-    ${CMAKE_SOURCE_DIR}/src/head_server/file_upload.cpp
-    ${CMAKE_SOURCE_DIR}/src/cluster_server/cluster_server.cpp
-    ${CMAKE_SOURCE_DIR}/src/cluster_server/chunk_service.cpp
-    ${CMAKE_SOURCE_DIR}/src/cluster_server/metrics_exporter.cpp
-    ${CMAKE_SOURCE_DIR}/src/health_checker/health_checker.cpp
-    ${CMAKE_SOURCE_DIR}/src/zk_monitor/zk_monitor.cpp
-    ${CMAKE_SOURCE_DIR}/src/common/src/zookeeper_client.cpp
-)
-
-target_compile_definitions(dfg PRIVATE DFG_UNIFIED_BINARY)
-
-target_include_directories(dfg PRIVATE
-    ${CMAKE_SOURCE_DIR}/src/head_server
-    ${CMAKE_SOURCE_DIR}/src/cluster_server
-    ${CMAKE_SOURCE_DIR}/src/health_checker
-    ${CMAKE_SOURCE_DIR}/src/zk_monitor
-)
-
+add_executable(dfg src/main.cpp)
 target_link_libraries(dfg PRIVATE
-    dfg_common
-    dfg_proto
-    Threads::Threads
-    ${ABSEIL_LIBS}
-    ${PROMETHEUS_LIBS}
-    ${ZLIB_LIBRARIES}
+    dfg_head_server dfg_cluster_server dfg_health_checker dfg_zk_monitor
 )
-
-target_compile_options(dfg PRIVATE -fcoroutines)
-
-if(WITH_REDIS)
-    target_include_directories(dfg PRIVATE ${REDIS_PLUS_PLUS_INCLUDE_DIRS})
-    target_compile_options(dfg PRIVATE ${REDIS_PLUS_PLUS_CFLAGS_OTHER})
-    target_link_libraries(dfg PRIVATE redis++::redis++)
-endif()

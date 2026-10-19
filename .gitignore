@@ -23,3 +23,7 @@ Thumbs.db
 
 # Dependencies fetched at build time
 _deps/
+
+# Python helper scripts
+__pycache__/
+*.py[cod]

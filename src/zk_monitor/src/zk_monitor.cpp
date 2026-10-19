@@ -4,6 +4,7 @@
 #include <cstring>
 #include <dfg/config_loader.hpp>
 #include <dfg/version.hpp>
+#include <dfg/zk_monitor/service.hpp>
 #include <dfg/zookeeper_client.hpp>
 #include <fcntl.h>
 #include <fstream>
@@ -774,93 +775,106 @@ public:
     addr.sin_family = AF_INET;
     addr.sin_port = htons(9680);
     addr.sin_addr.s_addr = INADDR_ANY;
-    if (bind(lfd, (sockaddr*)&addr, sizeof(addr)) < 0) {
-        std::cerr << "Failed to bind master API server on port 9680" << std::endl;
-        close(lfd);
-        return;
+    if (bind(lfd, (sockaddr *)&addr, sizeof(addr)) < 0) {
+      std::cerr << "Failed to bind master API server on port 9680" << std::endl;
+      close(lfd);
+      return;
     }
     listen(lfd, 10);
     std::cout << "Master Plane API listening on port 9680" << std::endl;
-    
+
     while (running) {
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(lfd, &fds);
-        timeval tv{1, 0};
-        if (select(lfd + 1, &fds, nullptr, nullptr, &tv) > 0) {
-            int cfd = accept(lfd, nullptr, nullptr);
-            if (cfd < 0) continue;
-            
-            char buf[4096] = {0};
-            recv(cfd, buf, sizeof(buf)-1, 0);
-            std::string req(buf);
-            std::istringstream iss(req);
-            std::string method, path;
-            iss >> method >> path;
-            
-            std::string response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n";
-            if (path == "/api/v1/master/head_servers") {
-                std::lock_guard<std::mutex> lock(servers_mutex);
-                std::string json = "{\"head_servers\":[";
-                bool first = true;
-                for (const auto& [id, info] : head_servers) {
-                    if (!first) json += ",";
-                    first = false;
-                    json += "{\"id\":\"" + id + "\",\"ip\":\"" + info.ip_address + "\",\"port\":" + std::to_string(info.port) + ",\"status\":\"" + info.status + "\",\"is_leader\":" + (info.is_leader ? "true" : "false") + "}";
+      fd_set fds;
+      FD_ZERO(&fds);
+      FD_SET(lfd, &fds);
+      timeval tv{1, 0};
+      if (select(lfd + 1, &fds, nullptr, nullptr, &tv) > 0) {
+        int cfd = accept(lfd, nullptr, nullptr);
+        if (cfd < 0)
+          continue;
+
+        char buf[4096] = {0};
+        recv(cfd, buf, sizeof(buf) - 1, 0);
+        std::string req(buf);
+        std::istringstream iss(req);
+        std::string method, path;
+        iss >> method >> path;
+
+        std::string response = "HTTP/1.1 200 OK\r\nContent-Type: "
+                               "application/json\r\nConnection: close\r\n\r\n";
+        if (path == "/api/v1/master/head_servers") {
+          std::lock_guard<std::mutex> lock(servers_mutex);
+          std::string json = "{\"head_servers\":[";
+          bool first = true;
+          for (const auto &[id, info] : head_servers) {
+            if (!first)
+              json += ",";
+            first = false;
+            json += "{\"id\":\"" + id + "\",\"ip\":\"" + info.ip_address +
+                    "\",\"port\":" + std::to_string(info.port) +
+                    ",\"status\":\"" + info.status +
+                    "\",\"is_leader\":" + (info.is_leader ? "true" : "false") +
+                    "}";
+          }
+          json += "]}";
+          response += json;
+        } else if (path.find("/api/v1/master/znode") == 0) {
+          std::string query = "";
+          auto qpos = path.find('?');
+          if (qpos != std::string::npos) {
+            query = path.substr(qpos + 1);
+            path = path.substr(0, qpos);
+          }
+          std::string zpath = "";
+          if (query.find("path=") == 0) {
+            zpath = query.substr(5);
+          }
+          if (zpath.empty()) {
+            response = "HTTP/1.1 400 Bad Request\r\n\r\n{\"error\":\"Missing "
+                       "path parameter\"}";
+          } else {
+            if (method == "GET") {
+              std::string data = zk_client->get_node_data(zpath);
+              response +=
+                  "{\"path\":\"" + zpath + "\",\"data\":\"" + data + "\"}";
+            } else if (method == "DELETE") {
+              bool success = zk_client->delete_node(zpath);
+              response +=
+                  "{\"success\":" + std::string(success ? "true" : "false") +
+                  "}";
+            } else if (method == "POST") {
+              // Very simple JSON parse for {"data":"..."}
+              std::string body;
+              auto body_start = req.find("\r\n\r\n");
+              if (body_start != std::string::npos) {
+                body = req.substr(body_start + 4);
+              }
+              std::string zdata = "";
+              auto data_pos = body.find("\"data\":\"");
+              if (data_pos != std::string::npos) {
+                auto end_pos = body.find("\"", data_pos + 8);
+                if (end_pos != std::string::npos) {
+                  zdata = body.substr(data_pos + 8, end_pos - (data_pos + 8));
                 }
-                json += "]}";
-                response += json;
-            } else if (path.find("/api/v1/master/znode") == 0) {
-                std::string query = "";
-                auto qpos = path.find('?');
-                if (qpos != std::string::npos) {
-                    query = path.substr(qpos + 1);
-                    path = path.substr(0, qpos);
-                }
-                std::string zpath = "";
-                if (query.find("path=") == 0) {
-                    zpath = query.substr(5);
-                }
-                if (zpath.empty()) {
-                    response = "HTTP/1.1 400 Bad Request\r\n\r\n{\"error\":\"Missing path parameter\"}";
-                } else {
-                    if (method == "GET") {
-                        std::string data = zk_client->get_node_data(zpath);
-                        response += "{\"path\":\"" + zpath + "\",\"data\":\"" + data + "\"}";
-                    } else if (method == "DELETE") {
-                        bool success = zk_client->delete_node(zpath);
-                        response += "{\"success\":" + std::string(success ? "true" : "false") + "}";
-                    } else if (method == "POST") {
-                        // Very simple JSON parse for {"data":"..."}
-                        std::string body;
-                        auto body_start = req.find("\r\n\r\n");
-                        if (body_start != std::string::npos) {
-                            body = req.substr(body_start + 4);
-                        }
-                        std::string zdata = "";
-                        auto data_pos = body.find("\"data\":\"");
-                        if (data_pos != std::string::npos) {
-                            auto end_pos = body.find("\"", data_pos + 8);
-                            if (end_pos != std::string::npos) {
-                                zdata = body.substr(data_pos + 8, end_pos - (data_pos + 8));
-                            }
-                        }
-                        bool success = false;
-                        if (zk_client->node_exists(zpath)) {
-                            success = zk_client->update_node(zpath, zdata);
-                        } else {
-                            success = zk_client->create_node(zpath, zdata, false);
-                        }
-                        response += "{\"success\":" + std::string(success ? "true" : "false") + "}";
-                    }
-                }
-            } else {
-                response = "HTTP/1.1 404 Not Found\r\n\r\n{\"error\":\"Not Found\"}";
+              }
+              bool success = false;
+              if (zk_client->node_exists(zpath)) {
+                success = zk_client->update_node(zpath, zdata);
+              } else {
+                success = zk_client->create_node(zpath, zdata, false);
+              }
+              response +=
+                  "{\"success\":" + std::string(success ? "true" : "false") +
+                  "}";
             }
-            
-            send(cfd, response.c_str(), response.size(), 0);
-            close(cfd);
+          }
+        } else {
+          response = "HTTP/1.1 404 Not Found\r\n\r\n{\"error\":\"Not Found\"}";
         }
+
+        send(cfd, response.c_str(), response.size(), 0);
+        close(cfd);
+      }
     }
     close(lfd);
   }
@@ -877,7 +891,8 @@ public:
     std::thread monitor_thread(&ZooKeeperHeadServerMonitor::monitor_loop, this);
     monitor_thread.detach();
 
-    master_api_thread = std::thread(&ZooKeeperHeadServerMonitor::master_api_server, this);
+    master_api_thread =
+        std::thread(&ZooKeeperHeadServerMonitor::master_api_server, this);
 
     std::cout << "ZooKeeper Head Server Monitor started with ID: " << monitor_id
               << std::endl;
@@ -887,7 +902,7 @@ public:
     running = false;
     std::cout << "Stopping ZooKeeper Head Server Monitor..." << std::endl;
     if (master_api_thread.joinable()) {
-        master_api_thread.join();
+      master_api_thread.join();
     }
   }
 
@@ -1019,14 +1034,18 @@ int run_zk_monitor(int argc, char *argv[]) {
       zk_hosts = argv[++i];
     } else if (arg == "-i" || arg == "--interactive") {
       interactive = true;
-    } else if (arg == "--help") {
+    } else if (arg == "-v" || arg == "--version") {
+      std::cout << "ZooKeeper Monitor version: " << APP_VERSION << std::endl;
+      return 0;
+    } else if (arg == "-h" || arg == "--help") {
       std::cout << "Usage: " << argv[0]
                 << " [--zk-hosts HOST:PORT] [--interactive]\n"
                 << "Options:\n"
                 << "  --zk-hosts HOST:PORT  ZooKeeper connection string "
                    "(default: localhost:2181)\n"
                 << "  -i, --interactive     Run in interactive mode\n"
-                << "  --help                Show this help message\n";
+                << "  -h, --help            Show this help message\n"
+                << "  -v, --version         Show version\n";
       return 0;
     }
   }
@@ -1087,9 +1106,3 @@ int run_zk_monitor(int argc, char *argv[]) {
 
   return 0;
 }
-
-#ifndef DFG_UNIFIED_BINARY
-int main(int argc, char *argv[]) {
-  return run_zk_monitor(argc, argv);
-}
-#endif

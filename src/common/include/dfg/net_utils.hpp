@@ -1,19 +1,16 @@
 #pragma once
-// ─────────────────── Network Utilities ───────────────────
+// Network Utilities
 // Non-blocking socket helpers shared across upload/download paths.
-// Extracted from asyc_file_recv_to_chunks.cpp and chunck_read_to_file.cpp
-// to eliminate code duplication.
 
+#include <arpa/inet.h>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
-#include <string>
-
-#include <arpa/inet.h>
 #include <cstring>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <string>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -30,6 +27,8 @@ inline bool send_all(int sock, const void *buf, size_t len) {
     ssize_t n = ::send(sock, p + sent, len - sent, MSG_NOSIGNAL);
     if (n > 0) {
       sent += static_cast<size_t>(n);
+    } else if (n < 0 && errno == EINTR) {
+      continue;
     } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
       fd_set wfds;
       FD_ZERO(&wfds);
@@ -56,6 +55,8 @@ inline bool recv_all(int sock, void *buf, size_t len) {
       got += static_cast<size_t>(n);
     } else if (n == 0) {
       return false;
+    } else if (errno == EINTR) {
+      continue;
     } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
       fd_set rfds;
       FD_ZERO(&rfds);
@@ -69,6 +70,24 @@ inline bool recv_all(int sock, void *buf, size_t len) {
     }
   }
   return true;
+}
+
+/// Read a newline-terminated command without consuming subsequent payload
+/// bytes. Reject disconnected peers, incomplete lines, and oversized commands.
+inline bool recv_line(int sock, std::string &line, size_t max_length = 4096) {
+  line.clear();
+  while (line.size() < max_length) {
+    char byte;
+    if (!recv_all(sock, &byte, 1))
+      return false;
+    if (byte == '\n') {
+      if (!line.empty() && line.back() == '\r')
+        line.pop_back();
+      return true;
+    }
+    line += byte;
+  }
+  return false;
 }
 
 /// Non-blocking connect with timeout (seconds).
@@ -88,7 +107,8 @@ inline int connect_with_timeout(const std::string &ip, int port,
       ::close(sock);
       return -1;
     }
-    std::memcpy(&serv_addr.sin_addr, he->h_addr_list[0], sizeof(struct in_addr));
+    std::memcpy(&serv_addr.sin_addr, he->h_addr_list[0],
+                sizeof(struct in_addr));
   }
 
   int rc = ::connect(sock, reinterpret_cast<sockaddr *>(&serv_addr),
@@ -106,7 +126,8 @@ inline int connect_with_timeout(const std::string &ip, int port,
       }
       int err = 0;
       socklen_t len = sizeof(err);
-      if (::getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
+      if (::getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len) < 0 ||
+          err != 0) {
         ::close(sock);
         return -1;
       }

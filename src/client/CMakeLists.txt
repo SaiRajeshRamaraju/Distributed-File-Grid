@@ -1,8 +1,3 @@
-cmake_minimum_required(VERSION 3.14)
-project(DFGProject LANGUAGES CXX)
-
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
 include(FetchContent)
 
 find_package(argparse QUIET)
@@ -19,14 +14,12 @@ if(NOT argparse_FOUND)
     FetchContent_MakeAvailable(argparse)
 endif()
 
-add_executable(client client.cpp)
+add_library(dfg_client_lib STATIC src/client.cpp src/diagnostics.cpp)
+target_include_directories(dfg_client_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(dfg_client_lib PUBLIC dfg_common)
 
-target_link_libraries(client
-    PRIVATE
-    dfg_common
-    pthread
-    argparse
-)
+add_executable(client src/main.cpp)
+target_link_libraries(client PRIVATE dfg_client_lib argparse)
 
 # Provide dfg_client as a symlink to client for backward compatibility
 add_custom_command(TARGET client POST_BUILD

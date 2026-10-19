@@ -1,5 +1,9 @@
+#include "chunk_service.hpp"
+
+#include "file_transfer.pb.h"
 #include "metrics_exporter.hpp"
-#include "dfg/sha256.hpp"
+
+#include <arpa/inet.h>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -7,7 +11,9 @@
 #include <dfg/async_net.hpp>
 #include <dfg/config_loader.hpp>
 #include <dfg/net_utils.hpp>
+#include <dfg/sha256.hpp>
 #include <dfg/system_info.hpp>
+#include <dfg/thread_pool.hpp>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
@@ -15,72 +21,63 @@
 #include <future>
 #include <iostream>
 #include <mutex>
+#include <netinet/in.h>
 #include <queue>
 #include <sstream>
 #include <string>
+#include <sys/socket.h>
 #include <sys/uio.h>
 #include <thread>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
-#include "file_transfer.pb.h"
-#include <arpa/inet.h>
-#include <chrono>
-#include <dfg/thread_pool.hpp>
-
-// ─────────────────── Awaiter: bridge future → coroutine ───────────────────
+// Awaiter: bridge future → coroutine
 // Suspends the coroutine, polls the future on reactor ticks via a timerfd,
 // and resumes once the result is ready.
 template <typename T>
-static async_hb::task poll_future_awaiter(async_hb::Reactor* rx,
+static async_hb::task poll_future_awaiter(async_hb::Reactor *rx,
                                           std::shared_future<T> f,
                                           std::coroutine_handle<> target_h) {
-    while (f.wait_for(std::chrono::microseconds(0)) != std::future_status::ready) {
-        co_await rx->sleep_for(std::chrono::milliseconds(1));
-    }
-    if (target_h && !target_h.done()) {
-        target_h.resume();
-    }
-    co_return;
+  while (f.wait_for(std::chrono::microseconds(0)) !=
+         std::future_status::ready) {
+    co_await rx->sleep_for(std::chrono::milliseconds(1));
+  }
+  if (target_h && !target_h.done()) {
+    target_h.resume();
+  }
+  co_return;
 }
 
-template <typename T>
-struct FutureAwaiter {
-    std::shared_future<T> fut;
-    async_hb::Reactor* reactor;
+template <typename T> struct FutureAwaiter {
+  std::shared_future<T> fut;
+  async_hb::Reactor *reactor;
 
-    bool await_ready() const noexcept {
-        return fut.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
-    }
+  bool await_ready() const noexcept {
+    return fut.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+  }
 
-    void await_suspend(std::coroutine_handle<> h) {
-        reactor->spawn(poll_future_awaiter(reactor, fut, h));
-    }
+  void await_suspend(std::coroutine_handle<> h) {
+    reactor->spawn(poll_future_awaiter(reactor, fut, h));
+  }
 
-    T await_resume() {
-        return fut.get();
-    }
+  T await_resume() { return fut.get(); }
 };
 
 template <typename T>
-FutureAwaiter<T> await_future(async_hb::Reactor& r, std::future<T> f) {
-    return FutureAwaiter<T>{f.share(), &r};
+FutureAwaiter<T> await_future(async_hb::Reactor &r, std::future<T> f) {
+  return FutureAwaiter<T>{f.share(), &r};
 }
 
 // Global I/O thread pool (shared by all storage operations)
-inline dfg::ThreadPool& io_pool() {
-    static dfg::ThreadPool pool(4);
-    return pool;
+inline dfg::ThreadPool &io_pool() {
+  static dfg::ThreadPool pool(4);
+  return pool;
 }
 
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
 namespace fs = std::filesystem;
 
-inline std::atomic<bool> g_is_dead_process(false);
-
-// ──────────────────────── Chunk Storage ────────────────────────
+// Chunk Storage
 class ChunkStorage {
 private:
   std::string storage_path = "/var/cluster_storage/";
@@ -117,8 +114,10 @@ private:
 
 public:
   ChunkStorage() {
-    // Honor the configured directory so separate nodes can use isolated storage.
-    storage_path = cluster_server_config().get_string("storage.chunk_dir", storage_path);
+    // Honor the configured directory so separate nodes can use isolated
+    // storage.
+    storage_path =
+        cluster_server_config().get_string("storage.chunk_dir", storage_path);
     if (!storage_path.empty() && storage_path.back() != '/') {
       storage_path += '/';
     }
@@ -128,14 +127,14 @@ public:
     }
   }
 
-  // ── Async store: offload to I/O thread pool ──
-  std::future<std::pair<bool, std::string>> async_store_chunk(const std::string &chunk_id,
-                                                              std::vector<char> data) {
+  // Async store: offload to I/O thread pool
+  std::future<std::pair<bool, std::string>>
+  async_store_chunk(const std::string &chunk_id, std::vector<char> data) {
     // Capture by value so the data lives in the pool thread.
     auto path = generate_chunk_path(chunk_id);
     auto *self = this;
-    return io_pool().submit([self, chunk_id, path,
-                             data = std::move(data)]() -> std::pair<bool, std::string> {
+    return io_pool().submit([self, chunk_id, path, data = std::move(data)]()
+                                -> std::pair<bool, std::string> {
       int fd =
           ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
       if (fd < 0) {
@@ -170,9 +169,10 @@ public:
     });
   }
 
-  // ── Async retrieve: offload to I/O thread pool ──
+  // Async retrieve: offload to I/O thread pool
   std::future<std::vector<char>>
-  async_retrieve_chunk(const std::string &chunk_id, const std::string &fallback_path = "") {
+  async_retrieve_chunk(const std::string &chunk_id,
+                       const std::string &fallback_path = "") {
     std::string chunk_path;
     {
       std::lock_guard<std::mutex> lock(registry_mutex);
@@ -384,9 +384,9 @@ private:
   std::atomic<int> active_connections{0};
 
   struct ConnectionTracker {
-      std::atomic<int>& counter;
-      ConnectionTracker(std::atomic<int>& c) : counter(c) { counter++; }
-      ~ConnectionTracker() { counter--; }
+    std::atomic<int> &counter;
+    ConnectionTracker(std::atomic<int> &c) : counter(c) { counter++; }
+    ~ConnectionTracker() { counter--; }
   };
 
   async_hb::task handle_connection(async_hb::Reactor &r, int cfd) {
@@ -397,9 +397,12 @@ private:
 
       // Check for raw emergency DEAD command: "DEAD" or "KILL"
       if (memcmp(first4, "DEAD", 4) == 0 || memcmp(first4, "KILL", 4) == 0) {
-        std::cout << "\n[Emergency Protocol] Received DEAD signal via TCP! Status set to DEAD. Returning OK and terminating..." << std::endl;
+        std::cout << "\n[Emergency Protocol] Received DEAD signal via TCP! "
+                     "Status set to DEAD. Returning OK and terminating..."
+                  << std::endl;
         const char *ok_resp = "OK\n";
-        co_await async_hb::async_send_all(r, cfd, reinterpret_cast<const uint8_t *>(ok_resp), 3);
+        co_await async_hb::async_send_all(
+            r, cfd, reinterpret_cast<const uint8_t *>(ok_resp), 3);
         ::close(cfd);
         g_is_dead_process = true;
         std::thread([]() {
@@ -416,9 +419,12 @@ private:
       uint32_t len = ntohl(*reinterpret_cast<uint32_t *>(len_bytes));
 
       if (type == 99) { // Framed DEAD emergency command
-        std::cout << "\n[Emergency Protocol] Received framed DEAD (type 99) via TCP! Terminating..." << std::endl;
+        std::cout << "\n[Emergency Protocol] Received framed DEAD (type 99) "
+                     "via TCP! Terminating..."
+                  << std::endl;
         const char *ok_resp = "OK\n";
-        co_await async_hb::async_send_all(r, cfd, reinterpret_cast<const uint8_t *>(ok_resp), 3);
+        co_await async_hb::async_send_all(
+            r, cfd, reinterpret_cast<const uint8_t *>(ok_resp), 3);
         ::close(cfd);
         g_is_dead_process = true;
         std::thread([]() {
@@ -474,8 +480,10 @@ private:
         if (!req.ParseFromArray(buf.data(), len))
           throw std::runtime_error("Parse fetch error");
 
-        // Offload disk read to I/O thread pool (passing fallback file_path if available)
-        auto fut = storage.async_retrieve_chunk(req.chunk_id(), req.file_path());
+        // Offload disk read to I/O thread pool (passing fallback file_path if
+        // available)
+        auto fut =
+            storage.async_retrieve_chunk(req.chunk_id(), req.file_path());
         std::vector<char> data = co_await await_future(r, std::move(fut));
         bool ok = !data.empty();
 
@@ -502,8 +510,10 @@ private:
         if (!req.ParseFromArray(buf.data(), len))
           throw std::runtime_error("Parse fetch hash error");
 
-        // Offload disk read to I/O thread pool (passing fallback file_path if available)
-        auto fut = storage.async_retrieve_chunk(req.chunk_id(), req.file_path());
+        // Offload disk read to I/O thread pool (passing fallback file_path if
+        // available)
+        auto fut =
+            storage.async_retrieve_chunk(req.chunk_id(), req.file_path());
         std::vector<char> data = co_await await_future(r, std::move(fut));
         bool ok = !data.empty();
 
@@ -529,7 +539,8 @@ private:
         co_await async_hb::async_send_all(
             r, cfd, reinterpret_cast<const uint8_t *>(serialized.data()),
             serialized.size());
-      } else if (type == 4) { // ReplicateChunkRequest — cluster-to-cluster replication
+      } else if (type ==
+                 4) { // ReplicateChunkRequest — cluster-to-cluster replication
         file_transfer::v1::ReplicateChunkRequest req;
         if (!req.ParseFromArray(buf.data(), len))
           throw std::runtime_error("Parse replicate chunk error");
@@ -543,11 +554,14 @@ private:
           resp.set_error_message("Chunk not found locally to replicate");
         } else {
           int target_transfer_port = req.target_transfer_port();
-          if(target_transfer_port == 0) target_transfer_port = 8180;
-          int target_sock = dfg::net::connect_with_timeout(req.target_server_ip(), target_transfer_port, 5);
+          if (target_transfer_port == 0)
+            target_transfer_port = 8180;
+          int target_sock = dfg::net::connect_with_timeout(
+              req.target_server_ip(), target_transfer_port, 5);
           if (target_sock < 0) {
             resp.set_success(false);
-            resp.set_error_message("Failed to connect to target cluster server");
+            resp.set_error_message(
+                "Failed to connect to target cluster server");
           } else {
             file_transfer::v1::ChunkData cmsg;
             cmsg.set_chunk_id(req.chunk_id());
@@ -561,7 +575,8 @@ private:
 
             dfg::net::send_all(target_sock, &ctype, sizeof(ctype));
             dfg::net::send_all(target_sock, &clen, sizeof(clen));
-            dfg::net::send_all(target_sock, serialized_cmsg.data(), serialized_cmsg.size());
+            dfg::net::send_all(target_sock, serialized_cmsg.data(),
+                               serialized_cmsg.size());
 
             uint32_t rlen_net;
             if (dfg::net::recv_all(target_sock, &rlen_net, sizeof(rlen_net))) {
@@ -569,12 +584,14 @@ private:
               std::vector<char> rbuf(rlen);
               if (dfg::net::recv_all(target_sock, rbuf.data(), rlen)) {
                 file_transfer::v1::ChunkResponse c_resp;
-                if (c_resp.ParseFromArray(rbuf.data(), rlen) && c_resp.success()) {
+                if (c_resp.ParseFromArray(rbuf.data(), rlen) &&
+                    c_resp.success()) {
                   resp.set_success(true);
                   resp.set_file_path(c_resp.file_path());
                 } else {
                   resp.set_success(false);
-                  resp.set_error_message("Target server rejected chunk: " + c_resp.error_message());
+                  resp.set_error_message("Target server rejected chunk: " +
+                                         c_resp.error_message());
                 }
               }
             }
@@ -584,8 +601,11 @@ private:
         std::string serialized;
         resp.SerializeToString(&serialized);
         uint32_t resp_len = htonl(serialized.size());
-        co_await async_hb::async_send_all(r, cfd, reinterpret_cast<const uint8_t *>(&resp_len), 4);
-        co_await async_hb::async_send_all(r, cfd, reinterpret_cast<const uint8_t *>(serialized.data()), serialized.size());
+        co_await async_hb::async_send_all(
+            r, cfd, reinterpret_cast<const uint8_t *>(&resp_len), 4);
+        co_await async_hb::async_send_all(
+            r, cfd, reinterpret_cast<const uint8_t *>(serialized.data()),
+            serialized.size());
       } else {
         std::cerr << "Unknown message type: " << type << std::endl;
       }
@@ -597,7 +617,7 @@ private:
   }
 
   async_hb::task chunk_server(async_hb::Reactor &reactor) {
-    
+
     int lfd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (lfd < 0) {
       std::cerr << "Listen socket failed\n";
@@ -675,7 +695,8 @@ private:
 
   async_hb::task emergency_listener(async_hb::Reactor &reactor) {
     int lfd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (lfd < 0) co_return;
+    if (lfd < 0)
+      co_return;
     int yes = 1;
     setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
     sockaddr_in addr{};
@@ -692,7 +713,8 @@ private:
       co_return;
     }
 
-    std::cout << "Emergency DEAD protocol listener active on TCP port " << port << std::endl;
+    std::cout << "Emergency DEAD protocol listener active on TCP port " << port
+              << std::endl;
 
     while (running && !g_is_dead_process) {
       sockaddr_in peer{};
@@ -712,9 +734,12 @@ private:
 
       if (n > 0) {
         std::string msg(buf, n);
-        if (msg.find("DEAD") != std::string::npos || msg.find("KILL") != std::string::npos) {
-          std::cout << "\n[Emergency Protocol] Received DEAD signal on port " << port
-                    << "! Status set to DEAD. Returning OK and terminating..." << std::endl;
+        if (msg.find("DEAD") != std::string::npos ||
+            msg.find("KILL") != std::string::npos) {
+          std::cout << "\n[Emergency Protocol] Received DEAD signal on port "
+                    << port
+                    << "! Status set to DEAD. Returning OK and terminating..."
+                    << std::endl;
           ::send(cfd, "OK\n", 3, 0);
           ::close(cfd);
           g_is_dead_process = true;
@@ -724,29 +749,31 @@ private:
           }).detach();
           break;
         } else if (msg.find("RESTART") != std::string::npos) {
-          std::cout << "\n[Emergency Protocol] Received RESTART signal on port " << port
-                    << "! Restarting..." << std::endl;
+          std::cout << "\n[Emergency Protocol] Received RESTART signal on port "
+                    << port << "! Restarting..." << std::endl;
           ::send(cfd, "OK\n", 3, 0);
           ::close(cfd);
-          
-          std::vector<char*> args;
+
+          std::vector<char *> args;
           std::string cmdline;
           {
-              std::ifstream f("/proc/self/cmdline");
-              if(f) {
-                  std::ostringstream ss;
-                  ss << f.rdbuf();
-                  cmdline = ss.str();
-              }
+            std::ifstream f("/proc/self/cmdline");
+            if (f) {
+              std::ostringstream ss;
+              ss << f.rdbuf();
+              cmdline = ss.str();
+            }
           }
           std::vector<std::string> args_str;
           size_t pos = 0;
-          while(pos < cmdline.size()) {
-              std::string arg = cmdline.c_str() + pos;
-              if(!arg.empty()) args_str.push_back(arg);
-              pos += arg.size() + 1;
+          while (pos < cmdline.size()) {
+            std::string arg = cmdline.c_str() + pos;
+            if (!arg.empty())
+              args_str.push_back(arg);
+            pos += arg.size() + 1;
           }
-          for(auto& s : args_str) args.push_back(&s[0]);
+          for (auto &s : args_str)
+            args.push_back(&s[0]);
           args.push_back(nullptr);
 
           execv("/proc/self/exe", args.data());
@@ -755,12 +782,13 @@ private:
           std::stringstream ss(msg.substr(13));
           std::string chunk_id;
           ss >> chunk_id;
-          std::cout << "[Emergency Protocol] Deleting chunk " << chunk_id << std::endl;
+          std::cout << "[Emergency Protocol] Deleting chunk " << chunk_id
+                    << std::endl;
           bool success = delete_chunk(chunk_id);
           if (success) {
-              ::send(cfd, "SUCCESS\n", 8, 0);
+            ::send(cfd, "SUCCESS\n", 8, 0);
           } else {
-              ::send(cfd, "ERROR\n", 6, 0);
+            ::send(cfd, "ERROR\n", 6, 0);
           }
         }
       }
@@ -769,7 +797,6 @@ private:
     }
     ::close(lfd);
   }
-
 
   async_hb::task handle_public_connection(async_hb::Reactor &r, int cfd) {
     ConnectionTracker tracker(active_connections);
@@ -780,29 +807,37 @@ private:
       while (req.size() < 255) {
         uint8_t byte;
         co_await async_hb::async_read_exact(r, cfd, &byte, 1);
-        if (byte == '\n') break;
+        if (byte == '\n')
+          break;
         req += static_cast<char>(byte);
       }
       if (!req.empty()) {
-        
+
         if (req.rfind("GET_CHUNK ", 0) == 0) {
           std::stringstream ss(req.substr(10));
           std::string chunk_id, file_name;
           ss >> chunk_id >> file_name;
-          
+
           std::string unique_chunk_id = file_name + "_chunk_" + chunk_id;
 
           auto fut = storage.async_retrieve_chunk(unique_chunk_id);
 
           std::vector<char> data = co_await await_future(r, std::move(fut));
-          
+
           if (!data.empty()) {
-            std::string header = "CHUNK_SIZE " + std::to_string(data.size()) + "\n";
-            co_await async_hb::async_send_all(r, cfd, reinterpret_cast<const uint8_t*>(header.data()), header.size());
-            co_await async_hb::async_send_all(r, cfd, reinterpret_cast<const uint8_t*>(data.data()), data.size());
+            std::string header =
+                "CHUNK_SIZE " + std::to_string(data.size()) + "\n";
+            co_await async_hb::async_send_all(
+                r, cfd, reinterpret_cast<const uint8_t *>(header.data()),
+                header.size());
+            co_await async_hb::async_send_all(
+                r, cfd, reinterpret_cast<const uint8_t *>(data.data()),
+                data.size());
           } else {
             std::string err = "ERROR: Chunk not found\n";
-            co_await async_hb::async_send_all(r, cfd, reinterpret_cast<const uint8_t*>(err.data()), err.size());
+            co_await async_hb::async_send_all(
+                r, cfd, reinterpret_cast<const uint8_t *>(err.data()),
+                err.size());
           }
         }
       }
@@ -842,7 +877,8 @@ private:
       co_return;
     }
 
-    std::cout << "Public chunk server started on port " << public_port << std::endl;
+    std::cout << "Public chunk server started on port " << public_port
+              << std::endl;
 
     while (running) {
       int cfd = -1;
@@ -917,10 +953,11 @@ public:
 // Global cluster server instance
 static std::unique_ptr<ClusterServerService> g_cluster_server;
 
-int start_cluster_server(int server_id, const char *ip, int port, int transfer_port, int public_port) {
+int start_cluster_server(int server_id, const char *ip, int port,
+                         int transfer_port, int public_port) {
   try {
-    g_cluster_server =
-        std::make_unique<ClusterServerService>(server_id, ip, port, transfer_port, public_port);
+    g_cluster_server = std::make_unique<ClusterServerService>(
+        server_id, ip, port, transfer_port, public_port);
     g_cluster_server->start();
     return 0;
   } catch (const std::exception &e) {

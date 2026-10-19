@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-// ─────────────────── Minimal JSON Config Loader ───────────────────
+// Minimal JSON Config Loader
 // Parses the flat key=value pairs from our JSON config files without
 // pulling in a full JSON library.  Supports nested objects via dotted
 // key paths, e.g. "server.port" → "9669".
@@ -75,16 +75,20 @@ public:
     // 3. Known aliases used across deployment configs
     if (key == "zookeeper.hosts") {
       const char *v = std::getenv("ZK_HOSTS");
-      if (v && *v) return std::string(v);
+      if (v && *v)
+        return std::string(v);
     } else if (key == "head_server.control_port") {
       const char *v = std::getenv("CONTROL_PORT");
-      if (v && *v) return std::string(v);
+      if (v && *v)
+        return std::string(v);
     } else if (key == "heartbeat.target_host") {
       const char *v = std::getenv("HEALTH_CHECKER_HOST");
-      if (v && *v) return std::string(v);
+      if (v && *v)
+        return std::string(v);
     } else if (key == "heartbeat.target_port") {
       const char *v = std::getenv("HEALTH_CHECKER_PORT");
-      if (v && *v) return std::string(v);
+      if (v && *v)
+        return std::string(v);
     }
 
     std::shared_lock lock(mutex_);
@@ -178,7 +182,8 @@ public:
       if (host.empty())
         break;
       HeadServerEntry entry;
-      entry.id = get_string(prefix + ".id", "head_server_" + std::to_string(i + 1));
+      entry.id =
+          get_string(prefix + ".id", "head_server_" + std::to_string(i + 1));
       entry.host = host;
       entry.port = get_int(prefix + ".port", 9669);
       entry.control_port = get_int(prefix + ".control_port", 9670 + i);
@@ -460,7 +465,7 @@ private:
   }
 };
 
-// ─────────────────── SIGHUP Hot-Reload Support ───────────────────
+// SIGHUP Hot-Reload Support
 // Send SIGHUP to the process to trigger a config reload on next access.
 //   kill -HUP <pid>
 
@@ -481,7 +486,7 @@ inline void install() {
 }
 } // namespace config_reload
 
-// ─────────────────── Global Config Singletons ───────────────────
+// Global Config Singletons
 
 /// Search paths used by each service config loader (kept visible so
 /// callers can reference them when printing warnings).

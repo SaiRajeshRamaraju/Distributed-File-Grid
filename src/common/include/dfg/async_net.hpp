@@ -1,29 +1,28 @@
 #pragma once
 #include "dfg/system_info.hpp"
-#include <arpa/inet.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <string.h>
-#include <sys/epoll.h>
-#include <sys/socket.h>
-#include <sys/timerfd.h>
-#include <unistd.h>
+#include "heartbeat.pb.h"
 
+#include <arpa/inet.h>
 #include <chrono>
 #include <coroutine>
 #include <cstdint>
 #include <cstring>
+#include <errno.h>
+#include <fcntl.h>
 #include <functional>
-#include <iostream>
-#include <string>
-#include <unordered_map>
-#include <vector>
-
-#include "heartbeat.pb.h"
 #include <google/protobuf/timestamp.pb.h>
 #include <google/protobuf/util/time_util.h>
+#include <iostream>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <string.h>
+#include <string>
+#include <sys/epoll.h>
+#include <sys/socket.h>
+#include <sys/timerfd.h>
+#include <unistd.h>
+#include <unordered_map>
+#include <vector>
 
 namespace async_hb {
 
@@ -92,13 +91,13 @@ struct Reactor {
     if (epfd_ < 0)
       throw std::runtime_error("epoll_create1 failed");
   }
-  
+
   // Rule of Five
   Reactor(const Reactor &) = delete;
   Reactor &operator=(const Reactor &) = delete;
   Reactor(Reactor &&) = delete;
   Reactor &operator=(Reactor &&) = delete;
-  
+
   ~Reactor() {
     if (epfd_ >= 0)
       ::close(epfd_);
@@ -151,8 +150,14 @@ struct Reactor {
     }
     void await_resume() {
       uint64_t expirations = 0;
-      (void)::read(tfd, &expirations, sizeof(expirations));
+      ssize_t count;
+      do {
+        count = ::read(tfd, &expirations, sizeof(expirations));
+      } while (count < 0 && errno == EINTR);
       ::close(tfd);
+      tfd = -1;
+      if (count != static_cast<ssize_t>(sizeof(expirations)))
+        throw std::runtime_error("timerfd read failed");
     }
   };
   SleepAwaiter sleep_for(std::chrono::nanoseconds ns) {
@@ -367,7 +372,9 @@ inline bool resolve_ipv4(const std::string &host, uint16_t port,
   return true;
 }
 
-inline task send_heartbeats(Reactor &r, int sfd, int server_id, const std::string& local_ip_port = "", int count = -1) {
+inline task send_heartbeats(Reactor &r, int sfd, int server_id,
+                            const std::string &local_ip_port = "",
+                            int count = -1) {
   heart_beat::v1::HeartBeat hb;
   hb.set_server_id(server_id);
   hb.set_ip(local_ip_port);
@@ -377,7 +384,7 @@ inline task send_heartbeats(Reactor &r, int sfd, int server_id, const std::strin
         google::protobuf::util::TimeUtil::GetCurrentTime();
 
     // Populate system metrics from cached monitor if available
-    auto& monitor = CachedSystemMonitor::instance();
+    auto &monitor = CachedSystemMonitor::instance();
     if (monitor.has_sample()) {
       auto usage = monitor.get();
       hb.set_cpu_usage(usage.cpu_usage);
@@ -427,7 +434,10 @@ recv_heartbeats(Reactor &r, int sfd,
   }
 }
 
-inline task send_heartbeat_session(Reactor &r, int sfd, sockaddr_in addr, int server_id, const std::string& local_ip_port, int count, bool &success) {
+inline task send_heartbeat_session(Reactor &r, int sfd, sockaddr_in addr,
+                                   int server_id,
+                                   const std::string &local_ip_port, int count,
+                                   bool &success) {
   try {
     co_await async_connect(r, sfd, addr);
     co_await send_heartbeats(r, sfd, server_id, local_ip_port, count);
@@ -437,7 +447,8 @@ inline task send_heartbeat_session(Reactor &r, int sfd, sockaddr_in addr, int se
   }
 }
 
-inline int send_signal(std::string server_ip, int server_id, int port = 9000, std::string local_ip_port = "", int count = 1) {
+inline int send_signal(std::string server_ip, int server_id, int port = 9000,
+                       std::string local_ip_port = "", int count = 1) {
   try {
     sockaddr_in addr{};
     if (!resolve_ipv4(server_ip, static_cast<uint16_t>(port), addr)) {
@@ -457,7 +468,8 @@ inline int send_signal(std::string server_ip, int server_id, int port = 9000, st
 
     bool success = false;
     Reactor r;
-    r.spawn(send_heartbeat_session(r, sfd, addr, server_id, local_ip_port, count, success));
+    r.spawn(send_heartbeat_session(r, sfd, addr, server_id, local_ip_port,
+                                   count, success));
     r.run();
     ::close(sfd);
     return success ? 0 : 1;
@@ -534,11 +546,10 @@ inline int receive_signal(int port = 9000) {
 }
 
 // Backward compatible alias
-inline int recieve_signal(int port = 9000) {
-  return receive_signal(port);
-}
+inline int recieve_signal(int port = 9000) { return receive_signal(port); }
 
-// Implementation of final_awaitable::await_suspend after Reactor is fully defined
+// Implementation of final_awaitable::await_suspend after Reactor is fully
+// defined
 inline void task::promise_type::final_awaitable::await_suspend(
     std::coroutine_handle<promise_type> h) noexcept {
   auto &p = h.promise();

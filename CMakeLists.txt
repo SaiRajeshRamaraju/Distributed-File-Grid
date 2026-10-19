@@ -20,11 +20,8 @@ endif()
 
 # Place all binaries in build/ root instead of per-component subdirs
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
-set(CMAKE_EXPORT_COMPILE_COMMANDS 1)
-
-# NOTE: Keep this flag enabled for proper LSP support.
-# It generates compile_commands.json for accurate project indexing.
-set(CMAKE_EXPORT_COMPILE_COMMANDS 1) # Write compile_commands.json
+# Generate compile_commands.json for editor and language-server support.
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 enable_testing()
 
 # ── Required packages ──
@@ -45,8 +42,6 @@ if(NOT Protobuf_PROTOC_EXECUTABLE)
 endif()
 message(STATUS "Found Protobuf: ${Protobuf_VERSION}")
 message(STATUS "Using protoc: ${Protobuf_PROTOC_EXECUTABLE}")
-
-include_directories(${Protobuf_INCLUDE_DIRS})
 
 # ── Optional Redis ──
 option(WITH_REDIS "Build with Redis++ support" OFF)
@@ -72,7 +67,6 @@ if(WITH_REDIS)
             message(FATAL_ERROR "redis++ or hiredis not found. Please install libredis++-dev and libhiredis-dev")
         endif()
     endif()
-    add_compile_definitions(WITH_REDIS)
 endif()
 
 # ── Optional tests ──

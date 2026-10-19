@@ -1,29 +1,12 @@
-# src/head_server/CMakeLists.txt
-
-# ── Standalone head_server binary ──
-add_executable(head_server
-    head_server.cpp
-    file_upload.cpp
-    ${CMAKE_SOURCE_DIR}/src/common/src/zookeeper_client.cpp
+add_library(dfg_head_server STATIC
+    src/head_server.cpp
+    src/file_upload.cpp
+    src/file_download.cpp
+)
+target_include_directories(dfg_head_server PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(dfg_head_server PUBLIC dfg_common PRIVATE
+    dfg_service_dependencies dfg_metadata
 )
 
-target_include_directories(head_server PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-
-target_link_libraries(head_server PRIVATE
-    dfg_common
-    dfg_proto
-    Threads::Threads
-    ${ABSEIL_LIBS}
-    ${PROMETHEUS_LIBS}
-    ${ZLIB_LIBRARIES}
-)
-
-target_compile_options(head_server PRIVATE -fcoroutines)
-
-if(WITH_REDIS)
-    target_include_directories(head_server PRIVATE ${REDIS_PLUS_PLUS_INCLUDE_DIRS})
-    target_compile_options(head_server PRIVATE ${REDIS_PLUS_PLUS_CFLAGS_OTHER})
-    target_link_libraries(head_server PRIVATE redis++::redis++)
-endif()
+add_executable(head_server src/main.cpp)
+target_link_libraries(head_server PRIVATE dfg_head_server)
