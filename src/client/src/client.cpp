@@ -1,22 +1,19 @@
 #include <algorithm>
-#include <arpa/inet.h>
-#include <cstdlib>
+#include <dfg/atomic_output.hpp>
 #include <dfg/client/client.hpp>
 #include <dfg/net_utils.hpp>
+#include <dfg/protocol.hpp>
 #include <dfg/sha256.hpp>
+#include <dfg/thread_pool.hpp>
 #include <dfg/unique_fd.hpp>
 #include <fstream>
-#include <iomanip>
+#include <future>
 #include <iostream>
 #include <map>
-#include <mutex>
-#include <netinet/in.h>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <sys/socket.h>
-#include <thread>
-#include <unistd.h>
 #include <vector>
 
 namespace dfg::client {
@@ -27,19 +24,18 @@ static std::string calculate_checksum(const std::vector<char> &data) {
 constexpr size_t DEFAULT_CHUNK_SIZE = 64 * 1024 * 1024; // 64 MB chunk size
 
 int file_delete(std::string server_ip, int server_port, std::string file_name) {
-  int sock = socket(AF_INET, SOCK_STREAM, 0);
+  if (!dfg::protocol::valid_name(file_name)) {
+    std::cerr << "Invalid remote filename" << std::endl;
+    return 1;
+  }
+
+  int sock = dfg::net::connect_with_timeout(server_ip, server_port);
   dfg::UniqueFd socket_owner(sock);
-  if (sock < 0)
+  if (sock < 0) {
+    std::cerr << "Cannot connect to head server at " << server_ip << ":"
+              << server_port << std::endl;
     return 1;
-
-  sockaddr_in serv_addr{};
-  serv_addr.sin_family = AF_INET;
-  serv_addr.sin_port = htons(server_port);
-  if (inet_pton(AF_INET, server_ip.c_str(), &serv_addr.sin_addr) <= 0)
-    return 1;
-
-  if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
-    return 1;
+  }
 
   std::string req = "DELETE " + file_name + "\n";
   if (!dfg::net::send_all(sock, req.data(), req.size()))
@@ -50,213 +46,144 @@ int file_delete(std::string server_ip, int server_port, std::string file_name) {
     std::cout << "Delete successful\n";
     return 0;
   }
-  std::cerr << "error\n";
+  std::cerr << "Delete failed: "
+            << (resp.empty() ? "head server disconnected" : resp) << std::endl;
   return 1;
+}
+
+// Fetches one verified chunk. The caller catches exceptions before committing
+// the destination, so a failed download never replaces an existing local file.
+struct DownloadChunk {
+  uint64_t id;
+  std::string host;
+  uint64_t port;
+  std::string digest;
+};
+
+static std::vector<char> fetch_chunk(const DownloadChunk &chunk,
+                                     const std::string &filename) {
+  dfg::UniqueFd connection(
+      dfg::net::connect_with_timeout(chunk.host, chunk.port));
+  if (connection.get() < 0)
+    throw std::runtime_error("Cannot connect to storage node");
+  const std::string request =
+      "GET_CHUNK " + std::to_string(chunk.id) + " " + filename + "\n";
+  if (!dfg::net::send_all(connection.get(), request.data(), request.size()))
+    throw std::runtime_error("Cannot request chunk");
+  std::string reply;
+  if (!dfg::net::recv_line(connection.get(), reply) ||
+      !reply.starts_with("CHUNK_SIZE "))
+    throw std::runtime_error("Invalid chunk response: " + reply);
+  uint64_t size = 0;
+  if (!dfg::protocol::parse_size(reply.substr(11), size) || size == 0 ||
+      size > dfg::protocol::max_chunk_bytes)
+    throw std::runtime_error("Invalid chunk size");
+  std::vector<char> data(size);
+  if (!dfg::net::recv_all(connection.get(), data.data(), data.size()))
+    throw std::runtime_error("Incomplete chunk data");
+  if (dfg::hash::sha256(data) != chunk.digest)
+    throw std::runtime_error("Chunk checksum mismatch");
+  return data;
 }
 
 int file_download(std::string server_ip, int server_port, std::string file_name,
                   std::string output_path) {
-  int sock = socket(AF_INET, SOCK_STREAM, 0);
-  dfg::UniqueFd socket_owner(sock);
-  if (sock < 0) {
-    std::cerr << "Socket creation error" << std::endl;
-    return 1;
-  }
+  try {
+    if (!dfg::protocol::valid_name(file_name))
+      throw std::runtime_error("Invalid remote filename");
+    dfg::UniqueFd connection(
+        dfg::net::connect_with_timeout(server_ip, server_port));
+    if (connection.get() < 0)
+      throw std::runtime_error("Cannot connect to head server");
+    const std::string request = "DOWNLOAD " + file_name + "\n";
+    if (!dfg::net::send_all(connection.get(), request.data(), request.size()))
+      throw std::runtime_error("Cannot request download");
 
-  sockaddr_in serv_addr{};
-  serv_addr.sin_family = AF_INET;
-  serv_addr.sin_port = htons(server_port);
-  if (inet_pton(AF_INET, server_ip.c_str(), &serv_addr.sin_addr) <= 0) {
-    std::cerr << "Invalid address/ Address not supported" << std::endl;
-    return 1;
-  }
-
-  if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-    std::cerr << "Connection Failed" << std::endl;
-    return 1;
-  }
-
-  std::string req = "DOWNLOAD " + file_name + "\n";
-  if (!dfg::net::send_all(sock, req.data(), req.size()))
-    return 1;
-
-  std::string file_hash_from_server;
-
-  struct ChunkInfo {
-    int id;
-    std::string ip;
-    int port;
-    std::string hash;
-  };
-  std::vector<ChunkInfo> chunks;
-
-  while (true) {
-    std::string line;
-    if (!dfg::net::recv_line(sock, line) || line.empty()) {
-      std::cerr << "Connection closed by server prematurely." << std::endl;
-      return 1;
-    }
-
-    if (line.rfind("ERROR:", 0) == 0) {
-      std::cerr << "Server Error: " << line << std::endl;
-      return 1;
-    }
-
-    if (line.rfind("FILE_HASH ", 0) == 0) {
-      file_hash_from_server = line.substr(10);
-      std::cout << "Received file hash from server: " << file_hash_from_server
-                << std::endl;
-    } else if (line.rfind("CHUNKS ", 0) == 0) {
-      std::cout << "File has " << line.substr(7) << " chunk(s) to download."
-                << std::endl;
-    } else if (line.rfind("CHUNK_LOC ", 0) == 0) {
-      std::istringstream iss(line.substr(10));
-      ChunkInfo info;
-      if (!(iss >> info.id >> info.ip >> info.port >> info.hash)) {
-        std::cerr << "Invalid chunk_loc header: " << line << std::endl;
-        return 1;
-      }
-      chunks.push_back(info);
-    } else if (line == "EOF") {
-      break;
-    } else {
-      std::cerr << "Unknown response: " << line << std::endl;
-    }
-  }
-  socket_owner.reset();
-
-  // Parallel download
-  std::cout << "Starting parallel download of " << chunks.size() << " chunks..."
-            << std::endl;
-  std::vector<std::thread> threads;
-  std::mutex mtx;
-  bool download_error = false;
-  std::map<int, std::vector<char>> chunk_data;
-
-  for (const auto &chunk : chunks) {
-    threads.emplace_back([&, chunk]() {
-      int csock = socket(AF_INET, SOCK_STREAM, 0);
-      dfg::UniqueFd chunk_socket_owner(csock);
-      if (csock < 0) {
-        std::lock_guard<std::mutex> lock(mtx);
-        std::cerr << "\033[31mError: socket creation failed for chunk "
-                  << chunk.id << "\033[0m" << std::endl;
-        download_error = true;
-        return;
-      }
-      sockaddr_in caddr{};
-      caddr.sin_family = AF_INET;
-      caddr.sin_port = htons(chunk.port);
-      if (inet_pton(AF_INET, chunk.ip.c_str(), &caddr.sin_addr) <= 0) {
-        std::lock_guard<std::mutex> lock(mtx);
-        std::cerr << "\033[31mError: invalid IP for chunk " << chunk.id
-                  << "\033[0m" << std::endl;
-        download_error = true;
-        chunk_socket_owner.reset();
-        return;
-      }
-      if (connect(csock, (struct sockaddr *)&caddr, sizeof(caddr)) < 0) {
-        std::lock_guard<std::mutex> lock(mtx);
-        std::cerr << "\033[31mError: connection failed for chunk " << chunk.id
-                  << "\033[0m" << std::endl;
-        download_error = true;
-        chunk_socket_owner.reset();
-        return;
-      }
-
-      std::string get_req =
-          "GET_CHUNK " + std::to_string(chunk.id) + " " + file_name + "\n";
-      if (!dfg::net::send_all(csock, get_req.data(), get_req.size())) {
-        std::lock_guard<std::mutex> lock(mtx);
-        download_error = true;
-        return;
-      }
-
-      std::string resp;
-      if (!dfg::net::recv_line(csock, resp) ||
-          resp.rfind("CHUNK_SIZE ", 0) != 0) {
-        std::lock_guard<std::mutex> lock(mtx);
-        std::cerr << "\033[31mError: server returned error for chunk "
-                  << chunk.id << ": " << resp << "\033[0m" << std::endl;
-        download_error = true;
-        chunk_socket_owner.reset();
-        return;
-      }
-      size_t size = 0;
-      std::istringstream size_header(resp.substr(11));
-      if (!(size_header >> size)) {
-        std::lock_guard<std::mutex> lock(mtx);
-        std::cerr << "Invalid chunk size for chunk " << chunk.id << std::endl;
-        download_error = true;
-        return;
-      }
-      std::vector<char> buf(size);
-      bool complete = dfg::net::recv_all(csock, buf.data(), size);
-      chunk_socket_owner.reset();
-
-      if (!complete) {
-        std::lock_guard<std::mutex> lock(mtx);
-        std::cerr << "\033[31mError: incomplete data for chunk " << chunk.id
-                  << "\033[0m" << std::endl;
-        download_error = true;
-        return;
-      }
-
-      std::string client_hash = calculate_checksum(buf);
-      std::lock_guard<std::mutex> lock(mtx);
-      if (client_hash != chunk.hash) {
-        std::cerr << "\033[31mError: Corrupted chunk received!\n"
-                  << "Order ID: " << chunk.id << "\n"
-                  << "Current Hash (Generated): " << client_hash << "\n"
-                  << "Expected Hash (from Head Server): " << chunk.hash
-                  << "\033[0m" << std::endl;
-        download_error = true;
+    std::string file_digest;
+    std::optional<uint64_t> expected_chunks;
+    std::map<uint64_t, DownloadChunk> chunks;
+    for (;;) {
+      std::string line;
+      if (!dfg::net::recv_line(connection.get(), line))
+        throw std::runtime_error("Incomplete download metadata");
+      if (line == "EOF")
+        break;
+      if (line.starts_with("ERROR:"))
+        throw std::runtime_error(line);
+      if (line.starts_with("FILE_HASH ")) {
+        const auto digest = line.substr(10);
+        if (!dfg::protocol::valid_digest(digest) ||
+            (!file_digest.empty() && file_digest != digest))
+          throw std::runtime_error("Invalid or conflicting file hash");
+        file_digest = digest;
+      } else if (line.starts_with("CHUNKS ")) {
+        uint64_t count = 0;
+        if (expected_chunks ||
+            !dfg::protocol::parse_size(line.substr(7), count) ||
+            count > 1000000)
+          throw std::runtime_error("Invalid chunk count");
+        expected_chunks = count;
+      } else if (line.starts_with("CHUNK_LOC ")) {
+        std::istringstream fields(line.substr(10));
+        std::string id, port, extra;
+        DownloadChunk chunk{};
+        if (!(fields >> id >> chunk.host >> port >> chunk.digest) ||
+            (fields >> extra) || !dfg::protocol::parse_size(id, chunk.id) ||
+            !dfg::protocol::parse_size(port, chunk.port) || chunk.port == 0 ||
+            chunk.port > 65535 || !dfg::protocol::valid_digest(chunk.digest) ||
+            chunks.size() >= 1000000 || !chunks.emplace(chunk.id, chunk).second)
+          throw std::runtime_error("Invalid or duplicate chunk location");
       } else {
-        std::cout << "\033[32mSuccessfully received and verified chunk "
-                  << chunk.id << "\033[0m" << std::endl;
-        chunk_data[chunk.id] = std::move(buf);
+        throw std::runtime_error("Unknown download metadata: " + line);
       }
-    });
-  }
+    }
+    if (file_digest.empty() ||
+        (expected_chunks && *expected_chunks != chunks.size()) ||
+        (!chunks.empty() && (!expected_chunks || chunks.begin()->first != 0 ||
+                             chunks.rbegin()->first != chunks.size() - 1)))
+      throw std::runtime_error(
+          "Missing file hash or incomplete chunk locations");
+    connection.reset();
 
-  for (auto &t : threads)
-    t.join();
-
-  if (download_error) {
-    std::cerr << "Download failed: one or more chunks could not be verified"
-              << std::endl;
+    dfg::AtomicOutput output(output_path);
+    dfg::hash::SHA256 file_hash;
+    dfg::ThreadPool downloads(4);
+    auto next = chunks.begin();
+    while (next != chunks.end()) {
+      // A batch holds at most four chunks, independently of file size.
+      std::vector<std::future<std::vector<char>>> batch;
+      for (size_t count = 0; count < 4 && next != chunks.end();
+           ++count, ++next) {
+        const auto chunk = next->second;
+        batch.push_back(downloads.submit(
+            [chunk, file_name] { return fetch_chunk(chunk, file_name); }));
+      }
+      for (auto &result : batch) {
+        auto data = result.get();
+        file_hash.update(data);
+        output.stream().write(data.data(), data.size());
+        if (!output.stream())
+          throw std::runtime_error("Failed to write downloaded data");
+      }
+    }
+    if (file_hash.digest() != file_digest)
+      throw std::runtime_error("Downloaded file checksum does not match");
+    output.commit();
+    std::cout << "Download successful" << std::endl;
+    return 0;
+  } catch (const std::exception &error) {
+    std::cerr << "Download failed: " << error.what() << std::endl;
     return 1;
   }
-
-  std::ofstream out_file(output_path, std::ios::binary);
-  if (!out_file) {
-    std::cerr << "Failed to open output file" << std::endl;
-    return 1;
-  }
-
-  dfg::hash::SHA256 full_file_hash;
-  for (size_t i = 0; i < chunks.size(); ++i) {
-    auto &data = chunk_data[i];
-    full_file_hash.update(data);
-    out_file.write(data.data(), data.size());
-  }
-  out_file.close();
-
-  std::string final_generated_hash = full_file_hash.digest();
-
-  if (!file_hash_from_server.empty() &&
-      final_generated_hash != file_hash_from_server) {
-    std::cerr << "Downloaded file checksum does not match" << std::endl;
-    remove(output_path.c_str());
-    return 1;
-  }
-
-  std::cout << "Download successful" << std::endl;
-  return 0;
 }
 
 int file_upload(const std::string &server_ip, int server_port,
                 const std::string &file_path, const std::string &file_name) {
+  if (!dfg::protocol::valid_name(file_name)) {
+    std::cerr << "Invalid remote filename" << std::endl;
+    return 1;
+  }
+
   std::ifstream in_file(file_path, std::ios::binary | std::ios::ate);
   if (!in_file) {
     std::cerr << "Error: Failed to open local file for upload: " << file_path
@@ -265,6 +192,10 @@ int file_upload(const std::string &server_ip, int server_port,
   }
 
   std::streamsize file_size = in_file.tellg();
+  if (file_size < 0) {
+    std::cerr << "Cannot determine upload size" << std::endl;
+    return 1;
+  }
   in_file.seekg(0, std::ios::beg);
 
   std::cout << "Calculating SHA256 checksum for: " << file_path << " ("
@@ -277,6 +208,10 @@ int file_upload(const std::string &server_ip, int server_port,
     if (bytes_read > 0) {
       hasher.update(buffer.data(), bytes_read);
     }
+  }
+  if (in_file.bad()) {
+    std::cerr << "Cannot read upload source" << std::endl;
+    return 1;
   }
   std::string file_hash = hasher.digest();
   std::cout << "SHA256: " << file_hash << std::endl;
@@ -292,27 +227,10 @@ int file_upload(const std::string &server_ip, int server_port,
   in_file.clear();
   in_file.seekg(0, std::ios::beg);
 
-  int sock = socket(AF_INET, SOCK_STREAM, 0);
+  int sock = dfg::net::connect_with_timeout(server_ip, server_port);
   dfg::UniqueFd socket_owner(sock);
   if (sock < 0) {
-    std::cerr << "Socket creation error" << std::endl;
-    return 1;
-  }
-
-  sockaddr_in serv_addr{};
-  serv_addr.sin_family = AF_INET;
-  serv_addr.sin_port = htons(server_port);
-  if (inet_pton(AF_INET, server_ip.c_str(), &serv_addr.sin_addr) <= 0) {
-    std::cerr << "Invalid address / Address not supported: " << server_ip
-              << std::endl;
-    socket_owner.reset();
-    return 1;
-  }
-
-  if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-    std::cerr << "Connection to Head Server failed: " << server_ip << ":"
-              << server_port << std::endl;
-    socket_owner.reset();
+    std::cerr << "Cannot connect to head server" << std::endl;
     return 1;
   }
 
@@ -406,27 +324,10 @@ int file_upload(const std::string &server_ip, int server_port,
 }
 
 int file_list(const std::string &server_ip, int server_port) {
-  int sock = socket(AF_INET, SOCK_STREAM, 0);
+  int sock = dfg::net::connect_with_timeout(server_ip, server_port);
   dfg::UniqueFd socket_owner(sock);
   if (sock < 0) {
-    std::cerr << "Socket creation error" << std::endl;
-    return 1;
-  }
-
-  sockaddr_in serv_addr{};
-  serv_addr.sin_family = AF_INET;
-  serv_addr.sin_port = htons(server_port);
-  if (inet_pton(AF_INET, server_ip.c_str(), &serv_addr.sin_addr) <= 0) {
-    std::cerr << "Invalid address / Address not supported: " << server_ip
-              << std::endl;
-    socket_owner.reset();
-    return 1;
-  }
-
-  if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-    std::cerr << "Connection to Head Server failed: " << server_ip << ":"
-              << server_port << std::endl;
-    socket_owner.reset();
+    std::cerr << "Cannot connect to head server" << std::endl;
     return 1;
   }
 

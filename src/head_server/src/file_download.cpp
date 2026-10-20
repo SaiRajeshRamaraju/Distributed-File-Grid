@@ -6,15 +6,17 @@
 #include <algorithm>
 #include <dfg/metadata/store.hpp>
 #include <dfg/net_utils.hpp>
+#include <dfg/protocol.hpp>
 #include <dfg/sha256.hpp>
 #include <dfg/thread_pool.hpp>
+#include <dfg/unique_fd.hpp>
 #include <future>
 #include <iostream>
 #include <map>
 #include <string>
 #include <vector>
 
-// File Download / Reverse Proxy & Replication
+// Replica verification, download locations, and repair transfers
 static constexpr int MAX_CONCURRENT_FETCHES = 6;
 
 struct ChunkLocation {
@@ -73,6 +75,7 @@ public:
     }
 
     int sock = dfg::net::connect_with_timeout(ip, transfer_port);
+    dfg::UniqueFd connection(sock);
     if (sock < 0)
       return resp;
 
@@ -90,26 +93,28 @@ public:
     if (!dfg::net::send_all(sock, &type, sizeof(type)) ||
         !dfg::net::send_all(sock, &len, sizeof(len)) ||
         !dfg::net::send_all(sock, serialized.data(), serialized.size())) {
-      ::close(sock);
+      connection.reset();
       return resp;
     }
 
     uint32_t resp_len_net;
     if (!dfg::net::recv_all(sock, &resp_len_net, sizeof(resp_len_net))) {
-      ::close(sock);
+      connection.reset();
       return resp;
     }
 
     uint32_t resp_len = ntohl(resp_len_net);
+    if (resp_len == 0 || resp_len > dfg::protocol::max_message_bytes)
+      throw std::runtime_error("Invalid chunk response length");
     std::vector<char> resp_buf(resp_len);
 
     if (!dfg::net::recv_all(sock, resp_buf.data(), resp_len)) {
-      ::close(sock);
+      connection.reset();
       return resp;
     }
 
     resp.ParseFromArray(resp_buf.data(), resp_len);
-    ::close(sock);
+    connection.reset();
     return resp;
   }
 
@@ -134,6 +139,7 @@ public:
     }
 
     int sock = dfg::net::connect_with_timeout(ip, transfer_port);
+    dfg::UniqueFd connection(sock);
     if (sock < 0)
       return false;
 
@@ -153,13 +159,15 @@ public:
     if (!dfg::net::send_all(sock, &type, sizeof(type)) ||
         !dfg::net::send_all(sock, &len, sizeof(len)) ||
         !dfg::net::send_all(sock, serialized.data(), serialized.size())) {
-      ::close(sock);
+      connection.reset();
       return false;
     }
 
     uint32_t resp_len_net;
     if (dfg::net::recv_all(sock, &resp_len_net, sizeof(resp_len_net))) {
       uint32_t resp_len = ntohl(resp_len_net);
+      if (resp_len == 0 || resp_len > dfg::protocol::max_message_bytes)
+        throw std::runtime_error("Invalid chunk response length");
       std::vector<char> resp_buf(resp_len);
       if (dfg::net::recv_all(sock, resp_buf.data(), resp_len)) {
         file_transfer::v1::ChunkResponse resp;
@@ -167,12 +175,12 @@ public:
           if (out_file_path) {
             *out_file_path = resp.file_path();
           }
-          ::close(sock);
+          connection.reset();
           return true;
         }
       }
     }
-    ::close(sock);
+    connection.reset();
     return false;
   }
 
@@ -196,6 +204,7 @@ public:
     }
 
     int sock = dfg::net::connect_with_timeout(ip, transfer_port);
+    dfg::UniqueFd connection(sock);
     if (sock < 0)
       return chunk_data;
 
@@ -214,21 +223,23 @@ public:
     if (!dfg::net::send_all(sock, &type, sizeof(type)) ||
         !dfg::net::send_all(sock, &len, sizeof(len)) ||
         !dfg::net::send_all(sock, serialized.data(), serialized.size())) {
-      ::close(sock);
+      connection.reset();
       return chunk_data;
     }
 
     uint32_t resp_len_net;
     if (!dfg::net::recv_all(sock, &resp_len_net, sizeof(resp_len_net))) {
-      ::close(sock);
+      connection.reset();
       return chunk_data;
     }
 
     uint32_t resp_len = ntohl(resp_len_net);
+    if (resp_len == 0 || resp_len > dfg::protocol::max_message_bytes)
+      throw std::runtime_error("Invalid chunk response length");
     std::vector<char> resp_buf(resp_len);
 
     if (!dfg::net::recv_all(sock, resp_buf.data(), resp_len)) {
-      ::close(sock);
+      connection.reset();
       return chunk_data;
     }
 
@@ -236,28 +247,28 @@ public:
     if (!resp.ParseFromArray(resp_buf.data(), resp_len) || !resp.success()) {
       std::cerr << "Server rejected fetch: " << resp.error_message()
                 << std::endl;
-      ::close(sock);
+      connection.reset();
       return chunk_data;
     }
 
     chunk_data.assign(resp.data().begin(), resp.data().end());
-    ::close(sock);
+    connection.reset();
     std::cout << "Read chunk " << location.chunk_id << " (" << chunk_data.size()
               << " bytes) from " << location.server_ip << std::endl;
     return chunk_data;
   }
 
-  bool stream_file_to_client(const std::string &filename, int fd) {
+  bool send_download_locations(const std::string &filename, int fd) {
     auto [chunk_locations, file_hash] =
         get_chunk_locations_from_metadata(filename);
     if (chunk_locations.empty()) {
       if (!file_hash.empty()) {
         std::string header = "FILE_HASH " + file_hash + "\nEOF\n";
-        ::send(fd, header.data(), header.size(), 0);
+        dfg::net::send_all(fd, header.data(), header.size());
         return true;
       }
       std::string err = "ERROR: No chunks found for file\n";
-      ::send(fd, err.data(), err.size(), 0);
+      dfg::net::send_all(fd, err.data(), err.size());
       return false;
     }
 
@@ -267,11 +278,11 @@ public:
     }
 
     std::string hash_msg = "FILE_HASH " + file_hash + "\n";
-    ::send(fd, hash_msg.data(), hash_msg.size(), 0);
+    dfg::net::send_all(fd, hash_msg.data(), hash_msg.size());
 
     std::string count_msg =
         "CHUNKS " + std::to_string(chunk_replicas.size()) + "\n";
-    ::send(fd, count_msg.data(), count_msg.size(), 0);
+    dfg::net::send_all(fd, count_msg.data(), count_msg.size());
 
     struct HashResult {
       int chunk_id;
@@ -326,7 +337,7 @@ public:
       if (consensus.hash_counts.empty()) {
         std::string err = "ERROR: Could not verify hashes for chunk " +
                           std::to_string(chunk_id) + "\n";
-        ::send(fd, err.data(), err.size(), 0);
+        dfg::net::send_all(fd, err.data(), err.size());
         return false;
       }
       std::string majority_hash;
@@ -365,10 +376,10 @@ public:
       std::string loc_msg = "CHUNK_LOC " + std::to_string(plan.chunk_id) + " " +
                             ip_only + " " + std::to_string(public_port) + " " +
                             plan.majority_hash + "\n";
-      ::send(fd, loc_msg.data(), loc_msg.size(), 0);
+      dfg::net::send_all(fd, loc_msg.data(), loc_msg.size());
     }
     std::string eof = "FILE_HASH " + file_hash + "\nEOF\n";
-    ::send(fd, eof.data(), eof.size(), 0);
+    dfg::net::send_all(fd, eof.data(), eof.size());
     return true;
   }
 };
@@ -378,9 +389,9 @@ static FileReconstructor g_file_reconstructor;
 void handle_client_delete(int fd, const std::string &filename) {
   auto [chunk_locations, file_hash] =
       g_file_reconstructor.get_chunk_locations_from_metadata(filename);
-  if (chunk_locations.empty()) {
+  if (chunk_locations.empty() && file_hash.empty()) {
     std::string err = "ERROR: File not found\n";
-    ::send(fd, err.data(), err.size(), 0);
+    dfg::net::send_all(fd, err.data(), err.size());
     return;
   }
 
@@ -390,43 +401,34 @@ void handle_client_delete(int fd, const std::string &filename) {
     int port;
     dfg::net::parse_address(loc.server_ip, ip, port);
 
-    int sock =
-        dfg::net::connect_with_timeout(ip, port, 5); // Connect to base port
-    if (sock >= 0) {
-      std::string unique_chunk_id =
-          filename + "_chunk_" + std::to_string(loc.chunk_id);
-      std::string del_req = "DELETE_CHUNK " + unique_chunk_id + "\n";
-      ::send(sock, del_req.data(), del_req.size(), 0);
-
-      char buf[64] = {0};
-      ssize_t n = ::recv(sock, buf, sizeof(buf) - 1, 0);
-      if (n > 0) {
-        std::string resp(buf, n);
-        if (resp.find("SUCCESS") == std::string::npos) {
-          all_deleted = false;
-        }
-      } else {
-        all_deleted = false;
-      }
-      ::close(sock);
-    } else {
+    int sock = dfg::net::connect_with_timeout(ip, port, 5);
+    dfg::UniqueFd connection(sock);
+    if (sock < 0) {
       all_deleted = false;
+      continue;
     }
+    const std::string chunk_id =
+        filename + "_chunk_" + std::to_string(loc.chunk_id);
+    const std::string request = "DELETE_CHUNK " + chunk_id + "\n";
+    std::string reply;
+    if (!dfg::net::send_all(sock, request.data(), request.size()) ||
+        !dfg::net::recv_line(sock, reply) || reply != "SUCCESS")
+      all_deleted = false;
   }
 
   if (all_deleted) {
     delete_entry(filename);
     std::string ok = "SUCCESS\n";
-    ::send(fd, ok.data(), ok.size(), 0);
+    dfg::net::send_all(fd, ok.data(), ok.size());
   } else {
     std::string err = "ERROR: Could not delete chunks\n";
-    ::send(fd, err.data(), err.size(), 0);
+    dfg::net::send_all(fd, err.data(), err.size());
   }
 }
 
 void handle_client_download(int fd, const std::string &filename) {
 
-  g_file_reconstructor.stream_file_to_client(filename, fd);
+  g_file_reconstructor.send_download_locations(filename, fd);
 }
 
 bool replicate_chunk_to_server(const std::string &source_server, int chunk_id,

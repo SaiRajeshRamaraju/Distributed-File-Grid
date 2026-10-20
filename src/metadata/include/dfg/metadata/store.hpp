@@ -1,3 +1,4 @@
+#include <dfg/atomic_output.hpp>
 #ifndef DFG_METADATA_STORE_HPP
 #define DFG_METADATA_STORE_HPP
 
@@ -134,11 +135,8 @@ inline std::mutex &store_mutex() {
 }
 
 inline void persist_locked() {
-  std::ofstream out(db_path(), std::ios::trunc);
-  if (!out) {
-    std::cerr << "Failed to persist metadata store" << std::endl;
-    return;
-  }
+  dfg::AtomicOutput output(db_path());
+  auto &out = output.stream();
   for (const auto &kv : store()) {
     if (!kv.second.file_hash.empty()) {
       out << kv.first << " HASH=" << kv.second.file_hash << '\n';
@@ -152,13 +150,33 @@ inline void persist_locked() {
           << '\n';
     }
   }
+  output.commit();
 }
+
+// The caller holds store_mutex() throughout a metadata update.
+class StoreTransaction {
+public:
+  StoreTransaction() : previous_(store()) {}
+  ~StoreTransaction() {
+    if (!committed_)
+      store().swap(previous_);
+  }
+  void commit() {
+    persist_locked();
+    committed_ = true;
+  }
+
+private:
+  MetadataMap previous_;
+  bool committed_ = false;
+};
 
 inline void replace_file_chunks(const std::string &file,
                                 const std::string &file_hash,
                                 std::vector<ChunkRecord> &&chunks,
                                 int replica_count = 0) {
   std::lock_guard<std::mutex> lock(store_mutex());
+  StoreTransaction transaction;
   store()[file].file_hash = file_hash;
 
   // Calculate per-chunk replica counts if needed
@@ -176,7 +194,7 @@ inline void replace_file_chunks(const std::string &file,
   }
   store()[file].replica_count = replica_count;
   store()[file].chunks = std::move(chunks);
-  persist_locked();
+  transaction.commit();
 }
 
 inline FileRecord get_chunks(const std::string &file) {
@@ -189,8 +207,9 @@ inline FileRecord get_chunks(const std::string &file) {
 
 inline void remove_file(const std::string &file) {
   std::lock_guard<std::mutex> lock(store_mutex());
+  StoreTransaction transaction;
   store().erase(file);
-  persist_locked();
+  transaction.commit();
 }
 
 inline std::vector<std::string> list_files_snapshot() {
@@ -208,6 +227,7 @@ inline bool atomic_replace_server_chunks(
     const std::map<std::string, std::vector<ChunkRecord>>
         &file_chunks_to_update) {
   std::lock_guard<std::mutex> lock(store_mutex());
+  StoreTransaction transaction;
   for (const auto &[filename, new_chunks] : file_chunks_to_update) {
     auto it = store().find(filename);
     if (it == store().end())
@@ -237,12 +257,13 @@ inline bool atomic_replace_server_chunks(
       it->second.replica_count = cid_counts.begin()->second;
     }
   }
-  persist_locked();
+  transaction.commit();
   return true;
 }
 
 inline void delete_server_metadata(const std::string &server_address) {
   std::lock_guard<std::mutex> lock(store_mutex());
+  StoreTransaction transaction;
   for (auto &[filename, file_rec] : store()) {
     file_rec.chunks.erase(
         std::remove_if(file_rec.chunks.begin(), file_rec.chunks.end(),
@@ -258,7 +279,7 @@ inline void delete_server_metadata(const std::string &server_address) {
       cr.replica_count = cid_counts[cr.chunk_id];
     }
   }
-  persist_locked();
+  transaction.commit();
 }
 #endif
 } // namespace metadata_store

@@ -1,16 +1,16 @@
 # Distributed File Grid
 
-A high-performance, fault-tolerant distributed file storage grid in modern **C++20**. Files are chunked into 64 MB blocks, replicated across storage nodes, and reassembled on demand with cryptographic integrity verification, consensus voting, and read-repair.
+A distributed file storage project in **C++20**. Files are chunked into 64 MB blocks, replicated across storage nodes, and reassembled with SHA-256 integrity verification. See the implementation limits below before relying on its coordination or failover behavior.
 
 ---
 
 ## What It Does
 
 - **Chunking & Replication**: Splits files into configurable chunks (default: 64 MB), replicates each chunk across $N$ storage nodes (default: 3), and computes SHA-256 digests for end-to-end data integrity.
-- **Consensus & Read Repair**: File downloads query chunk hashes across replicas, vote on consensus hashes, and automatically trigger background read-repairs if an out-of-sync or corrupted chunk is detected.
+- **Replica Verification**: Downloads compare chunk hashes across available replicas, select a matching replica, and verify both chunk and full-file checksums. Detected corruption fails the download; automatic repair during reads is not currently implemented.
 - **Dynamic Cluster Membership**: Cluster storage servers self-register dynamically with the Head Server's Control API (`:9670`).
 - **Heartbeat & System Monitoring**: Storage nodes emit real-time system metrics (CPU, RAM, Disk, Network) to the Health Checker.
-- **High Availability & Leader Election**: Integrated in-memory ZooKeeper client enables leader election and head server failover.
+- **Coordination Experiments**: The ZooKeeper-shaped adapter is an in-process simulation. It does not connect to an external ensemble or provide coordination between processes.
 - **Observability**: Exposes native Prometheus metrics across all nodes and provides pre-configured Grafana dashboards with Loki log aggregation.
 
 ---
@@ -176,7 +176,7 @@ implementation files in `src/`. Executable entry points live in `src/main.cpp`.
 |---|---|
 | `src/common` | Networking, configuration, hashing, health tracking, and the in-process ZooKeeper adapter |
 | `src/metadata` | Shared metadata API with on-disk and optional Redis backends |
-| `src/head_server` | Head service startup, upload placement, downloads, and replica repair |
+| `src/head_server` | Request dispatch, head service startup, upload placement, downloads, and replica repair |
 | `src/cluster_server` | Storage service, chunk transfer, and metrics |
 | `src/health_checker` | Heartbeat monitoring and health dashboard |
 | `src/zk_monitor` | Coordination monitor |
@@ -272,7 +272,7 @@ The dedicated client CLI (`client`, symlinked as `dfg_client`) handles all clien
 ./build/client upload <local-file-path> [remote-grid-name]
 # Example: ./build/client upload document.pdf my_doc.pdf
 
-# Download a file (queries replicas, consensus hash voting, read repair, assembly)
+# Download a file (replica hash voting, checksum verification, assembly)
 ./build/client download <remote-grid-name> [output-file-path]
 # Example: ./build/client download my_doc.pdf /tmp/restored_doc.pdf
 
@@ -310,7 +310,7 @@ The client and head server communicate over a deterministic line-delimited and b
 2. **Download Protocol**:
    - Client sends `DOWNLOAD <filename>\n`.
    - Server queries metadata and returns `FILE_HASH <sha256_digest>\n` and `CHUNKS <num_chunks>\n`.
-   - Server validates replica hash consensus, initiates repairs when needed, and returns `CHUNK_LOC <order_id> <ip> <public_port> <chunk_sha256>\n` entries followed by the file hash and `EOF\n`.
+   - Server compares replica hashes and returns `CHUNK_LOC <order_id> <ip> <public_port> <chunk_sha256>\n` entries followed by the file hash and `EOF\n`.
    - Client fetches chunks in parallel from the storage nodes using `GET_CHUNK <order_id> <filename>\n`; each node returns `CHUNK_SIZE <bytes>\n` followed by the binary payload.
    - **Per-Chunk Verification**: Client verifies each chunk's SHA-256 checksum.
    - **Full-File Verification**: After assembly, the client verifies the reconstructed file's SHA-256 digest against the server digest.
@@ -319,12 +319,37 @@ The client and head server communicate over a deterministic line-delimited and b
 
 ## High-Availability & Self-Healing
 
-### ZooKeeper + Head Server Health Consensus
-The Head Server and ZooKeeper collaborate to verify cluster server liveness:
-1. **Heartbeat Monitoring**: Cluster nodes send UDP heartbeats to the Health Checker. If heartbeats stop for $T > 10\text{s}$, the Head Server initiates a health vote.
-2. **ZooKeeper Verification**: Before declaring a node dead, the Head Server queries the ZooKeeper ensemble (`/dfg/cluster_servers`) to verify whether the node's ephemeral registration has expired.
-3. **Consensus Trigger**: Only when both UDP monitoring and ZooKeeper confirm the failure is the node marked as `DEAD`.
-4. **Auto-Replication**: The Head Server locates all chunks hosted on the dead server and initiates automated re-replication to surviving healthy storage servers to maintain replication factor $N$.
+### Coordination and Failover Limits
+
+Storage nodes report heartbeats, and the head server contains failure-detection
+and re-replication routines. The current `ZooKeeperClient` stores nodes in memory
+inside each process. Configuring `zookeeper.hosts` does not turn it into a real
+ZooKeeper client. Cross-process leader election and coordinated multi-head
+failover are therefore not provided by this implementation.
+
+The test suite verifies file operations with a single head server, storage
+restarts, replica loss, malformed requests, and failed writes. It does not prove
+production high availability. Services currently assume a trusted network;
+authentication and transport encryption are not implemented.
+
+### File Operation Rules
+
+- Uploads create a new remote name. Delete an existing file before uploading a
+  replacement. Requests for the same name are serialized within the head process.
+- Remote names contain at most 200 bytes, with no whitespace, control characters,
+  path separators, or `|`. They are names rather than filesystem paths.
+- Uploads must supply contiguous chunk IDs starting at zero, the declared total
+  size, valid SHA-256 digests, and an `EOF` terminator. Each chunk is limited to
+  256 MiB; the standard client uses 64 MiB chunks.
+- Downloads fetch at most four chunks at a time. They write a temporary file
+  beside the destination and replace it only after complete integrity checks and
+  a successful write. A failed download preserves the previous destination.
+- On-disk metadata is replaced atomically. If persistence fails, the in-memory
+  update is rolled back and the operation reports an error. Storage nodes rebuild
+  their chunk index from saved files after restart.
+- Failed or interrupted uploads can leave unreferenced chunk files. Automatic
+  garbage collection and a transaction spanning all storage nodes are not
+  implemented.
 
 ### Redis Metadata Backend Improvements
 - **Connection Pooling**: `sw::redis::Redis` connection pool is reused across calls, avoiding socket churn.
@@ -372,7 +397,7 @@ The project includes an end-to-end integration test runner [`e2e/e2e_test.sh`](e
   ```bash
   ./e2e/e2e_test.sh
   ```
-  Runs 8 end-to-end verification tests covering small and multi-MB file upload/download, SHA-256 validation, client streaming, HTTP Control API, Prometheus metrics, and replica fault tolerance with read repair.
+  Runs 8 end-to-end verification tests covering small and multi-MB file upload/download, SHA-256 validation, client streaming, HTTP Control API, Prometheus metrics, and downloads after replica loss.
 
 - **Full Containerized Grid Emulation (`--system-test`)** *(Work in Progress)*:
   ```bash

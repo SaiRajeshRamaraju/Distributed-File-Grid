@@ -5,14 +5,17 @@
 
 #include <algorithm>
 #include <atomic>
+#include <climits>
 #include <dfg/async_net.hpp>
 #include <dfg/config_loader.hpp>
 #include <dfg/health_monitor.hpp>
 #include <dfg/metadata/store.hpp>
 #include <dfg/net_utils.hpp>
+#include <dfg/protocol.hpp>
 #include <dfg/server_registry.hpp>
 #include <dfg/sha256.hpp>
 #include <dfg/thread_pool.hpp>
+#include <dfg/unique_fd.hpp>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
@@ -21,6 +24,7 @@
 #include <iomanip>
 #include <iostream>
 #include <random>
+#include <set>
 #include <sstream>
 #include <string>
 #include <sys/uio.h>
@@ -68,19 +72,13 @@ static dfg::ThreadPool &transfer_pool() {
 
 class FileChunker {
 private:
-  std::vector<std::string> cluster_servers;
-
-  void load_cluster_servers() {
-    if (!cluster_servers.empty())
-      return;
-    auto entries = head_server_config().get_cluster_servers();
-    for (const auto &e : entries) {
-      cluster_servers.push_back(e.host + ":" + std::to_string(e.port));
-    }
-    // Fallback defaults if config was not loaded
-    if (cluster_servers.empty()) {
-      cluster_servers = {"127.0.0.1:8080", "127.0.0.1:8081", "127.0.0.1:8082"};
-    }
+  static std::vector<std::string> configured_servers() {
+    std::vector<std::string> servers;
+    for (const auto &entry : head_server_config().get_cluster_servers())
+      servers.push_back(entry.host + ":" + std::to_string(entry.port));
+    if (servers.empty())
+      servers = {"127.0.0.1:8080", "127.0.0.1:8081", "127.0.0.1:8082"};
+    return servers;
   }
 
   std::string calculate_checksum(const std::vector<char> &data) {
@@ -88,14 +86,13 @@ private:
   }
 
   std::vector<std::string> select_servers_for_chunk(int replication_factor) {
-    load_cluster_servers();
 
     std::vector<std::string> servers_copy;
     if (g_cluster_registry) {
       servers_copy = g_cluster_registry->get_addresses();
     }
     if (servers_copy.empty()) {
-      servers_copy = cluster_servers;
+      servers_copy = configured_servers();
     }
 
     std::vector<std::string> selected;
@@ -174,6 +171,7 @@ private:
     }
 
     int sock = dfg::net::connect_with_timeout(ip, transfer_port);
+    dfg::UniqueFd connection(sock);
     if (sock < 0) {
       std::cerr << "Connection failed to transfer port " << ip << ":"
                 << transfer_port << std::endl;
@@ -197,7 +195,7 @@ private:
         !dfg::net::send_all(sock, &len, sizeof(len)) ||
         !dfg::net::send_all(sock, serialized.data(), serialized.size())) {
       std::cerr << "Failed to send chunk data to " << server << std::endl;
-      ::close(sock);
+      connection.reset();
       return false;
     }
 
@@ -205,15 +203,17 @@ private:
     if (!dfg::net::recv_all(sock, &resp_len_net, sizeof(resp_len_net))) {
       std::cerr << "Failed to receive response length from " << server
                 << std::endl;
-      ::close(sock);
+      connection.reset();
       return false;
     }
 
     uint32_t resp_len = ntohl(resp_len_net);
+    if (resp_len == 0 || resp_len > dfg::protocol::max_message_bytes)
+      throw std::runtime_error("Invalid chunk response length");
     std::vector<char> resp_buf(resp_len);
 
     if (!dfg::net::recv_all(sock, resp_buf.data(), resp_len)) {
-      ::close(sock);
+      connection.reset();
       return false;
     }
 
@@ -221,12 +221,12 @@ private:
     if (!resp.ParseFromArray(resp_buf.data(), resp_len) || !resp.success()) {
       std::cerr << "Server rejected chunk: " << resp.error_message()
                 << std::endl;
-      ::close(sock);
+      connection.reset();
       return false;
     }
 
     out_file_path = resp.file_path();
-    ::close(sock);
+    connection.reset();
     return true;
   }
 
@@ -310,7 +310,6 @@ public:
                               const std::string &filename,
                               const std::string &checksum,
                               std::vector<PendingTransfer> &pending) {
-    load_cluster_servers();
     int replication_factor = config_replication_factor();
     auto selected_servers = select_servers_for_chunk(replication_factor);
 
@@ -406,53 +405,75 @@ void handle_client_upload(int fd, const std::string &initial_req) {
   size_t file_size = 0;
   size_t num_chunks = 0;
 
-  if (tokens.size() >= 5 && tokens[0] == "UPLOAD") {
-    filename = tokens[1];
-    file_size = std::stoull(tokens[2]);
-    num_chunks = std::stoull(tokens[3]);
-    file_hash = tokens[4];
-  } else if (tokens.size() == 4 && tokens[0] == "UPLOAD") {
-    filename = tokens[1];
-    file_size = std::stoull(tokens[2]);
-    file_hash = tokens[3];
-    num_chunks = (file_size == 0) ? 0
-                                  : (file_size + config_chunk_size() - 1) /
-                                        config_chunk_size();
+  auto reject = [fd](const std::string &message) {
+    const std::string response = "ERROR: " + message + "\n";
+    dfg::net::send_all(fd, response.data(), response.size());
+  };
+  uint64_t declared_size = 0, declared_chunks = 0;
+  if ((tokens.size() != 4 && tokens.size() != 5) || tokens[0] != "UPLOAD" ||
+      !dfg::protocol::valid_name(tokens[1]) ||
+      !dfg::protocol::parse_size(tokens[2], declared_size)) {
+    reject("Invalid upload header");
+    return;
+  }
+  filename = tokens[1];
+  file_size = declared_size;
+  file_hash = tokens.back();
+  if (tokens.size() == 5) {
+    if (!dfg::protocol::parse_size(tokens[3], declared_chunks)) {
+      reject("Invalid chunk count");
+      return;
+    }
   } else {
-    std::string err = "ERROR: Invalid upload request format. Expected: UPLOAD "
-                      "<filename> <size> [chunks] <sha256>\n";
-    ::send(fd, err.data(), err.size(), 0);
+    const size_t chunk_size = config_chunk_size();
+    if (chunk_size == 0 || chunk_size > dfg::protocol::max_chunk_bytes) {
+      reject("Invalid configured chunk size");
+      return;
+    }
+    declared_chunks = file_size / chunk_size + (file_size % chunk_size != 0);
+  }
+  if (!dfg::protocol::valid_digest(file_hash) ||
+      (file_size == 0 && declared_chunks != 0) ||
+      (file_size > 0 && (declared_chunks == 0 || declared_chunks > file_size ||
+                         declared_chunks > static_cast<uint64_t>(INT_MAX)))) {
+    reject("Invalid hash, file size, or chunk count");
+    return;
+  }
+  num_chunks = declared_chunks;
+  if (file_size == 0 && file_hash != dfg::hash::sha256("")) {
+    reject("Empty file checksum mismatch");
+    return;
+  }
+
+  const auto existing = query_metadata(filename);
+  if (!existing.file_hash.empty() || !existing.chunks.empty()) {
+    reject(
+        "Remote file already exists; delete it before uploading a replacement");
     return;
   }
 
   // Acknowledge ready to receive file data
   std::string ready_msg = "READY\n";
-  if (::send(fd, ready_msg.data(), ready_msg.size(), 0) < 0) {
+  if (!dfg::net::send_all(fd, ready_msg.data(), ready_msg.size())) {
     std::cerr << "Failed to send READY to client" << std::endl;
     return;
   }
 
   if (file_size == 0) {
+    std::string terminator;
+    if (!dfg::net::recv_line(fd, terminator) || terminator != "EOF") {
+      reject("Expected EOF after empty upload");
+      return;
+    }
     std::string empty_hash =
         !file_hash.empty() ? file_hash : dfg::hash::sha256("");
     g_file_chunker.store_metadata(filename, {}, empty_hash);
     std::string ok_msg = "SUCCESS\n";
-    ::send(fd, ok_msg.data(), ok_msg.size(), 0);
+    dfg::net::send_all(fd, ok_msg.data(), ok_msg.size());
     std::cout << "Successfully processed 0-byte client upload for file: "
               << filename << std::endl;
     return;
   }
-
-  auto read_line = [&](int sock_fd) -> std::string {
-    std::string line;
-    char c;
-    while (::recv(sock_fd, &c, 1, 0) == 1) {
-      if (c == '\n')
-        break;
-      line += c;
-    }
-    return line;
-  };
 
   std::cout << "Handling upload for: " << filename << " (" << file_size
             << " bytes, " << num_chunks << " chunks)" << std::endl;
@@ -463,8 +484,8 @@ void handle_client_upload(int fd, const std::string &initial_req) {
   size_t total_bytes_received = 0;
 
   while (chunks_received < num_chunks) {
-    std::string line = read_line(fd);
-    if (line.empty()) {
+    std::string line;
+    if (!dfg::net::recv_line(fd, line)) {
       std::cerr << "Client disconnected prematurely while waiting for chunk "
                 << chunks_received << std::endl;
       return;
@@ -474,11 +495,20 @@ void handle_client_upload(int fd, const std::string &initial_req) {
       int chunk_id = 0;
       size_t chunk_size = 0;
       std::string client_chunk_hash;
-      if (!(ch_iss >> chunk_id >> chunk_size >> client_chunk_hash)) {
-        std::string err = "ERROR: Malformed CHUNK header: " + line + "\n";
-        ::send(fd, err.data(), err.size(), 0);
+      std::string id_text, size_text, extra;
+      uint64_t parsed_id = 0, parsed_size = 0;
+      if (!(ch_iss >> id_text >> size_text >> client_chunk_hash) ||
+          (ch_iss >> extra) || !dfg::protocol::parse_size(id_text, parsed_id) ||
+          !dfg::protocol::parse_size(size_text, parsed_size) ||
+          parsed_id != chunks_received || parsed_size == 0 ||
+          parsed_size > dfg::protocol::max_chunk_bytes ||
+          parsed_size > file_size - total_bytes_received ||
+          !dfg::protocol::valid_digest(client_chunk_hash)) {
+        reject("Invalid chunk header, order, or size");
         return;
       }
+      chunk_id = static_cast<int>(parsed_id);
+      chunk_size = parsed_size;
 
       auto chunk_data = std::make_shared<std::vector<char>>(chunk_size);
       size_t received = 0;
@@ -502,7 +532,7 @@ void handle_client_upload(int fd, const std::string &initial_req) {
                   << std::endl;
         std::string err = "ERROR: Chunk checksum mismatch for chunk " +
                           std::to_string(chunk_id) + "\n";
-        ::send(fd, err.data(), err.size(), 0);
+        dfg::net::send_all(fd, err.data(), err.size());
         return;
       }
 
@@ -518,9 +548,20 @@ void handle_client_upload(int fd, const std::string &initial_req) {
     } else {
       std::cerr << "Unexpected line from client: " << line << std::endl;
       std::string err = "ERROR: Expected CHUNK header, got: " + line + "\n";
-      ::send(fd, err.data(), err.size(), 0);
+      dfg::net::send_all(fd, err.data(), err.size());
       return;
     }
+  }
+
+  if (chunks_received != num_chunks || total_bytes_received != file_size) {
+    reject("Upload size or chunk count does not match the header");
+    return;
+  }
+
+  std::string terminator;
+  if (!dfg::net::recv_line(fd, terminator) || terminator != "EOF") {
+    reject("Expected EOF after the declared chunks");
+    return;
   }
 
   // Wait for all chunk replica transfers to finish across cluster servers
@@ -533,20 +574,23 @@ void handle_client_upload(int fd, const std::string &initial_req) {
               << computed_file_hash << ", expected " << file_hash << ")"
               << std::endl;
     std::string err = "ERROR: SHA256 checksum mismatch\n";
-    ::send(fd, err.data(), err.size(), 0);
+    dfg::net::send_all(fd, err.data(), err.size());
     return;
   }
 
-  if (chunks.empty() && file_size > 0) {
+  std::set<int> stored_chunk_ids;
+  for (const auto &chunk : chunks)
+    stored_chunk_ids.insert(chunk.chunk_id);
+  if (stored_chunk_ids.size() != num_chunks) {
     std::string err =
         "ERROR: Failed to store chunk replicas across cluster servers\n";
-    ::send(fd, err.data(), err.size(), 0);
+    dfg::net::send_all(fd, err.data(), err.size());
     return;
   }
 
   g_file_chunker.store_metadata(filename, chunks, computed_file_hash);
   std::string ok_msg = "SUCCESS\n";
-  ::send(fd, ok_msg.data(), ok_msg.size(), 0);
+  dfg::net::send_all(fd, ok_msg.data(), ok_msg.size());
   std::cout << "Successfully processed client upload for file: " << filename
             << " (" << chunks_received << " chunks, " << total_bytes_received
             << " bytes)" << std::endl;

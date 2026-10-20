@@ -67,7 +67,7 @@ resolve_server_target(const argparse::ArgumentParser &sub_cmd,
   return {ip, port};
 }
 
-int main(int argc, char *argv[]) {
+static int run_client_cli(int argc, char *argv[]) {
   argparse::ArgumentParser program("client", APP_VERSION);
   program.add_description(
       "Distributed File Grid — Client CLI for file lifecycle operations");
@@ -301,4 +301,13 @@ int main(int argc, char *argv[]) {
   std::cerr << "Error: No command or operation flag specified.\n" << std::endl;
   std::cerr << program << std::endl;
   return 1;
+}
+
+int main(int argc, char *argv[]) {
+  try {
+    return run_client_cli(argc, argv);
+  } catch (const std::exception &error) {
+    std::cerr << "Client error: " << error.what() << std::endl;
+    return 1;
+  }
 }

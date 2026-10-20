@@ -1,3 +1,6 @@
+#include <cctype>
+#include <climits>
+#include <dfg/protocol.hpp>
 #pragma once
 // HTTP Control API
 // Lightweight HTTP API for runtime server management.
@@ -93,27 +96,78 @@ private:
         ::close(cfd);
         break;
       }
-      handle_request(cfd);
+      timeval timeout{5, 0};
+      ::setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+      ::setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+      try {
+        handle_request(cfd);
+      } catch (const std::exception &error) {
+        std::cerr << "Control API request failed: " << error.what()
+                  << std::endl;
+        const auto response =
+            make_response(400, "{\"error\":\"Invalid request\"}");
+        dfg::net::send_all(cfd, response.data(), response.size());
+      }
       ::close(cfd);
     }
     ::close(lfd);
   }
 
   void handle_request(int cfd) {
-    char buf[4096] = {};
-    ssize_t n = ::recv(cfd, buf, sizeof(buf) - 1, 0);
-    if (n <= 0)
+    auto bad_request = [cfd]() {
+      const auto response =
+          make_response(400, "{\"error\":\"Invalid HTTP request\"}");
+      dfg::net::send_all(cfd, response.data(), response.size());
+    };
+    std::string line, method, path, version, extra;
+    if (!dfg::net::recv_line(cfd, line))
       return;
-
-    std::string request(buf, n);
-    std::string method, path;
-    std::istringstream iss(request);
-    iss >> method >> path;
-
-    std::string body;
-    auto body_start = request.find("\r\n\r\n");
-    if (body_start != std::string::npos) {
-      body = request.substr(body_start + 4);
+    std::istringstream request_line(line);
+    if (!(request_line >> method >> path >> version) ||
+        (request_line >> extra) ||
+        (version != "HTTP/1.1" && version != "HTTP/1.0")) {
+      bad_request();
+      return;
+    }
+    uint64_t content_length = 0;
+    bool has_length = false;
+    size_t header_bytes = line.size();
+    for (;;) {
+      if (!dfg::net::recv_line(cfd, line) ||
+          (header_bytes += line.size()) > 16384) {
+        bad_request();
+        return;
+      }
+      if (line.empty())
+        break;
+      auto separator = line.find(':');
+      if (separator == std::string::npos) {
+        bad_request();
+        return;
+      }
+      std::string key = line.substr(0, separator);
+      std::transform(key.begin(), key.end(), key.begin(),
+                     [](unsigned char c) { return std::tolower(c); });
+      auto value = line.substr(separator + 1);
+      auto first = value.find_first_not_of(" \t");
+      value = first == std::string::npos ? "" : value.substr(first);
+      value.erase(value.find_last_not_of(" \t") + 1);
+      if (key == "content-length") {
+        if (has_length || !dfg::protocol::parse_size(value, content_length) ||
+            content_length > 65536) {
+          bad_request();
+          return;
+        }
+        has_length = true;
+      } else if (key == "transfer-encoding") {
+        bad_request();
+        return;
+      }
+    }
+    std::string body(content_length, '\0');
+    if (!dfg::net::recv_all(cfd, body.data(), body.size())) {
+      bad_request();
+      return;
     }
 
     std::string response;
@@ -122,7 +176,7 @@ private:
       response = handle_list_servers();
     } else if (method == "GET" && path.find("/api/v1/servers/cluster/") == 0 &&
                path.find("/health") != std::string::npos) {
-      size_t start = 23;
+      size_t start = std::string("/api/v1/servers/cluster/").size();
       size_t end = path.find("/health");
       std::string id_str = path.substr(start, end - start);
       response = handle_server_health(id_str);
@@ -130,7 +184,8 @@ private:
       response = handle_add_server(body);
     } else if (method == "DELETE" &&
                path.find("/api/v1/servers/cluster/") == 0) {
-      std::string id_str = path.substr(23);
+      std::string id_str =
+          path.substr(std::string("/api/v1/servers/cluster/").size());
       response = handle_remove_server(id_str);
     } else if (method == "GET" && path == "/api/v1/status") {
       response = handle_status();
@@ -153,12 +208,16 @@ private:
       response = make_response(404, "{\"error\":\"Not found\"}");
     }
 
-    ::send(cfd, response.data(), response.size(), 0);
+    dfg::net::send_all(cfd, response.data(), response.size());
   }
 
   std::string handle_server_health(const std::string &id_str) {
     try {
-      int id = std::stoi(id_str);
+      uint64_t parsed_id = 0;
+      if (!dfg::protocol::parse_size(id_str, parsed_id) || parsed_id == 0 ||
+          parsed_id > INT_MAX)
+        throw std::invalid_argument("Invalid server ID");
+      int id = static_cast<int>(parsed_id);
       auto health_map = health_.get_all_health();
       auto it = health_map.find(id);
       if (it == health_map.end()) {
@@ -227,7 +286,11 @@ private:
 
   std::string handle_remove_server(const std::string &id_str) {
     try {
-      int id = std::stoi(id_str);
+      uint64_t parsed_id = 0;
+      if (!dfg::protocol::parse_size(id_str, parsed_id) || parsed_id == 0 ||
+          parsed_id > INT_MAX)
+        throw std::invalid_argument("Invalid server ID");
+      int id = static_cast<int>(parsed_id);
       if (registry_.remove_server(id)) {
         health_.deregister_server(id);
         return make_response(
@@ -271,7 +334,11 @@ private:
 
   std::string handle_restart_cluster_node(const std::string &id_str) {
     try {
-      int id = std::stoi(id_str);
+      uint64_t parsed_id = 0;
+      if (!dfg::protocol::parse_size(id_str, parsed_id) || parsed_id == 0 ||
+          parsed_id > INT_MAX)
+        throw std::invalid_argument("Invalid server ID");
+      int id = static_cast<int>(parsed_id);
       auto servers = registry_.get_all();
       for (const auto &s : servers) {
         if (s.id == id) {

@@ -10,13 +10,23 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <string>
-#include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
 
 namespace dfg::net {
+
+/// Wait without fd_set's descriptor limit. EINTR is not a socket failure.
+inline bool wait_for_socket(int fd, short events, int timeout_ms) {
+  pollfd descriptor{fd, events, 0};
+  int result;
+  do {
+    result = ::poll(&descriptor, 1, timeout_ms);
+  } while (result < 0 && errno == EINTR);
+  return result > 0 && !(descriptor.revents & POLLNVAL);
+}
 
 /// Drain an entire buffer over a non-blocking socket.
 /// Returns true only if all `len` bytes were sent.
@@ -30,12 +40,7 @@ inline bool send_all(int sock, const void *buf, size_t len) {
     } else if (n < 0 && errno == EINTR) {
       continue;
     } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-      fd_set wfds;
-      FD_ZERO(&wfds);
-      FD_SET(sock, &wfds);
-      struct timeval tv = {10, 0};
-      int rc = ::select(sock + 1, nullptr, &wfds, nullptr, &tv);
-      if (rc <= 0)
+      if (!wait_for_socket(sock, POLLOUT, 10000))
         return false;
     } else {
       return false;
@@ -58,12 +63,7 @@ inline bool recv_all(int sock, void *buf, size_t len) {
     } else if (errno == EINTR) {
       continue;
     } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-      fd_set rfds;
-      FD_ZERO(&rfds);
-      FD_SET(sock, &rfds);
-      struct timeval tv = {10, 0};
-      int rc = ::select(sock + 1, &rfds, nullptr, nullptr, &tv);
-      if (rc <= 0)
+      if (!wait_for_socket(sock, POLLIN, 10000))
         return false;
     } else {
       return false;
@@ -92,58 +92,45 @@ inline bool recv_line(int sock, std::string &line, size_t max_length = 4096) {
 
 /// Non-blocking connect with timeout (seconds).
 /// Returns socket fd on success, -1 on failure.
-inline int connect_with_timeout(const std::string &ip, int port,
+inline int connect_with_timeout(const std::string &host, int port,
                                 int timeout_sec = 5) {
-  int sock = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-  if (sock < 0)
+  if (port < 1 || port > 65535 || timeout_sec <= 0)
     return -1;
-
-  struct sockaddr_in serv_addr{};
-  serv_addr.sin_family = AF_INET;
-  serv_addr.sin_port = htons(port);
-  if (::inet_pton(AF_INET, ip.c_str(), &serv_addr.sin_addr) <= 0) {
-    struct hostent *he = ::gethostbyname(ip.c_str());
-    if (!he || he->h_addrtype != AF_INET) {
-      ::close(sock);
-      return -1;
-    }
-    std::memcpy(&serv_addr.sin_addr, he->h_addr_list[0],
-                sizeof(struct in_addr));
-  }
-
-  int rc = ::connect(sock, reinterpret_cast<sockaddr *>(&serv_addr),
-                     sizeof(serv_addr));
-  if (rc < 0) {
-    if (errno == EINPROGRESS) {
-      fd_set wfds;
-      FD_ZERO(&wfds);
-      FD_SET(sock, &wfds);
-      struct timeval tv = {timeout_sec, 0};
-      rc = ::select(sock + 1, nullptr, &wfds, nullptr, &tv);
-      if (rc <= 0) {
-        ::close(sock);
-        return -1;
+  addrinfo hints{};
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  addrinfo *addresses = nullptr;
+  const std::string service = std::to_string(port);
+  if (::getaddrinfo(host.c_str(), service.c_str(), &hints, &addresses) != 0)
+    return -1;
+  int connected = -1;
+  for (auto *address = addresses; address; address = address->ai_next) {
+    int sock = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (sock < 0)
+      continue;
+    int status = ::connect(sock, address->ai_addr, address->ai_addrlen);
+    bool ready =
+        status == 0 || (errno == EINPROGRESS &&
+                        wait_for_socket(sock, POLLOUT, timeout_sec * 1000));
+    int error = 0;
+    socklen_t size = sizeof(error);
+    if (ready && ::getsockopt(sock, SOL_SOCKET, SO_ERROR, &error, &size) == 0 &&
+        error == 0) {
+      int flags = ::fcntl(sock, F_GETFL, 0);
+      timeval timeout{timeout_sec, 0};
+      if (flags >= 0 && ::fcntl(sock, F_SETFL, flags & ~O_NONBLOCK) == 0 &&
+          ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                       sizeof(timeout)) == 0 &&
+          ::setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout,
+                       sizeof(timeout)) == 0) {
+        connected = sock;
+        break;
       }
-      int err = 0;
-      socklen_t len = sizeof(err);
-      if (::getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len) < 0 ||
-          err != 0) {
-        ::close(sock);
-        return -1;
-      }
-    } else {
-      ::close(sock);
-      return -1;
     }
+    ::close(sock);
   }
-
-  // Restore blocking mode so callers have a standard connected stream socket
-  int flags = ::fcntl(sock, F_GETFL, 0);
-  if (flags >= 0) {
-    ::fcntl(sock, F_SETFL, flags & ~O_NONBLOCK);
-  }
-
-  return sock;
+  ::freeaddrinfo(addresses);
+  return connected;
 }
 
 /// Parse "host:port" into separate ip string and port int.

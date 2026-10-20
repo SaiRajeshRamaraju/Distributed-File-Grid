@@ -1,4 +1,5 @@
 add_library(dfg_head_server STATIC
+    src/client_request.cpp
     src/head_server.cpp
     src/file_upload.cpp
     src/file_download.cpp

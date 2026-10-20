@@ -195,3 +195,18 @@ TEST_F(MetadataReplicationTest, EmergencyTcpDeadSignal) {
     server_thread.join();
     EXPECT_TRUE(received_dead);
 }
+
+#ifndef WITH_REDIS
+TEST_F(MetadataReplicationTest, FailedPersistenceRollsBackTheCachedEntry) {
+    create_entry("original.bin\nHASH=original\nREPLICAS=0\n");
+    const std::string invalid_path = db_file_ + ".directory";
+    std::filesystem::create_directory(invalid_path);
+    setenv("DFG_METADATA_DB", invalid_path.c_str(), 1);
+    EXPECT_THROW(create_entry("new.bin\nHASH=new\nREPLICAS=0\n"), std::exception);
+    EXPECT_THROW(delete_entry("original.bin"), std::exception);
+    EXPECT_EQ(query_metadata("original.bin").file_hash, "original");
+    EXPECT_TRUE(query_metadata("new.bin").file_hash.empty());
+    setenv("DFG_METADATA_DB", db_file_.c_str(), 1);
+    std::filesystem::remove(invalid_path);
+}
+#endif

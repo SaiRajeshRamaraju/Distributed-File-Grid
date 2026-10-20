@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import struct
 import subprocess
 import tempfile
 import time
@@ -184,6 +185,130 @@ class ClusterIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 1)
         self.assertIn("Error:", result.stderr)
+
+    def test_existing_remote_file_cannot_be_overwritten_by_an_upload(self):
+        source = self.root / "original.source"
+        source.write_bytes(b"original")
+        self.client("upload", source, "preserved.bin")
+        source.write_bytes(b"replacement")
+        result = self.client("upload", source, "preserved.bin", succeeds=False)
+        self.assertIn("already exists", result.stderr)
+        output = self.root / "preserved.download"
+        self.client("download", "preserved.bin", output)
+        self.assertEqual(output.read_bytes(), b"original")
+
+    def test_concurrent_uploads_to_one_name_commit_only_one_file(self):
+        processes = []
+        payloads = [b"first upload", b"second upload"]
+        for index, payload in enumerate(payloads):
+            source = self.root / f"concurrent-{index}.source"
+            source.write_bytes(payload)
+            processes.append(subprocess.Popen(
+                [str(BUILD_DIR / "client"), "upload", str(source), "concurrent.bin"],
+                cwd=self.root, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            ))
+        try:
+            for process in processes:
+                process.communicate(timeout=20)
+            self.assertEqual(sorted(process.returncode for process in processes), [0, 1])
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+        output = self.root / "concurrent.download"
+        self.client("download", "concurrent.bin", output)
+        self.assertIn(output.read_bytes(), payloads)
+
+    def test_delete_empty_and_replicated_files(self):
+        for name, payload in [("delete-empty.bin", b""), ("delete-data.bin", b"delete me")]:
+            with self.subTest(name=name):
+                source = self.root / (name + ".source")
+                source.write_bytes(payload)
+                self.client("upload", source, name)
+                if payload:
+                    # A previous partial deletion must not make a retry fail.
+                    with socket.create_connection(("127.0.0.1", self.node_ports[0][0]), timeout=5) as sock:
+                        sock.sendall(f"DELETE_CHUNK {name}_chunk_0\n".encode())
+                        self.assertEqual(sock.makefile("rb").readline(), b"SUCCESS\n")
+                self.client("delete", name)
+                self.assertNotIn(name, self.client("list").stdout)
+                for index in range(1, 4):
+                    self.assertEqual(list((self.root / f"node-{index}").glob(f"*{name}*.dat")), [])
+
+    def test_fragmented_storage_control_command(self):
+        with socket.create_connection(("127.0.0.1", self.node_ports[0][0]), timeout=5) as sock:
+            time.sleep(0.1)
+            sock.sendall(b"DELETE_")
+            time.sleep(0.1)
+            sock.sendall(b"CHUNK already-missing_chunk_0\n")
+            self.assertEqual(sock.makefile("rb").readline(), b"SUCCESS\n")
+
+    def test_invalid_uploads_are_rejected_without_stopping_head(self):
+        digest = hashlib.sha256(b"x").hexdigest()
+        cases = [
+            f"UPLOAD invalid.bin nope 1 {digest}\n",
+            f"UPLOAD invalid.bin -1 1 {digest}\n",
+            f"UPLOAD invalid.bin 1 0 {digest}\n",
+            f"UPLOAD invalid.bin 0 0 {digest}\n",
+            f"UPLOAD ../invalid.bin 1 1 {digest}\n",
+        ]
+        for request in cases:
+            with self.subTest(request=request):
+                with socket.create_connection(("127.0.0.1", self.head_port), timeout=5) as sock:
+                    sock.sendall(request.encode())
+                    self.assertTrue(sock.makefile("rb").readline().startswith(b"ERROR:"))
+                self.assertNotIn("invalid.bin", self.client("list").stdout)
+
+    def test_upload_count_order_and_size_must_match(self):
+        digest = hashlib.sha256(b"x").hexdigest()
+        cases = [
+            (2, 1, f"CHUNK 0 1 {digest}\nxEOF\n"),
+            (1, 1, f"CHUNK 1 1 {digest}\nxEOF\n"),
+            (1, 1, "EOF\n"),
+            (1, 1, f"CHUNK 0 -1 {digest}\n"),
+            (268435457, 1, f"CHUNK 0 268435457 {digest}\n"),
+        ]
+        for size, count, body in cases:
+            with self.subTest(size=size, count=count, body=body):
+                with socket.create_connection(("127.0.0.1", self.head_port), timeout=5) as sock:
+                    sock.sendall(f"UPLOAD rejected.bin {size} {count} {digest}\n".encode())
+                    with sock.makefile("rb") as stream:
+                        self.assertEqual(stream.readline(), b"READY\n")
+                        sock.sendall(body.encode())
+                        self.assertTrue(stream.readline().startswith(b"ERROR:"))
+                self.assertNotIn("rejected.bin", self.client("list").stdout)
+
+    def test_oversized_binary_message_does_not_stop_storage(self):
+        with socket.create_connection(("127.0.0.1", self.node_ports[0][1]), timeout=5) as sock:
+            sock.sendall(struct.pack("!II", 1, 0xffffffff))
+            self.assertEqual(sock.recv(1), b"")
+        self.assertEqual(self.nodes[0].poll(), None)
+
+    def test_control_api_ids_and_fragmented_http_body(self):
+        servers = self.api("/api/v1/servers/cluster")["servers"]
+        server_id = servers[0]["id"]
+        # An existing route must parse the numeric ID after the slash.
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{self.control_port}/api/v1/servers/cluster/{server_id}/health", timeout=5
+        ) as response:
+            self.assertEqual(response.status, 200)
+        body = b'{"host":"127.0.0.1","port":65432}'
+        with socket.create_connection(("127.0.0.1", self.control_port), timeout=5) as sock:
+            sock.sendall(("POST /api/v1/servers/cluster HTTP/1.1\r\nHost: localhost\r\n"
+                          f"Content-Length: {len(body)}\r\n\r\n").encode() + body[:10])
+            time.sleep(0.1)
+            sock.sendall(body[10:])
+            with sock.makefile("rb") as stream:
+                response = stream.read()
+        self.assertIn(b"201 Created", response)
+        registered = self.api("/api/v1/servers/cluster")["servers"]
+        added_id = next(node["id"] for node in registered if node["port"] == 65432)
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.control_port}/api/v1/servers/cluster/{added_id}", method="DELETE"
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 200)
 
     def test_missing_file_download_fails(self):
         result = self.client("download", "does-not-exist.bin",

@@ -9,6 +9,18 @@ add_test(NAME CliSmokeTest
 )
 set_tests_properties(CliSmokeTest PROPERTIES LABELS "unit" TIMEOUT 30)
 
+add_test(NAME ClientFailureTest
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/test_client_failures.py
+        --build-dir ${CMAKE_BINARY_DIR}
+)
+set_tests_properties(ClientFailureTest PROPERTIES LABELS "unit" TIMEOUT 60)
+
+add_executable(test_storage unit/test_storage.cpp)
+target_include_directories(test_storage PRIVATE ${CMAKE_SOURCE_DIR}/src/cluster_server/src)
+target_link_libraries(test_storage PRIVATE GTest::GTest GTest::Main dfg_common)
+add_test(NAME StorageTest COMMAND test_storage)
+set_tests_properties(StorageTest PROPERTIES LABELS "unit" TIMEOUT 60)
+
 # ── Unit tests ──
 
 add_executable(test_net_utils unit/test_net_utils.cpp)
@@ -98,6 +110,6 @@ set_tests_properties(ClusterIntegrationTest ClusterUnifiedIntegrationTest PROPER
 add_custom_target(run_tests
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
     DEPENDS test_async_io simple_heartbeat_test test_heartbeat test_metadata_replication
-            test_server_registry test_net_utils test_e2e dfg head_server cluster_server client health_checker zk_head_server_monitor
+            test_server_registry test_net_utils test_storage test_e2e dfg head_server cluster_server client health_checker zk_head_server_monitor
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
 )

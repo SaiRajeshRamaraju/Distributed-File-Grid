@@ -1,5 +1,6 @@
 #include "chunk_service.hpp"
 
+#include "chunk_storage.hpp"
 #include "file_transfer.pb.h"
 #include "metrics_exporter.hpp"
 
@@ -8,9 +9,11 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <dfg/async_net.hpp>
 #include <dfg/config_loader.hpp>
 #include <dfg/net_utils.hpp>
+#include <dfg/protocol.hpp>
 #include <dfg/sha256.hpp>
 #include <dfg/system_info.hpp>
 #include <dfg/thread_pool.hpp>
@@ -68,218 +71,6 @@ template <typename T>
 FutureAwaiter<T> await_future(async_hb::Reactor &r, std::future<T> f) {
   return FutureAwaiter<T>{f.share(), &r};
 }
-
-// Global I/O thread pool (shared by all storage operations)
-inline dfg::ThreadPool &io_pool() {
-  static dfg::ThreadPool pool(4);
-  return pool;
-}
-
-namespace fs = std::filesystem;
-
-// Chunk Storage
-class ChunkStorage {
-private:
-  std::string storage_path = "/var/cluster_storage/";
-  std::unordered_map<std::string, std::string> chunk_registry;
-  std::mutex registry_mutex;
-
-  int ensure_storage_directory() {
-    std::error_code ec;
-    fs::create_directories(storage_path, ec);
-    if (ec || ::access(storage_path.c_str(), W_OK) != 0) {
-      // Fallback to writable temporary storage path
-      storage_path = "/tmp/cluster_storage/";
-      fs::create_directories(storage_path, ec);
-      if (ec || ::access(storage_path.c_str(), W_OK) != 0) {
-        std::cerr << "Failed to create or access storage directory: "
-                  << storage_path << std::endl;
-        return -1;
-      }
-    }
-    return 0;
-  }
-
-  std::string generate_chunk_path(const std::string &chunk_id) {
-    static std::atomic<uint64_t> seq{0};
-    auto now = std::chrono::system_clock::now();
-    auto epoch_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                        now.time_since_epoch())
-                        .count();
-    std::stringstream ss;
-    ss << storage_path << "chunk_" << chunk_id << "_" << epoch_us << "_"
-       << (++seq) << ".dat";
-    return ss.str();
-  }
-
-public:
-  ChunkStorage() {
-    // Honor the configured directory so separate nodes can use isolated
-    // storage.
-    storage_path =
-        cluster_server_config().get_string("storage.chunk_dir", storage_path);
-    if (!storage_path.empty() && storage_path.back() != '/') {
-      storage_path += '/';
-    }
-    int status = ensure_storage_directory();
-    if (status != 0) {
-      throw std::runtime_error("Error creating storage directory");
-    }
-  }
-
-  // Async store: offload to I/O thread pool
-  std::future<std::pair<bool, std::string>>
-  async_store_chunk(const std::string &chunk_id, std::vector<char> data) {
-    // Capture by value so the data lives in the pool thread.
-    auto path = generate_chunk_path(chunk_id);
-    auto *self = this;
-    return io_pool().submit([self, chunk_id, path, data = std::move(data)]()
-                                -> std::pair<bool, std::string> {
-      int fd =
-          ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-      if (fd < 0) {
-        std::cerr << "Failed to create chunk file: " << path << std::endl;
-        return {false, ""};
-      }
-
-      size_t written = 0;
-      while (written < data.size()) {
-        ssize_t n = ::write(fd, data.data() + written, data.size() - written);
-        if (n < 0) {
-          if (errno == EINTR)
-            continue;
-          std::cerr << "Write error for chunk " << chunk_id << ": "
-                    << strerror(errno) << std::endl;
-          ::close(fd);
-          return {false, ""};
-        }
-        written += static_cast<size_t>(n);
-      }
-      ::fdatasync(fd);
-      ::close(fd);
-
-      {
-        std::lock_guard<std::mutex> lock(self->registry_mutex);
-        self->chunk_registry[chunk_id] = path;
-      }
-
-      std::cout << "Async stored chunk " << chunk_id << " (" << data.size()
-                << " bytes) at " << path << std::endl;
-      return {true, path};
-    });
-  }
-
-  // Async retrieve: offload to I/O thread pool
-  std::future<std::vector<char>>
-  async_retrieve_chunk(const std::string &chunk_id,
-                       const std::string &fallback_path = "") {
-    std::string chunk_path;
-    {
-      std::lock_guard<std::mutex> lock(registry_mutex);
-      auto it = chunk_registry.find(chunk_id);
-      if (it != chunk_registry.end()) {
-        chunk_path = it->second;
-      } else if (!fallback_path.empty() && fs::exists(fallback_path)) {
-        chunk_path = fallback_path;
-        chunk_registry[chunk_id] = fallback_path;
-      } else {
-        // Return an immediately-ready future with empty data.
-        std::promise<std::vector<char>> p;
-        p.set_value({});
-        return p.get_future();
-      }
-    }
-
-    return io_pool().submit([chunk_id, chunk_path]() -> std::vector<char> {
-      int fd = ::open(chunk_path.c_str(), O_RDONLY | O_CLOEXEC);
-      if (fd < 0) {
-        std::cerr << "Failed to open chunk file: " << chunk_path << std::endl;
-        return {};
-      }
-
-      off_t file_size = ::lseek(fd, 0, SEEK_END);
-      if (file_size < 0) {
-        std::cerr << "Failed to seek chunk file: " << chunk_path << std::endl;
-        ::close(fd);
-        return {};
-      }
-      ::lseek(fd, 0, SEEK_SET);
-
-      std::vector<char> data(static_cast<size_t>(file_size));
-      size_t total_read = 0;
-      while (total_read < data.size()) {
-        ssize_t n =
-            ::read(fd, data.data() + total_read, data.size() - total_read);
-        if (n < 0) {
-          if (errno == EINTR)
-            continue;
-          ::close(fd);
-          return {};
-        }
-        if (n == 0)
-          break;
-        total_read += static_cast<size_t>(n);
-      }
-      ::close(fd);
-
-      std::cout << "Async retrieved chunk " << chunk_id << " (" << data.size()
-                << " bytes)" << std::endl;
-      return data;
-    });
-  }
-
-  bool delete_chunk(const std::string &chunk_id) {
-    try {
-      std::string chunk_path;
-      {
-        std::lock_guard<std::mutex> lock(registry_mutex);
-        auto it = chunk_registry.find(chunk_id);
-        if (it == chunk_registry.end()) {
-          std::cerr << "Chunk id " << chunk_id
-                    << "not found in chunk registry. Error deleting chunk"
-                    << std::endl;
-          return false;
-        }
-        chunk_path = it->second;
-        chunk_registry.erase(it);
-      }
-
-      fs::remove(chunk_path);
-      std::cout << "Deleted chunk " << chunk_id << std::endl;
-      return true;
-    } catch (const std::exception &e) {
-      std::cerr << "Delete chunk from local registyr. But error deleting chunk "
-                   "in the filesystem "
-                << chunk_id << ": " << e.what() << std::endl;
-      return false;
-    }
-  }
-
-  std::vector<std::string> list_chunks() {
-    std::vector<std::string> chunks;
-    {
-      std::lock_guard<std::mutex> lock(registry_mutex);
-      for (const auto &[chunk_id, path] : chunk_registry) {
-        chunks.push_back(chunk_id);
-      }
-    }
-    return chunks;
-  }
-
-  size_t get_storage_usage() {
-    size_t total_size = 0;
-    try {
-      for (const auto &entry : fs::recursive_directory_iterator(storage_path)) {
-        if (entry.is_regular_file()) {
-          total_size += entry.file_size();
-        }
-      }
-    } catch (const std::exception &e) {
-      std::cerr << "Error calculating storage usage: " << e.what() << std::endl;
-    }
-    return total_size;
-  }
-};
 
 class ClusterServerService {
 private:
@@ -415,8 +206,13 @@ private:
       uint8_t len_bytes[4];
       co_await async_hb::async_read_exact(r, cfd, len_bytes, 4);
 
-      uint32_t type = ntohl(*reinterpret_cast<uint32_t *>(first4));
-      uint32_t len = ntohl(*reinterpret_cast<uint32_t *>(len_bytes));
+      uint32_t type, len;
+      std::memcpy(&type, first4, sizeof(type));
+      std::memcpy(&len, len_bytes, sizeof(len));
+      type = ntohl(type);
+      len = ntohl(len);
+      if (len > dfg::protocol::max_message_bytes)
+        throw std::runtime_error("Chunk message too large");
 
       if (type == 99) { // Framed DEAD emergency command
         std::cout << "\n[Emergency Protocol] Received framed DEAD (type 99) "
@@ -581,6 +377,8 @@ private:
             uint32_t rlen_net;
             if (dfg::net::recv_all(target_sock, &rlen_net, sizeof(rlen_net))) {
               uint32_t rlen = ntohl(rlen_net);
+              if (rlen == 0 || rlen > dfg::protocol::max_message_bytes)
+                throw std::runtime_error("Invalid replication response length");
               std::vector<char> rbuf(rlen);
               if (dfg::net::recv_all(target_sock, rbuf.data(), rlen)) {
                 file_transfer::v1::ChunkResponse c_resp;
@@ -693,6 +491,89 @@ private:
     ::close(lfd);
   }
 
+  async_hb::task handle_control_connection(async_hb::Reactor &reactor,
+                                           int cfd) {
+    try {
+      std::string msg;
+      bool complete = false;
+      while (msg.size() < 1024) {
+        uint8_t byte;
+        co_await async_hb::async_read_exact(reactor, cfd, &byte, 1);
+        if (byte == '\n') {
+          complete = true;
+          break;
+        }
+        msg += static_cast<char>(byte);
+      }
+      if (!complete)
+        throw std::runtime_error("Control command too long");
+      if (msg == "DEAD" || msg == "KILL") {
+        std::cout << "\n[Emergency Protocol] Received DEAD signal on port "
+                  << port
+                  << "! Status set to DEAD. Returning OK and terminating..."
+                  << std::endl;
+        co_await async_hb::async_send_all(
+            reactor, cfd, reinterpret_cast<const uint8_t *>("OK\n"), 3);
+        ::close(cfd);
+        g_is_dead_process = true;
+        std::thread([]() {
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          ::_exit(0);
+        }).detach();
+        co_return;
+      } else if (msg == "RESTART") {
+        std::cout << "\n[Emergency Protocol] Received RESTART signal on port "
+                  << port << "! Restarting..." << std::endl;
+        co_await async_hb::async_send_all(
+            reactor, cfd, reinterpret_cast<const uint8_t *>("OK\n"), 3);
+        ::close(cfd);
+
+        std::vector<char *> args;
+        std::string cmdline;
+        {
+          std::ifstream f("/proc/self/cmdline");
+          if (f) {
+            std::ostringstream ss;
+            ss << f.rdbuf();
+            cmdline = ss.str();
+          }
+        }
+        std::vector<std::string> args_str;
+        size_t pos = 0;
+        while (pos < cmdline.size()) {
+          std::string arg = cmdline.c_str() + pos;
+          if (!arg.empty())
+            args_str.push_back(arg);
+          pos += arg.size() + 1;
+        }
+        for (auto &s : args_str)
+          args.push_back(&s[0]);
+        args.push_back(nullptr);
+
+        execv("/proc/self/exe", args.data());
+        ::_exit(1);
+      } else if (msg.rfind("DELETE_CHUNK ", 0) == 0) {
+        std::stringstream ss(msg.substr(13));
+        std::string chunk_id;
+        ss >> chunk_id;
+        std::cout << "[Emergency Protocol] Deleting chunk " << chunk_id
+                  << std::endl;
+        bool success =
+            dfg::protocol::valid_name(chunk_id, 240) && delete_chunk(chunk_id);
+        if (success) {
+          co_await async_hb::async_send_all(
+              reactor, cfd, reinterpret_cast<const uint8_t *>("SUCCESS\n"), 8);
+        } else {
+          co_await async_hb::async_send_all(
+              reactor, cfd, reinterpret_cast<const uint8_t *>("ERROR\n"), 6);
+        }
+      }
+    } catch (const std::exception &error) {
+      std::cerr << "Control request failed: " << error.what() << std::endl;
+    }
+    ::close(cfd);
+  }
+
   async_hb::task emergency_listener(async_hb::Reactor &reactor) {
     int lfd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (lfd < 0)
@@ -729,71 +610,7 @@ private:
         break;
       }
 
-      char buf[1024] = {0};
-      ssize_t n = ::recv(cfd, buf, sizeof(buf) - 1, 0);
-
-      if (n > 0) {
-        std::string msg(buf, n);
-        if (msg.find("DEAD") != std::string::npos ||
-            msg.find("KILL") != std::string::npos) {
-          std::cout << "\n[Emergency Protocol] Received DEAD signal on port "
-                    << port
-                    << "! Status set to DEAD. Returning OK and terminating..."
-                    << std::endl;
-          ::send(cfd, "OK\n", 3, 0);
-          ::close(cfd);
-          g_is_dead_process = true;
-          std::thread([]() {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            ::_exit(0);
-          }).detach();
-          break;
-        } else if (msg.find("RESTART") != std::string::npos) {
-          std::cout << "\n[Emergency Protocol] Received RESTART signal on port "
-                    << port << "! Restarting..." << std::endl;
-          ::send(cfd, "OK\n", 3, 0);
-          ::close(cfd);
-
-          std::vector<char *> args;
-          std::string cmdline;
-          {
-            std::ifstream f("/proc/self/cmdline");
-            if (f) {
-              std::ostringstream ss;
-              ss << f.rdbuf();
-              cmdline = ss.str();
-            }
-          }
-          std::vector<std::string> args_str;
-          size_t pos = 0;
-          while (pos < cmdline.size()) {
-            std::string arg = cmdline.c_str() + pos;
-            if (!arg.empty())
-              args_str.push_back(arg);
-            pos += arg.size() + 1;
-          }
-          for (auto &s : args_str)
-            args.push_back(&s[0]);
-          args.push_back(nullptr);
-
-          execv("/proc/self/exe", args.data());
-          ::_exit(1);
-        } else if (msg.find("DELETE_CHUNK ") != std::string::npos) {
-          std::stringstream ss(msg.substr(13));
-          std::string chunk_id;
-          ss >> chunk_id;
-          std::cout << "[Emergency Protocol] Deleting chunk " << chunk_id
-                    << std::endl;
-          bool success = delete_chunk(chunk_id);
-          if (success) {
-            ::send(cfd, "SUCCESS\n", 8, 0);
-          } else {
-            ::send(cfd, "ERROR\n", 6, 0);
-          }
-        }
-      }
-
-      ::close(cfd);
+      reactor.spawn(handle_control_connection(reactor, cfd));
     }
     ::close(lfd);
   }

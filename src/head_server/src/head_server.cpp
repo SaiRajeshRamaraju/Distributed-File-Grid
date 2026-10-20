@@ -1,3 +1,4 @@
+#include "client_request.hpp"
 #include "control_api.hpp"
 #include "file_download.hpp"
 #include "file_transfer.pb.h"
@@ -769,41 +770,7 @@ int run_head_server(int argc, char **argv) {
         break;
       }
 
-      std::thread([cfd]() {
-        std::string req;
-        if (dfg::net::recv_line(cfd, req)) {
-          if (req.rfind("DOWNLOAD ", 0) == 0) {
-            std::string filename = req.substr(9);
-            // trim trailing newline
-            while (!filename.empty() &&
-                   (filename.back() == '\n' || filename.back() == '\r')) {
-              filename.pop_back();
-            }
-            handle_client_download(cfd, filename);
-
-          } else if (req.rfind("DELETE ", 0) == 0) {
-            std::string filename = req.substr(7);
-            filename.erase(filename.find_last_not_of(" \n\r\t") + 1);
-            handle_client_delete(cfd, filename);
-          } else if (req.rfind("UPLOAD ", 0) == 0) {
-
-            // trim trailing newline
-            while (!req.empty() && (req.back() == '\n' || req.back() == '\r')) {
-              req.pop_back();
-            }
-            handle_client_upload(cfd, req);
-          } else if (req.rfind("LIST", 0) == 0) {
-            auto files = list_all_files();
-            std::string resp;
-            for (const auto &file : files) {
-              resp += file + "\n";
-            }
-            resp += "EOF\n";
-            dfg::net::send_all(cfd, resp.data(), resp.size());
-          }
-        }
-        ::close(cfd);
-      }).detach();
+      std::thread([cfd]() { handle_client_request(cfd); }).detach();
     }
     ::close(sfd);
   });
